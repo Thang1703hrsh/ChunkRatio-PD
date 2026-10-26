@@ -2,7 +2,8 @@
 import pytest
 
 torch = pytest.importorskip('torch',reason='PyTorch unavailable for active interpreter')
-from chunkratio.scoring import score_batch, score_tokens, state_features
+from chunkratio.sampling import generate, stream
+from chunkratio.scoring import continuation_increments, score_batch, score_tokens, state_features
 from chunkratio.tiny import TinyLM
 
 
@@ -36,3 +37,27 @@ def test_batching_features_causality_and_frozen_gradients() -> None:
     assert policy_scores.requires_grad
     policy_scores.sum().backward()
     assert any(p.grad is not None for p in model.parameters())
+
+
+class GradProbe(TinyLM):
+    """Record autograd mode inside every forward, independent of requires_grad flags (§6.2)."""
+
+    def forward(self, *args: object, **kwargs: object) -> object:
+        """Delegate after recording grad mode (§6.2)."""
+        self.modes.append(torch.is_grad_enabled())
+        return super().forward(*args,**kwargs)
+
+
+def test_frozen_roles_always_run_under_no_grad() -> None:
+    """Sampling, increments, features and frozen scoring never build graphs (§§2,6.2)."""
+    torch.manual_seed(5)
+    probe = GradProbe(vocab_size=7,hidden_size=8)
+    probe.modes = []
+    assert all(p.requires_grad for p in probe.parameters())
+    tokens = generate(probe,[1,2],3,0,stream(1,'probe'))
+    assert not continuation_increments(probe,[1,2],[3,4],0).requires_grad
+    assert not state_features(probe,[[1,2]]).requires_grad
+    assert not score_batch(probe,[[1]],[[2]],0,frozen=True).requires_grad
+    assert len(probe.modes) == len(tokens)+3 and not any(probe.modes)
+    score_batch(probe,[[1]],[[2]],0,frozen=False)
+    assert probe.modes[-1]
