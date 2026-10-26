@@ -46,6 +46,7 @@ def build_targets(records: list[dict[str,Any]], head: MeanHead | None, models: d
                   cfg: dict[str,Any], eos: int, route: str) -> dict[str,Any]:
     """Cache scores independent of alpha; weights cover eligible train prompts (§8)."""
     output, audits = [],[]
+    audited = {'student_ref':0,'teacher_plus':0}
     grouped: dict[str,list[dict[str,Any]]] = defaultdict(list)
     for record in records:
         if record['skipped']:
@@ -67,8 +68,11 @@ def build_targets(records: list[dict[str,Any]], head: MeanHead | None, models: d
                                                  ('logp_teacher_plus','logp_teacher_base','endpoint_mu')),
                                                torch.tensor([row['terminal']])).item()
             candidates.append(row)
-            if cfg['variant'] == 'crpd_audit' and not row['terminal'] and len(audits) < cfg.get('audit_endpoints',8):
-                audits.append({'candidate_id':row['id'],'mu_hat':mu,**exponential_audit(
+            # Fixed audit endpoints split evenly by proposing source, so teacher endpoints are covered (§7.4).
+            if (cfg['variant'] == 'crpd_audit' and not row['terminal']
+                    and audited[row['sources'][0]] < math.ceil(cfg.get('audit_endpoints',8)/len(audited))):
+                audited[row['sources'][0]] += 1
+                audits.append({'candidate_id':row['id'],'sources':row['sources'],'mu_hat':mu,**exponential_audit(
                     state['prefix_ids']+row['tokens'],cfg['horizon']-state['n']-len(row['tokens']),
                     models,cfg,eos,row['id'])})
         result = {'state':state,'candidates':candidates}

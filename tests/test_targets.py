@@ -101,3 +101,17 @@ def test_sampler_matches_hierarchical_weights() -> None:
     counts = collections.Counter(p['id'] for p in trainer.sample())
     for pair in targets['pairs']:
         assert counts[pair['id']]/40000 == pytest.approx(pair['weight'],abs=.01)
+
+
+def test_audit_endpoints_cover_both_sources() -> None:
+    """Replicated audits include teacher-proposed endpoints, not only the first rho siblings (§7.4)."""
+    cfg = {**load_config('config/crpd/smoke.json'),'variant':'crpd_audit','audit_endpoints':2,'audit_replicates':2}
+    models,_,_,info = load_models(cfg)
+    def state(name: str, source: str) -> dict:
+        rows = [{**candidate(name+str(i),[i+2],False,-1.,-1.),'sources':[source]} for i in range(3)]
+        return {'state':{'id':name,'prefix_ids':[1],'response_ids':[],'prompt_id':name,'split':'train','n':0},
+                'candidates':rows,'skipped':False}
+    result = build_targets([state('r','student_ref'),state('t','teacher_plus')],None,models,cfg,
+                           info['eos'],'exact_zero_residual')
+    assert [a['sources'] for a in result['audits']] == [['student_ref'],['teacher_plus']]
+    assert all(a['replicates'] == 2 and a['mu_hat'] == 0 for a in result['audits'])
