@@ -42,7 +42,11 @@ compatible torch wheel; the official CPU nightly index supplied
 `requirements-crpd-cpu-tested.txt` freezes the successful CPU environment.
 The original `env/train_env.yml` instead pins Python 3.11, torch 2.6.0+cu124,
 transformers 4.52.4, datasets 3.5.0, accelerate 1.7.0, peft 0.14.0 and Hydra 1.3.2.
-Those research dependencies were inspected, not installed/executed here.
+Codex only inspected those research dependencies. The review then installed
+numpy 2.5.4 and transformers 4.52.4 (tokenizers 0.21.4, safetensors 0.8.0) into
+the same interpreter. With them it ran the non-synthetic code path on tiny,
+randomly initialised local Llama checkpoints (`tests/test_hf_runtime.py`).
+datasets, accelerate, peft and Hydra are still not installed.
 
 Install commands used in the active environment:
 
@@ -51,12 +55,32 @@ python -m pip install pytest pyyaml
 python -m pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
 ```
 
-NumPy is not installed; torch emits a NumPy initialization warning in standalone
-commands. CRPD's CPU verification uses no NumPy conversion and completes. The
-nightly wheel is a reproducibility limitation; stable versions should be checked
-in a compatible research environment before scaling.
+The review installed NumPy, which removed the torch NumPy initialization warning.
+The nightly wheel is a reproducibility limitation; check stable versions in a
+compatible research environment before scaling.
 
-Executed verification commands and final summary lines:
+Final verification after the review (27 October 2026), with summary lines.
+REVIEW.md lists the review fixes, so the counts differ from Codex's run
+(32 tests):
+
+```text
+python reference/ChunkRatio_Math_Checks.py output/review/reference-checks.json
+ALL CHECKS PASSED
+
+python -m pytest -q
+53 passed in 27.12s
+
+script/smoke_test.ps1 -Output output/smoke-review-final        (Windows PowerShell 5.1)
+SMOKE PASSED: 7 variants, all stages, export/reload and standalone generation
+
+bash --noprofile --norc script/smoke_test.sh --output output/smoke-review-bash
+SMOKE PASSED: 7 variants, all stages, export/reload and standalone generation
+
+python -m chunkratio learned-tree --output output/review/learned-tree.json
+LEARNED TREE COMPLETED: synthetic finite-data experiment   (numbers identical to the table below)
+```
+
+Codex's original runs, kept for the record:
 
 ```text
 python reference/ChunkRatio_Math_Checks.py
@@ -81,13 +105,14 @@ bash --noprofile --norc script/smoke_test.sh --output output/smoke-bash
 SMOKE PASSED: 7 variants, all stages, export/reload and standalone generation
 ```
 
-The ordinary PowerShell launcher first encountered the machine's disabled-script
-policy. The successful invocation sets execution policy only for that process;
-no persistent policy was changed. Bash execution used Git Bash on Windows.
-Native Linux and CUDA have not been executed.
+Codex reported that the PowerShell launcher first hit the machine's disabled-script
+policy. In the review session the process policy was already Bypass, so the
+launcher ran directly. The review also fixed a launcher bug: redirecting stderr
+(`2>&1`) used to abort the run. No persistent policy was changed. Bash runs used
+Git Bash on Windows. Native Linux and CUDA have not been run.
 
 Earlier test runs skipped tensor modules before installing torch; those are
-superseded by the complete 32-test run above, with no skipped modules. Both a
+superseded by the complete runs above (32 tests by Codex, 53 after review), with no skipped modules. Both a
 completed checkpoint and an interrupted/extended partial head/policy run are
 compared against uninterrupted execution. `python -m compileall -q chunkratio
 tests script/run_crpd_protocol.py` and `git diff --check` also passed.
@@ -104,14 +129,15 @@ artifacts: `output/verification/`, `output/reference-checks.json`,
 | Variable EOS stopping, action mass, partition invariance | `tree.py` | `test_variable_eos_action_mass`; partition invariance also in the preceding exhaustive identity test |
 | Causal shift, prompt/PAD/post-EOS mask, sampled EOS once | `scoring.py` | `tests/test_scoring.py::test_shift_mask_prompt_padding_eos` |
 | Padding/batching including EOS=PAD | `scoring.py`, `tiny.py` | `test_batching_features_causality_and_frozen_gradients` |
-| Prefix feature causality | `scoring.py::state_features` | Same test compares prefix-only hidden states with extended sequences |
-| Suffix indexing / endpoint excludes past chunk | `math.py::mu_targets` | `tests/test_math.py::test_suffix_endpoint_exclusion` |
-| Global H, chunk boundary nonterminal | `sampling.py`, `collection.py` | `tests/test_pipeline.py::test_global_horizon_raw_sampling` |
+| Prefix feature causality | `scoring.py::state_features`, `trajectory_features` | Same test compares prefix-only hidden states with extended sequences; one-pass trajectory features equal per-prefix features (TinyLM and HF Llama, `tests/test_hf_runtime.py`) |
+| Suffix indexing / endpoint excludes past chunk | `math.py::mu_targets`, `collection.py` | `tests/test_math.py::test_suffix_endpoint_exclusion`; `tests/test_collection.py::test_correction_rollouts_labels_and_features` recomputes labels, features and budgets independently for rho (main) and T+ (mu_teacher) rollouts |
+| Global H, chunk boundary nonterminal | `sampling.py`, `collection.py` | `tests/test_pipeline.py::test_global_horizon_raw_sampling`; `tests/test_collection.py::test_candidate_budget_is_global_and_chunk_cutoff_nonterminal` (H-n < L) |
 | Untruncated categorical sampling | `sampling.py::generate` | Same test: 3000 controlled categorical draws match declared probabilities |
-| Pair logit .24, p .55971365, loss log2, derivative -.05971365 | `math.py` | `tests/test_math.py::test_numeric_fixture` |
+| Pair logit .24, p .55971365, loss log2, derivative -.05971365 | `math.py` | `tests/test_math.py::test_numeric_fixture`; nonzero margin (alpha on the student side) in `test_nonzero_margin_alpha_on_both_sides` |
+| Frozen target t_s(c)=delta_T+mu_hat, terminal mu_hat=0, endpoint budget | `math.py::target_score`, `targets.py` | `tests/test_targets.py::test_target_score_function`, `test_build_targets_sign_correction_terminal_and_budget` |
 | Pair swap/common offset/soft targets | `math.py` | `test_symmetry_offset_and_frozen_targets`; label bound/entropy floor in `test_label_error_and_entropy_floor` |
-| Policy changes only student; head changes only head | `training.py`, `value_head.py` | `tests/test_pipeline.py::test_collection_resume_and_gradient_routing`; `tests/test_head.py::test_head_gradient_and_resume` |
-| Hierarchical/full/accumulated reductions, fixed H regression | `math.py`, `training.py`, `value_head.py` | `tests/test_math.py::test_weights_and_accumulated_reductions`; policy microbatch loop normalizes by the total sampled batch |
+| Policy changes only student; head changes only head; frozen roles under no_grad | `training.py`, `value_head.py`, `scoring.py`, `sampling.py` | `tests/test_pipeline.py::test_collection_resume_and_gradient_routing`; `tests/test_head.py::test_head_gradient_and_resume`; `tests/test_scoring.py::test_frozen_roles_always_run_under_no_grad` (records autograd mode inside every forward) |
+| Hierarchical/full/accumulated reductions, fixed H regression | `math.py`, `targets.py`, `training.py`, `value_head.py` | `tests/test_math.py::test_weights_and_accumulated_reductions`; `tests/test_targets.py::test_pair_weights_are_hierarchical`, `test_sampler_matches_hierarchical_weights`; `tests/test_head.py::test_feature_shards_and_minibatch_head`; the policy microbatch loop normalizes by the total sampled batch |
 | Null update / shared reference bypass | `math.py::routing`, `targets.py`, `training.py` | `test_exact_routes`; `tests/test_pipeline.py::test_no_alignment_update_and_exact_zero` |
 | Metadata invalidation, immutable atomic shards, no duplicates | `artifacts.py`, `collection.py` | `tests/test_artifacts.py::test_resume_integrity_and_incompatible_metadata`, `test_stage_identity`; actual collection repeat in pipeline test |
 | Optimizer/scheduler/RNG/sampler partial resume | `training.py`, `value_head.py` | Partial one-step/one-epoch execution extended to full run in pipeline/head tests; histories and model fingerprints match |
@@ -266,22 +292,35 @@ rates the estimator returns null, rather than fabricating a complete run estimat
 - **Training integration uses an opt-in dedicated loop.** CRPD does not run inside
   the legacy BasicTrainer/Hydra/FSDP loop. This keeps inherited loss/batch behavior
   intact and enables Windows CPU operation. Distributed training, LoRA and sharded
-  model loading for CRPD are not implemented; the default research template uses
-  full FP32 models and may exceed available device memory.
-- **Scaling/compute auditing needs work.** Correction features are ordinary JSON
-  arrays; model/head/optimizer checkpoints are tensor files. There is no compact
-  large-scale feature-shard backend or concurrent multiwriter support. Jobs are
-  single writer; deterministic restart replays incomplete jobs from saved semantic
-  seeds. Model fingerprinting and uncached prefix forwards prioritize correctness
-  over speed. Full cumulative GPU/energy accounting and matched-compute tuning
+  model loading for CRPD are not implemented. The research template uses full
+  FP32 models. Since the review, teachers can set their own `device`/`dtype`
+  (for example both FP32 teachers on a second GPU), but multi-GPU placement has
+  not been run on CUDA.
+- **Scaling/compute auditing needs work.** Since the review, correction features
+  are hash-verified binary tensor shards, loaded lazily for minibatch head
+  fitting, and are computed in one causal pass per trajectory. Correction volume
+  is still large: every prefix state plus half the nonterminal candidate
+  endpoints, times `correction_replicates=4`, at about 4 bytes x hidden size per
+  visited state. There is one shard file per trajectory. Collection sampling has
+  no KV cache and no batching: each generated token reruns the whole context at
+  batch size 1. This is correct but probably the dominant GPU cost. Jobs are
+  single writer; a restart replays incomplete jobs from their saved semantic
+  seeds. Full cumulative GPU/energy accounting and matched-compute tuning
   budgets require real profiling.
 - **Audit coverage is finite.** Replicated exponential estimates include bootstrap
   intervals and a rare-tail warning; they are not an oracle. The main head has
   head_val error reporting and candidate coverage; an independent replicated mean
   audit of all teacher-proposed endpoints at research scale is not yet delivered.
 - **Platform/runtime scope.** Native Linux/CUDA and the full legacy dependency
-  stack have not been run. Successful Windows/Git-Bash CPU tests use a nightly
-  PyTorch build. A stable compatible training environment still needs verification.
+  stack have not been run. The Windows/Git-Bash CPU tests that passed use a nightly
+  PyTorch build. The HF code path has only run on tiny local Llama checkpoints
+  with a monkeypatched local reward model. A stable compatible training
+  environment still needs verification. The preparation launcher is single-process
+  FP32 full fine-tuning: an 8B SFT/DPO run does not fit one GPU this way and needs
+  an external trainer (inherited FSDP stack, alignment-handbook or similar) whose
+  DPO reference is recorded the same way.
+- **Review.** REVIEW.md lists the defects found in review, the mutation check
+  and the readiness verdict.
 - **License provenance.** The inherited README declares Apache-2.0, and vendored
   FastChat retains its Apache-2.0 LICENSE. No root LICENSE was present in the
   supplied checkout; this task does not create or infer one for inherited code.

@@ -11,16 +11,14 @@
         "-q"
       ],
       "exit_code": 0,
-      "summary": "32 passed in 8.05s"
+      "summary": "53 passed in 27.12s"
     },
     "smoke": {
       "command": [
-        "python",
-        "-m",
-        "chunkratio",
-        "smoke",
-        "--output",
-        "output/smoke-final"
+        "powershell",
+        "script/smoke_test.ps1",
+        "-Output",
+        "output/smoke-review-final"
       ],
       "exit_code": 0,
       "summary": "SMOKE PASSED: 7 variants, all stages, export/reload and standalone generation"
@@ -168,9 +166,15 @@
     }
   },
   "platforms_executed": [
-    "Windows PowerShell (process-scoped ExecutionPolicy Bypass)",
+    "Windows PowerShell 5.1 (script/smoke_test.ps1; process policy already Bypass)",
     "Git Bash on Windows"
   ],
   "native_linux_executed": false,
-  "real_llm_experiments_executed": false
+  "real_llm_experiments_executed": false,
+  "hf_tiny_llama_integration_executed": true,
+  "reviewed": {
+    "by": "review pass, see REVIEW.md",
+    "date": "2026-10-27"
+  },
+  "transformers": "4.52.4"
 }
