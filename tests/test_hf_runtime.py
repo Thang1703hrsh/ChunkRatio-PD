@@ -128,3 +128,27 @@ def test_hf_policy_selection_export_and_rm_evaluation(tmp_path: Path, monkeypatc
     assert seen and all(revision == 'pinned' for _,revision in seen)
     summary = evaluate_reward_model(cfg,str(tmp_path/'run'/'student'),tmp_path/'rm.jsonl')
     assert summary['n_prompts'] == 2 and summary['split'] == 'test'
+
+
+def test_preparation_sft_then_teacher_dpo(tmp_path: Path) -> None:
+    """SFT then DPO launchers run; DPO records its frozen reference = the SFT checkpoint (§11.1)."""
+    from chunkratio.preparation import prepare_checkpoint
+    from chunkratio.scoring import fingerprint
+    paths = checkpoints(tmp_path)
+    data = tmp_path/'pairs.jsonl'
+    rows = [{'prompt_ids':[1,2+i],'chosen_ids':[5,6,0],'rejected_ids':[7,0],'split':'train'} for i in range(3)]
+    data.write_text(''.join(json.dumps(r)+'\n' for r in rows),encoding='utf-8')
+    common = {'revision':'local','data':str(data),'device':'cpu','seed':0,'batch_size':128}
+    prepare_checkpoint({**common,'model':str(paths['teacher_base']),'output':str(tmp_path/'sft'),
+                        'epochs':3,'learning_rate':2e-5},'train-sft')
+    sft = read_json(tmp_path/'sft'/'preparation_manifest.json')
+    assert len(sft['history']) == 3
+    prepare_checkpoint({**common,'model':str(tmp_path/'sft'),'output':str(tmp_path/'dpo'),
+                        'epochs':2,'learning_rate':5e-7,'beta':.05},'train-teacher-dpo')
+    dpo = read_json(tmp_path/'dpo'/'preparation_manifest.json')
+    reference = transformers.LlamaForCausalLM.from_pretrained(tmp_path/'sft').eval().requires_grad_(False)
+    assert dpo['teacher_dpo_reference_fingerprint'] == fingerprint(reference) == sft['model_fingerprint']
+    assert dpo['model_fingerprint'] != sft['model_fingerprint']
+    with pytest.raises(ValueError,match='beta'):
+        prepare_checkpoint({**common,'model':str(tmp_path/'sft'),'output':str(tmp_path/'x'),
+                            'epochs':2,'learning_rate':5e-7,'beta':.1},'train-teacher-dpo')
