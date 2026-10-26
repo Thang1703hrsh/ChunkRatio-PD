@@ -152,3 +152,19 @@ def test_preparation_sft_then_teacher_dpo(tmp_path: Path) -> None:
     with pytest.raises(ValueError,match='beta'):
         prepare_checkpoint({**common,'model':str(tmp_path/'sft'),'output':str(tmp_path/'x'),
                             'epochs':2,'learning_rate':5e-7,'beta':.1},'train-teacher-dpo')
+
+
+def test_per_role_teacher_dtype_and_device(tmp_path: Path) -> None:
+    """Teachers may use their own dtype/device; rho, student and head stay on the main device (§§6.1,10)."""
+    from chunkratio.config import validate
+    from chunkratio.models import load_models
+    paths = checkpoints(tmp_path)
+    cfg = real_config(tmp_path,paths)
+    cfg['models']['teacher_plus'].update(dtype='float64',device='cpu')
+    models,student,_,_ = load_models(cfg)
+    assert next(models['teacher_plus'].parameters()).dtype == torch.float64
+    assert next(models['teacher_base'].parameters()).dtype == torch.float32
+    assert next(student.parameters()).dtype == torch.float32
+    assert pipeline(cfg,'build-targets')['route'] == 'reference_mean'
+    with pytest.raises(ValueError,match='top-level device'):
+        validate({**cfg,'models':{**cfg['models'],'student_ref':{**cfg['models']['student_ref'],'device':'cuda:1'}}})

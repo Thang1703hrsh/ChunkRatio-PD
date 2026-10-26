@@ -29,8 +29,9 @@ def load_models(cfg: dict[str,Any]) -> tuple[dict[str,nn.Module],nn.Module,list[
         loaded,toks = [],[]
         for role in ('teacher_plus','teacher_base','student_ref'):
             entry = cfg['models'][role]
+            dtype = entry.get('dtype',cfg.get('dtype','float32'))
             loaded.append(AutoModelForCausalLM.from_pretrained(entry['path'],revision=entry['revision'],
-                                                             torch_dtype=getattr(torch,cfg.get('dtype','float32'))))
+                                                             torch_dtype=getattr(torch,dtype)))
             tok = AutoTokenizer.from_pretrained(entry.get('tokenizer',entry['path']),
                                                 revision=entry.get('tokenizer_revision',entry['revision']))
             if tok.pad_token_id is None:
@@ -38,7 +39,11 @@ def load_models(cfg: dict[str,Any]) -> tuple[dict[str,nn.Module],nn.Module,list[
             toks.append(tok)
         plus,base,rho = loaded
         tokenizers = toks+[copy.deepcopy(toks[2])]
-    models = {'teacher_plus':freeze(plus.to(cfg['device'])),'teacher_base':freeze(base.to(cfg['device'])),
+    # Teachers may sit on another device; rho, the student and the head share cfg['device'].
+    def device(role: str) -> str:
+        """Per-role placement, defaulting to the shared device (§10)."""
+        return cfg['models'][role].get('device',cfg['device'])
+    models = {'teacher_plus':freeze(plus.to(device('teacher_plus'))),'teacher_base':freeze(base.to(device('teacher_base'))),
               'student_ref':freeze(rho.to(cfg['device']))}
     student = copy.deepcopy(rho).requires_grad_(True).eval()
     info = preflight(tokenizers,[plus,base,rho,student])

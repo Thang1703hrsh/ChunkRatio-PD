@@ -26,7 +26,7 @@ def exponential_audit(prefix: list[int], remaining: int, models: dict[str,nn.Mod
         suffix = generate(models['student_ref'],prefix,remaining,eos,rng)
         a = continuation_increments(models['teacher_plus'],prefix,suffix,eos)
         b = continuation_increments(models['teacher_base'],prefix,suffix,eos)
-        values.append(float((a-b).double().sum()))
+        values.append(float((a.cpu().double()-b.cpu().double()).sum()))
         tokens += len(suffix)
     d = torch.tensor(values,dtype=torch.float64)
     shifted = (d-d.max()).exp()

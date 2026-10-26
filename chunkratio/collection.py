@@ -147,7 +147,7 @@ def collect_correction(candidates: list[dict[str,Any]], models: dict[str,nn.Modu
                 numerator = 'student_ref' if teacher_direction else 'teacher_plus'
                 a = continuation_increments(models[numerator],seed['prefix_ids'],tokens,eos)
                 b = continuation_increments(models['teacher_base'],seed['prefix_ids'],tokens,eos)
-                increments = a-b
+                increments = a.cpu()-b.cpu()
                 labels = suffix_returns(increments)
                 # Binary attachment written first; the JSON commit records its content hash.
                 features = trajectory_features(models['student_ref'],seed['prefix_ids'],tokens)

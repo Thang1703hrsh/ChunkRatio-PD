@@ -48,6 +48,8 @@ def validate(cfg: dict[str,Any]) -> None:
         raise ValueError('collection must use raw categorical decoding')
     if set(cfg['models']) != {'teacher_plus','teacher_base','student_ref'}:
         raise ValueError('three explicit checkpoint roles required')
+    if cfg['models']['student_ref'].get('device',cfg['device']) != cfg['device']:
+        raise ValueError('student_ref, student and head share the top-level device')
     if cfg['variant'] == 'crpd_anchor' and (cfg.get('anchor_lambda',0) <= 0 or cfg.get('anchor_beta',0) <= 0):
         raise ValueError('anchor requires fixed lambda and beta')
     if cfg['variant'] == 'crpd_audit' and cfg.get('audit_replicates',0) < 2:
