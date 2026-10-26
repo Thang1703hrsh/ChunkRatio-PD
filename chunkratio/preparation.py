@@ -40,6 +40,8 @@ def prepare_checkpoint(cfg: dict[str,Any], stage: str) -> None:
     context = model.config.max_position_embeddings
     # Exclude over-budget examples before sampling, never silently truncate responses.
     rows = [r for r in rows if len(r['prompt_ids'])+max(len(r['chosen_ids']),len(r.get('rejected_ids',[]))) <= context]
+    if not rows or any(not row['chosen_ids'] or (dpo and not row.get('rejected_ids')) for row in rows):
+        raise ValueError('no eligible nonempty supervised responses after context preflight')
     optimizer = torch.optim.AdamW(model.parameters(),lr=cfg['learning_rate'],weight_decay=0.)
     rng = stream(cfg['seed'],'preparation-shuffle')
     torch.manual_seed(cfg['seed'])

@@ -40,7 +40,7 @@ Paths above are relative to chunkratio/ unless qualified.
 - [x] 7. Evaluation, protocol and table reporting (external execution gaps in REPORT).
 - [x] 8. Cross-platform tiny CPU smoke stages and variants (Windows + Git Bash).
 - [x] 9. Execute tests/smoke, resolve the stable-wheel block using official CPU nightly.
-- [ ] 10. Review spec, verification matrix, report and final commit.
+- [x] 10. Re-read the specification, complete verification matrix/report, and commit delivery.
 
 Checked steps mean work delivered/reviewed; executed verification status and
 unfulfilled requirements are stated individually in REPORT.md.

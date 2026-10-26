@@ -141,8 +141,8 @@ The following organization separates inherited TBPO infrastructure from the CRPD
 ├── reference/
 │   ├── ChunkRatio_PD_Method_1_1.md
 │   ├── ChunkRatio_PD_v1_1_Coding_Spec_rev2.md
-│   ├── ChunkRatio_PD_Revision_Checks.py
-│   ├── ChunkRatio_PD_Revision_Checks.json
+│   ├── ChunkRatio_Math_Checks.py
+│   ├── ChunkRatio_Math_Checks.json
 │   └── HASHES.txt
 ├── tests/                         # Mathematical, scoring and pipeline checks
 ├── script/                        # Inherited launch/evaluation helpers
