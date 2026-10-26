@@ -83,3 +83,20 @@ def test_exact_routes() -> None:
     assert routing('b','a','c') == 'reference_mean'
     with pytest.raises(ValueError):
         pair_target_logits(tensor(0.),tensor(0.),0)
+
+
+def test_nonzero_margin_alpha_on_both_sides() -> None:
+    """m = alpha(a_c - a_d), a = log pi - log rho; loss and student gradient (§8)."""
+    alpha = .3
+    c, d = tensor(-2., True), tensor(-3., True)
+    loss, margin, u = pair_loss(c, d, tensor(-2.2), tensor(-2.4), tensor(.9), tensor(.1), alpha)
+    a_c, a_d = -2.-(-2.2), -3.-(-2.4)
+    assert margin.item() == pytest.approx(alpha*(a_c-a_d), abs=1e-12)
+    p = 1/(1+math.exp(-alpha*(.9-.1)))
+    m = alpha*(a_c-a_d)
+    assert u.item() == pytest.approx(alpha*.8, abs=1e-12)
+    assert loss.item() == pytest.approx(math.log1p(math.exp(m))-p*m, abs=1e-12)
+    loss.backward()
+    sigma = 1/(1+math.exp(-m))
+    assert c.grad.item() == pytest.approx(alpha*(sigma-p), abs=1e-12)
+    assert d.grad.item() == pytest.approx(-alpha*(sigma-p), abs=1e-12)
