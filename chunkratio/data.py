@@ -51,8 +51,12 @@ def prepare_data(source: Path, tokenizer_path: str, revision: str, destination: 
             if full[:len(prefix)] != prefix:
                 raise ValueError('template prompt/response seam differs; no silent re-tokenization allowed')
             continuation = full[len(prefix):]
-            if tok.eos_token_id in continuation:
-                continuation = continuation[:continuation.index(tok.eos_token_id)+1]
+            # The collection sampler stops only at tokenizer EOS; a template whose assistant turn
+            # ends with another token would silently run every response to H (§5.1).
+            if tok.eos_token_id not in continuation:
+                raise ValueError('chat template does not end the assistant turn with tokenizer EOS; '
+                                 'set eos_token to the end-of-turn token for every model')
+            continuation = continuation[:continuation.index(tok.eos_token_id)+1]
             result[label+'_ids'] = continuation
         for key in ('split','group_id'):
             if key in row:
