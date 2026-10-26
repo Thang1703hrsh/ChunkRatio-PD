@@ -23,3 +23,7 @@ def test_head_gradient_and_resume(tmp_path: Path) -> None:
     restored,other = fit_head(rows,cfg,tmp_path/'head.pt')
     assert meta['hash'] == other['hash'] == fingerprint(restored)
     assert len(meta['history']) == 3
+    fit_head(rows,{**cfg,'head_epochs':1},tmp_path/'partial.pt')
+    extended,extended_meta = fit_head(rows,cfg,tmp_path/'partial.pt')
+    assert extended_meta['hash'] == meta['hash']
+    assert extended_meta['history'] == meta['history']

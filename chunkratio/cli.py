@@ -36,6 +36,16 @@ def main(argv: list[str] | None = None) -> int:
     sub = commands.add_parser('benchmark-run')
     sub.add_argument('--plan',required=True)
     sub.add_argument('--output',required=True)
+    sub = commands.add_parser('estimate-cost')
+    sub.add_argument('--states',type=int,required=True)
+    sub.add_argument('--trajectories',type=int,required=True)
+    sub.add_argument('--average-suffix',type=float,required=True)
+    sub.add_argument('--generation-rate',type=float)
+    sub.add_argument('--scoring-rate',type=float)
+    sub = commands.add_parser('rm-evaluate')
+    sub.add_argument('--config',required=True)
+    sub.add_argument('--model',required=True)
+    sub.add_argument('--output',required=True)
     sub = commands.add_parser('prepare-data')
     sub.add_argument('--input',required=True)
     sub.add_argument('--tokenizer',required=True)
@@ -67,6 +77,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == 'benchmark-run':
             from .experiment import execute_plan
             execute_plan(read_json(Path(args.plan)),Path(args.output))
+            return 0
+        if args.command == 'estimate-cost':
+            from .experiment import estimate_cost
+            print(json.dumps(estimate_cost(args.states,args.trajectories,args.average_suffix,
+                                          args.generation_rate,args.scoring_rate),indent=2))
+            return 0
+        if args.command == 'rm-evaluate':
+            from .evaluation import evaluate_reward_model
+            print(json.dumps(evaluate_reward_model(load_config(args.config),args.model,Path(args.output)),indent=2))
             return 0
         if args.command == 'prepare-data':
             from .data import prepare_data

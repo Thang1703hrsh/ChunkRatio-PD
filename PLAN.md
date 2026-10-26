@@ -31,15 +31,15 @@ Paths above are relative to chunkratio/ unless qualified.
 ## Steps
 
 - [x] 0. Read sources, baseline tag, instructions, plan and decisions.
-- [ ] 1. Pure tensor mathematics.
-- [ ] 2. Numeric, masks and frozen-gradient fixtures.
-- [ ] 3. Independent torch FP64 tree port and JSON comparisons.
-- [ ] 4. Causal collection, scoring and resumable artifacts.
-- [ ] 5. Scalar head and training stage.
-- [ ] 6. Trainer, routes, variants and additive TBPO dispatch.
-- [ ] 7. Evaluation, protocol and table reporting.
-- [ ] 8. Cross-platform tiny CPU smoke stages and variants.
-- [ ] 9. Execute tests/smoke and report dependency blocks.
+- [x] 1. Pure tensor mathematics.
+- [x] 2. Numeric, masks and frozen-gradient fixtures.
+- [x] 3. Independent torch FP64 tree port and JSON comparisons.
+- [x] 4. Causal collection, scoring and resumable artifacts.
+- [x] 5. Scalar head and training stage.
+- [x] 6. Trainer, routes, variants and additive TBPO dispatch.
+- [x] 7. Evaluation, protocol and table reporting (external execution gaps in REPORT).
+- [x] 8. Cross-platform tiny CPU smoke stages and variants (Windows + Git Bash).
+- [x] 9. Execute tests/smoke, resolve the stable-wheel block using official CPU nightly.
 - [ ] 10. Review spec, verification matrix, report and final commit.
 
 Checked steps mean work delivered/reviewed; executed verification status and

@@ -73,5 +73,10 @@
   "anchor_beta": 0.05,
   "audit_replicates": 16,
   "audit_endpoints": 8,
-  "synthetic": false
+  "synthetic": false,
+  "policy_microbatch_size": 1,
+  "evaluation_decoding": {
+    "max_new_tokens": 1024,
+    "do_sample": false
+  }
 }

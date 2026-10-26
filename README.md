@@ -8,7 +8,7 @@ CRPD transfers preferences from an aligned teacher and its reference model to a 
 
 The implementation is intended for a fork of the TokenRatio/TBPO codebase. The original TBPO-Q and TBPO-A implementations remain separate continuity baselines.
 
-> **Implementation status:** This README specifies the CRPD v1.1 workflow and the revision-2 experimental protocol. The CRPD command names and added module layout below are integration targets, not verified executable entry points. Inherited TBPO setup instructions are identified separately. No CRPD benchmark scores or hardware-performance claims are reported here.
+> **Implementation status:** The offline CRPD v1.1 pipeline is implemented under `chunkratio/`, with a staged Python CLI, CPU tests and a synthetic smoke test for all seven variants. See [REPORT.md](REPORT.md) for executed results, verification coverage and remaining research-scale work. Real checkpoints, external benchmark configurations and baseline retraining still require resolved inputs. No CRPD benchmark scores or hardware-performance claims are reported here.
 
 ## Contents
 
@@ -115,7 +115,7 @@ Model-family names or approximate score agreement are insufficient to trigger th
 
 The revision-2 specification is the authority for implementation and experiments; the method document is the authority for mathematics. Keep these sources under `reference/` with SHA-256 hashes.
 
-The following organization separates inherited TBPO infrastructure from the CRPD additions. Existing paths are taken from the supplied TBPO README; inspect the actual fork before relying on them. New CRPD paths are intended integration locations.
+The following organization separates inherited TBPO infrastructure from the CRPD additions. The implemented module map and verification commands are recorded in `AGENTS.md` and `CLAUDE.md`.
 
 ```text
 .
@@ -126,7 +126,10 @@ The following organization separates inherited TBPO infrastructure from the CRPD
 ├── merge.py                       # Inherited adapter export utility
 ├── loss/                          # Preserve TBPO-Q/A and other baseline losses
 ├── config/                        # Inherited configs; add explicit CRPD configs
-├── chunkratio/                    # New CRPD implementation
+├── chunkratio/                    # Implemented standalone CRPD pipeline
+│   ├── math.py                    # Ratios, returns, routes, weights and pair BCE
+│   ├── cli.py                     # python -m chunkratio stage interface
+│   ├── artifacts.py               # Atomic versioned shards and provenance
 │   ├── sampling.py                # Prefixes, sibling chunks, reference rollouts
 │   ├── scoring.py                 # Token scores, masks, causal reference features
 │   ├── collection.py              # Versioned datasets and scoring caches
@@ -152,6 +155,37 @@ The following organization separates inherited TBPO infrastructure from the CRPD
 Inspect existing repository instructions before integration. Record verified commands and real file mappings in `CLAUDE.md`. Reuse model loading, tokenization, and evaluation utilities when they satisfy the specification. Keep TBPO-Q/A behavior unchanged and verify it on tiny fixtures before and after integration.
 
 ## Installation
+
+For the standalone CRPD implementation, use an environment with a compatible
+PyTorch installation and install `requirements-crpd.txt`. The original TBPO
+environment below pins Python 3.11. The active Python 3.15 verification environment
+used an official CPU nightly PyTorch wheel; exact versions and installation
+commands are recorded in `REPORT.md`.
+
+Run from the repository root:
+
+```bash
+python -m pytest -q
+python -m chunkratio toy-check --output output/reference-checks.json
+python -m chunkratio smoke --output output/smoke
+python -m chunkratio learned-tree --output output/learned-tree.json
+```
+
+Windows: `powershell -File script/smoke_test.ps1`. Linux/Bash:
+`bash script/smoke_test.sh`. Neither smoke launcher downloads models.
+Use `python -m chunkratio --help` for the actual stage interface. For example:
+
+```bash
+python -m chunkratio collect-prefixes --config config/crpd/smoke.json
+python -m chunkratio fit-head --config config/crpd/smoke.json
+python train.py --crpd train-policy --config config/crpd/smoke.json
+python -m chunkratio evaluate --config config/crpd/smoke.json
+```
+
+Each stage resumes compatible prerequisites. The ordinary TBPO entry point and
+losses retain their behavior. Research configs and preparation commands are
+documented in [config/crpd/README.md](config/crpd/README.md); unresolved checkpoint
+revisions are rejected before any collection.
 
 The supplied TBPO README uses separate Conda environments for training and general-language evaluation. The inherited setup is:
 
@@ -277,7 +311,10 @@ Select policy checkpoints using the shared reward-model rule on `select`, then e
 
 ### Target command interface
 
-The following is the **illustrative stage interface from the specification**. Bind it to verified entry points during integration before treating these commands as executable:
+The stage names below come from the specification. Invoke each as
+`python -m chunkratio STAGE --config FILE`; `toy-check` instead accepts `--output`.
+The Python module is the implemented entry point; no separate `crpd` console
+executable is installed:
 
 ```text
 crpd validate-config

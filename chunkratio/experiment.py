@@ -14,6 +14,7 @@ from .artifacts import read_json, write_json
 def benchmark_plan(model: str, model_id: str, judge: str, adpa_outputs: str,
                    output: str) -> dict[str,Any]:
     """Reuse inherited MT-Bench and official external CLIs with explicit roles (§11.4)."""
+    model = str(Path(model).resolve()) if Path(model).exists() else model
     return {'model':model,'model_id':model_id,'primary_judge':judge,'jobs':[
         {'metric':'open_llm','cwd':'.','argv':[sys.executable,'-m','lm_eval','--model','hf',
            '--model_args','pretrained='+model,'--tasks','arc_challenge,hellaswag,truthfulqa_mc2,mmlu,winogrande,gsm8k',

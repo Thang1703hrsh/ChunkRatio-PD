@@ -13,6 +13,7 @@ import torch
 
 from .artifacts import ShardStore, digest, read_jsonl, stage_key, write_json
 from .collection import collect_candidates, collect_correction, collect_prefixes, prepare_prompts
+from .cost import ForwardMeter
 from .evaluation import reward_selector
 from .math import diagnostics, routing
 from .models import load_models
@@ -27,6 +28,7 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
     """Execute requested stage and prerequisites, reusing compatible completed shards (§10)."""
     started = time.perf_counter()
     models,student,tokenizers,info = load_models(cfg)
+    meter = ForwardMeter({**models,'student':student})
     eos = info['eos']
     identities = {role:fingerprint(model) for role,model in models.items()}
     route = routing(identities['teacher_plus'],identities['teacher_base'],identities['student_ref'])
@@ -52,7 +54,14 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
                 'seed_streams':['split','prefix','candidate/student_ref','candidate/teacher_plus',
                                 'endpoint-selection','correction','head-init','policy-sampler','audit'],
                 'synthetic':cfg.get('synthetic',False)}
+    manifest['dependencies'] = {}
+    for package in ('torch','transformers','datasets','numpy','pytest','PyYAML'):
+        try:
+            manifest['dependencies'][package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            manifest['dependencies'][package] = None
     write_json(output/'manifest.json',manifest)
+    write_json(output/'resolved_config.json',cfg)
     if until == 'validate-config':
         return manifest
     common = {'models':identities,'tokenizer':info,'horizon':cfg['horizon'],'precision':manifest['precision'],
@@ -65,6 +74,9 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
         return ShardStore(output/'cache'/stage_key(stage,metadata),metadata)
     if route == 'no_alignment_update':
         # Routing precedes any correction collection and ANY optimization.
+        if not cfg.get('synthetic',False):
+            student.save_pretrained(output/'student')
+            tokenizers[2].save_pretrained(output/'student')
         save_tensor(output/'student.pt',{'state_dict':student.state_dict(),'synthetic':cfg.get('synthetic',False)})
         result = {'route':route,'optimizer_steps':0,'collection_skipped':True}
         write_json(output/'diagnostics.json',result)
@@ -98,9 +110,13 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
     write_json(output/'target_index.json',{'path':str(target_path/'targets.json'),'head_hash':head_meta['hash']})
     if until == 'build-targets':
         return {'pairs':len(targets['pairs']),'head':head_meta,'route':route}
-    selector = None if cfg.get('synthetic',False) else reward_selector(cfg,prompts,tokenizers[2])
+    selector,selection_cost = (None,{}) if cfg.get('synthetic',False) else reward_selector(cfg,prompts,tokenizers[2])
     trainer = ChunkRatioTrainer(student,models['student_ref'],targets,prompts,cfg,eos,selector)
-    policy = trainer.train(output/'policy.resume.pt')
+    policy_deps = {'code_revision':revision,'targets':digest(targets),
+                   'config':{k:v for k,v in cfg.items() if k not in ('output','steps')}}
+    policy_path = output/'cache'/stage_key('policy',policy_deps)/'resume.pt'
+    policy = trainer.train(policy_path)
+    write_json(output/'policy_index.json',{'path':str(policy_path),'code_revision':revision})
     frozen_after = {role:fingerprint(model) for role,model in models.items()}
     assert identities == frozen_after,'frozen model parameters changed'
     if head is not None:
@@ -138,6 +154,9 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
               'cost':{'collection_generated_tokens':generated_counts,'collection_scored_tokens':scored_counts,
                       'wall_seconds_this_invocation':time.perf_counter()-started,
                       'peak_cuda_allocated_bytes':torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0,
-                      'gpu_hours':None,'policy_and_selection_token_accounting':'not yet instrumented'}}
+                      'gpu_hours':None,'forward_input_tokens_this_invocation':meter.counts,
+                      'selection_this_invocation':selection_cost,
+                      'note':'forward counts include repeated prefix prefill; GPU-hours require hardware profiling'}}
+    meter.close()
     write_json(output/'diagnostics.json',result)
     return result

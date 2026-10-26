@@ -4,8 +4,12 @@ from __future__ import annotations
 import math
 import random
 import statistics
+from collections.abc import Callable
 from collections import defaultdict
 from typing import Any
+from pathlib import Path
+
+from .artifacts import atomic_bytes, read_jsonl, write_json
 
 METRICS = ('rm','mt_bench','ae_vs_adpa','ae2_lc','ae2_wr','arena_hard',
            'arc','hellaswag','truthfulqa','mmlu','winogrande','gsm8k')
@@ -52,7 +56,11 @@ def report_tables(rows: list[dict[str,Any]], allow_incomplete: bool = False) -> 
             raise ValueError('all specified metrics required; use --allow-incomplete for a labeled partial report')
         normalized.append(row)
     methods = sorted({r['method'] for r in normalized})
-    lines = ['# Measured CRPD results','',
+    required_methods = set(REFERENCE_ROWS+BASELINES+('crpd_main','crpd_raw'))
+    missing_methods = sorted(required_methods-set(methods))
+    if missing_methods and not allow_incomplete:
+        raise ValueError('required reference/baseline rows missing: '+', '.join(missing_methods))
+    lines = ['# '+('Partial measured CRPD results' if allow_incomplete else 'Measured CRPD results'),'',
              'Training seeds remain separate from prompt-bootstrap uncertainty. Missing values are not estimates.','',
              '| Method | DPO-MIX-7K: RM / MT / AE-vs-ADPA / AE2-LC / OLL | HelpSteer2: RM / MT / AE-vs-ADPA / AE2-LC / OLL | GPU-h |',
              '|---|---|---|---|']
@@ -79,10 +87,22 @@ def report_tables(rows: list[dict[str,Any]], allow_incomplete: bool = False) -> 
             costs.extend(r['cost']['gpu_hours'] for r in subset)
             secondary.append('| '+method+' / '+dataset+' | '+' | '.join(f'{means[m]:.4f}' if m in means else 'missing' for m in ('ae2_wr','arena_hard',*tasks))+' |')
         lines.append('| '+method+' | '+' | '.join(cells)+' | '+(f'{statistics.mean(costs):.3f}' if costs else 'missing')+' |')
-    return '\n'.join(lines+secondary)+'\n'
+    seed_variation = ['','| Method / track | Metric | Training seeds | Mean | Between-seed sample SD |',
+                      '|---|---|---|---|---|']
+    for method in methods:
+        for dataset in ('DPO-MIX-7K','HelpSteer2'):
+            subset = [r for r in normalized if r['method'] == method and r['dataset'] == dataset]
+            for metric in METRICS:
+                values = [r['metrics'][metric] for r in subset if metric in r['metrics']]
+                if values:
+                    std = f'{statistics.stdev(values):.4f}' if len(values)>1 else 'unavailable'
+                    seed_variation.append(f'| {method} / {dataset} | {metric} | {len(values)} | {statistics.mean(values):.4f} | {std} |')
+    if missing_methods:
+        seed_variation += ['','Missing reference/baseline rows: '+', '.join(missing_methods)+'.']
+    return '\n'.join(lines+secondary+seed_variation)+'\n'
 
 
-def reward_selector(cfg: dict[str,Any], prompts: list[dict[str,Any]], tokenizer: Any):
+def reward_selector(cfg: dict[str,Any], prompts: list[dict[str,Any]], tokenizer: Any) -> tuple[Callable[[Any],float],dict[str,int]]:
     """Pinned FsfairX RM, select prompts only, same generation rule for all methods (§11.1)."""
     import torch
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
@@ -95,11 +115,13 @@ def reward_selector(cfg: dict[str,Any], prompts: list[dict[str,Any]], tokenizer:
     rm = rm.to(cfg['device']).eval().requires_grad_(False)
     rm_tok = AutoTokenizer.from_pretrained(name,revision=selection['reward_model_revision'])
     decode = selection['decoding']
+    cost = {'generated_tokens':0,'rm_scored_input_tokens':0,'selection_calls':0}
 
     @torch.no_grad()
-    def select(student):
+    def select(student: Any) -> float:
         """Mean independent reward of generated responses on fixed select prompts (§11.1)."""
         scores = []
+        cost['selection_calls'] += 1
         for row in rows:
             ids = torch.tensor([row['prompt_ids']],device=cfg['device'])
             # Reset stream per prompt/checkpoint so selection noise is controlled.
@@ -107,14 +129,63 @@ def reward_selector(cfg: dict[str,Any], prompts: list[dict[str,Any]], tokenizer:
                 torch.manual_seed(cfg['seed']+911)
                 response = student.generate(ids,attention_mask=torch.ones_like(ids),
                                             pad_token_id=tokenizer.pad_token_id,eos_token_id=tokenizer.eos_token_id,**decode)
+            cost['generated_tokens'] += response.shape[1]-ids.shape[1]
             if 'messages' not in row:
                 raise ValueError('reward selection requires original prompt messages')
             messages = row['messages']+[{'role':'assistant','content':tokenizer.decode(response[0,ids.shape[1]:],skip_special_tokens=True)}]
             text = rm_tok.apply_chat_template(messages,tokenize=False)
             inputs = rm_tok(text,return_tensors='pt',add_special_tokens=False).to(cfg['device'])
+            cost['rm_scored_input_tokens'] += int(inputs['attention_mask'].sum())
             logits = rm(**inputs).logits
             if logits.numel() != 1:
                 raise ValueError('reward model must return one scalar')
             scores.append(float(logits.item()))
         return statistics.mean(scores)
-    return select
+    return select,cost
+
+
+def evaluate_reward_model(cfg: dict[str,Any], model_path: str, output: Path) -> dict[str,Any]:
+    """Generate held-out answers and score pinned FsfairX RM; never use select prompts (§11.4)."""
+    import json
+    import time
+    import torch
+    from transformers import AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer
+    decode = cfg.get('evaluation_decoding')
+    if decode is None:
+        raise ValueError('explicit evaluation_decoding required, separate from collection horizon')
+    prompts = [row for row in read_jsonl(Path(cfg['prompts'])) if row['split'] == 'test']
+    if not prompts:
+        raise ValueError('held-out test prompts required for RM reporting')
+    model = AutoModelForCausalLM.from_pretrained(model_path,torch_dtype=torch.float32).to(cfg['device']).eval().requires_grad_(False)
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    name = 'sfairXC/FsfairX-LLaMA3-RM-v0.1'
+    revision = cfg['selection']['reward_model_revision']
+    rm = AutoModelForSequenceClassification.from_pretrained(name,revision=revision,torch_dtype=torch.float32).to(cfg['device']).eval().requires_grad_(False)
+    rm_tok = AutoTokenizer.from_pretrained(name,revision=revision)
+    results = []
+    start = time.perf_counter()
+    with torch.no_grad():
+        for row in prompts:
+            if 'messages' not in row:
+                raise ValueError('RM evaluation requires original prompt messages')
+            ids = torch.tensor([row['prompt_ids']],device=cfg['device'])
+            torch.manual_seed(cfg['seed']+911)
+            response = model.generate(ids,attention_mask=torch.ones_like(ids),pad_token_id=tokenizer.eos_token_id,
+                                      eos_token_id=tokenizer.eos_token_id,**decode)[0,len(row['prompt_ids']):]
+            text = tokenizer.decode(response,skip_special_tokens=True)
+            messages = row['messages']+[{'role':'assistant','content':text}]
+            rm_text = rm_tok.apply_chat_template(messages,tokenize=False)
+            inputs = rm_tok(rm_text,add_special_tokens=False,return_tensors='pt').to(cfg['device'])
+            score = rm(**inputs).logits
+            if score.numel() != 1 or not torch.isfinite(score).all():
+                raise ValueError('nonfinite/non-scalar reward')
+            results.append({'schema':1,'split':'test','synthetic':False,'prompt_id':row.get('id',str(len(results))),
+                            'messages':row['messages'],'response':text,'generated_token_ids':response.tolist(),
+                            'rm_score':score.item(),'reward_model':name,'reward_model_revision':revision,
+                            'evaluation_decoding':decode})
+    atomic_bytes(output,(''.join(json.dumps(row,ensure_ascii=False)+'\n' for row in results)).encode())
+    summary = {'mean_rm_score':statistics.mean(r['rm_score'] for r in results),'n_prompts':len(results),
+               'generated_tokens':sum(len(r['generated_token_ids']) for r in results),
+               'wall_seconds':time.perf_counter()-start,'reward_model':name,'revision':revision,'split':'test'}
+    write_json(output.with_suffix('.summary.json'),summary)
+    return summary

@@ -1,0 +1,176 @@
+{
+  "synthetic_only": true,
+  "python": "3.15.1",
+  "torch": "2.16.0.dev20261026+cpu",
+  "tests": {
+    "pytest": {
+      "command": [
+        "python",
+        "-m",
+        "pytest",
+        "-q"
+      ],
+      "exit_code": 0,
+      "summary": "32 passed in 8.05s"
+    },
+    "smoke": {
+      "command": [
+        "python",
+        "-m",
+        "chunkratio",
+        "smoke",
+        "--output",
+        "output/smoke-final"
+      ],
+      "exit_code": 0,
+      "summary": "SMOKE PASSED: 7 variants, all stages, export/reload and standalone generation"
+    }
+  },
+  "smoke": {
+    "status": "passed",
+    "summary": "SMOKE PASSED: 7 variants, all stages, export/reload and standalone generation",
+    "synthetic": true,
+    "variants": {
+      "crpd_anchor": {
+        "optimizer_steps": 3,
+        "pairs": 54,
+        "standalone_generated_tokens": [
+          6,
+          6,
+          5,
+          5,
+          0
+        ],
+        "status": "passed"
+      },
+      "crpd_audit": {
+        "optimizer_steps": 0,
+        "pairs": 54,
+        "standalone_generated_tokens": [
+          6,
+          6,
+          5,
+          5,
+          0
+        ],
+        "status": "passed"
+      },
+      "crpd_main": {
+        "optimizer_steps": 3,
+        "pairs": 54,
+        "standalone_generated_tokens": [
+          6,
+          6,
+          5,
+          5,
+          0
+        ],
+        "status": "passed"
+      },
+      "crpd_mu_teacher": {
+        "optimizer_steps": 3,
+        "pairs": 54,
+        "standalone_generated_tokens": [
+          6,
+          6,
+          5,
+          5,
+          0
+        ],
+        "status": "passed"
+      },
+      "crpd_raw": {
+        "optimizer_steps": 3,
+        "pairs": 54,
+        "standalone_generated_tokens": [
+          6,
+          6,
+          5,
+          5,
+          0
+        ],
+        "status": "passed"
+      },
+      "crpd_suffix": {
+        "optimizer_steps": 3,
+        "pairs": 51,
+        "standalone_generated_tokens": [
+          6,
+          6,
+          5,
+          5,
+          0
+        ],
+        "status": "passed"
+      },
+      "crpd_token": {
+        "optimizer_steps": 3,
+        "pairs": 79,
+        "standalone_generated_tokens": [
+          6,
+          6,
+          5,
+          5,
+          0
+        ],
+        "status": "passed"
+      }
+    }
+  },
+  "reference_identity_max_errors": {
+    "two_representations": 3.3306690738754696e-16,
+    "chunk_decomposition": 3.9968028886505635e-15,
+    "partition_invariance": 1.6653345369377348e-16,
+    "objective_identity": 4.440892098500626e-16,
+    "q_identity": 3.1086244689504383e-15,
+    "forward_jensen": 2.706168622523819e-16,
+    "reverse_jensen": 2.7755575615628914e-16,
+    "tilted_variance": 2.0539125955565396e-15
+  },
+  "learned_tree": {
+    "finite_rollouts_per_state": 16,
+    "policy_steps": 200,
+    "regimes": {
+      "large_displacement_small_mismatch": {
+        "disclosure": "independent head_val trajectories share enumerable state support; not an unseen-prompt generalization study",
+        "excess_pair_loss": 9.369416353877114e-11,
+        "fitted_reverse_kl": 0.11801088271800131,
+        "fitted_to_target_kl": 1.8710269636835344e-10,
+        "head_val": 0.3747110366821289,
+        "max_sibling_mean_error": 0.5945651383939518,
+        "restricted_candidate_graph": {
+          "note": "pair odds on tokens 0/1 alone cannot identify EOS mass",
+          "observed_tokens": [
+            0,
+            1
+          ],
+          "unidentified_reference_outside_mass_at_root": 0.28815462015768284
+        },
+        "target_reverse_kl": 0.118012204385636
+      },
+      "small_displacement_large_mismatch": {
+        "disclosure": "independent head_val trajectories share enumerable state support; not an unseen-prompt generalization study",
+        "excess_pair_loss": 6.672440377997191e-14,
+        "fitted_reverse_kl": 9.596850732130504e-05,
+        "fitted_to_target_kl": 1.9678893016774306e-12,
+        "head_val": 0.0017690276727080345,
+        "max_sibling_mean_error": 0.03946388785897817,
+        "restricted_candidate_graph": {
+          "note": "pair odds on tokens 0/1 alone cannot identify EOS mass",
+          "observed_tokens": [
+            0,
+            1
+          ],
+          "unidentified_reference_outside_mass_at_root": 0.34455238622141915
+        },
+        "target_reverse_kl": 9.59560652482542e-05
+      }
+    }
+  },
+  "platforms_executed": [
+    "Windows PowerShell (process-scoped ExecutionPolicy Bypass)",
+    "Git Bash on Windows"
+  ],
+  "native_linux_executed": false,
+  "real_llm_experiments_executed": false
+}

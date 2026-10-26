@@ -18,8 +18,11 @@ def test_report_validation_and_main_table() -> None:
     rows = [dict(method='crpd_main',dataset=dataset,seed=seed,synthetic=False,split='test',
                  metrics={m:float(seed+1) for m in METRICS},protocols={m:'fixed' for m in METRICS},cost={'gpu_hours':2.})
             for dataset in ('DPO-MIX-7K','HelpSteer2') for seed in range(3)]
-    result = report_tables(rows)
+    result = report_tables(rows,allow_incomplete=True)
     assert 'crpd_main' in result and '2.0000 / 2.0000' in result
+    assert 'Between-seed sample SD' in result
+    with pytest.raises(ValueError,match='rows missing'):
+        report_tables(rows)
     rows[0]['synthetic'] = True
     with pytest.raises(ValueError,match='synthetic'):
         report_tables(rows)

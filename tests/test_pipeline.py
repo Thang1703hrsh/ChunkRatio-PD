@@ -78,6 +78,16 @@ def test_collection_resume_and_gradient_routing(tmp_path: Path) -> None:
     restored = resumed.train(tmp_path/'policy.pt')
     assert restored['history'] == result['history']
     assert fingerprint(fresh) == fingerprint(student)
+    # Resume from an actual partial run, not only an already-completed checkpoint.
+    partial_student = copy.deepcopy(models['student_ref']).requires_grad_(True)
+    short_cfg = {**cfg,'steps':1}
+    partial = ChunkRatioTrainer(partial_student,models['student_ref'],targets,prompts,short_cfg,info['eos'])
+    partial.train(tmp_path/'partial.pt')
+    continued_student = copy.deepcopy(models['student_ref']).requires_grad_(True)
+    continued = ChunkRatioTrainer(continued_student,models['student_ref'],targets,prompts,cfg,info['eos'])
+    continued_result = continued.train(tmp_path/'partial.pt')
+    assert continued_result['history'] == result['history']
+    assert fingerprint(continued_student) == fingerprint(student)
 
 
 def test_no_alignment_update_and_exact_zero(tmp_path: Path) -> None:

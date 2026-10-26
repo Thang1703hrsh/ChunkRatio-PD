@@ -100,11 +100,23 @@ class ChunkRatioTrainer:
             self.student.eval()  # no dropout, gradients intentionally enabled
             optimizer.zero_grad(set_to_none=True)
             batch = self.sample()
-            loss,diag = self.batch_loss(batch)
+            loss_total = 0.
+            diag = {'excess_bce':0.,'logit_error':0.,'saturation':0.}
+            microbatch_size = cfg.get('policy_microbatch_size',1)
+            assert microbatch_size > 0
+            for offset in range(0,len(batch),microbatch_size):
+                micro = batch[offset:offset+microbatch_size]
+                loss,metrics = self.batch_loss(micro)
+                weight = len(micro)/len(batch)
+                (loss*weight).backward()
+                loss_total += loss.item()*weight
+                for key in diag:
+                    diag[key] += metrics[key]*weight
             if cfg['variant'] == 'crpd_anchor':
-                loss = loss+cfg['anchor_lambda']*self.anchor_loss()
-            assert torch.isfinite(loss), 'nonfinite student objective'
-            loss.backward()
+                anchor = cfg['anchor_lambda']*self.anchor_loss()
+                assert torch.isfinite(anchor)
+                anchor.backward()
+                loss_total += anchor.item()
             optimizer.step()
             scheduler.step()
             if self.selector is not None:
@@ -116,7 +128,7 @@ class ChunkRatioTrainer:
             if score > best:
                 best = score
                 best_state = {k:v.detach().cpu().clone() for k,v in self.student.state_dict().items()}
-            self.history.append({'step':step+1,'loss':loss.item(),'selection_score':score,**diag})
+            self.history.append({'step':step+1,'loss':loss_total,'selection_score':score,**diag})
             save_tensor(path,{'identity':identity,'student':self.student.state_dict(),
                               'optimizer':optimizer.state_dict(),'scheduler':scheduler.state_dict(),
                               'step':step+1,'sampler_state':self.rng.getstate(),'torch_rng':torch.get_rng_state(),
