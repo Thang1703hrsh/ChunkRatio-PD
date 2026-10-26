@@ -34,13 +34,18 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
     identities = {role:fingerprint(model) for role,model in models.items()}
     route = routing(identities['teacher_plus'],identities['teacher_base'],identities['student_ref'])
     prompts = prepare_prompts(read_jsonl(Path(cfg['prompts'])),cfg['seed'])
+    contexts = [getattr(model.config,'max_position_embeddings',None) or getattr(model.config,'n_positions',None)
+                for model in models.values()]
+    if any(context is None for context in contexts):
+        raise ValueError('every model needs a verified context length')
     for prompt in prompts:
-        for model in models.values():
-            context = getattr(model.config,'max_position_embeddings',None) or getattr(model.config,'n_positions',None)
-            if context is None or len(prompt['prompt_ids'])+cfg['horizon'] > context:
-                raise ValueError(f'prompt {prompt["id"]} exceeds or lacks verified context budget')
         if max(prompt['prompt_ids']) >= len(tokenizers[0]):
             raise ValueError('canonical prompt token outside shared vocabulary')
+    # Pre-generation eligibility rule (§5.2): prompt + H must fit every model; never truncate later.
+    ineligible = sorted(p['id'] for p in prompts if len(p['prompt_ids'])+cfg['horizon'] > min(contexts))
+    prompts = [p for p in prompts if p['id'] not in set(ineligible)]
+    if not prompts:
+        raise ValueError('no prompt fits prompt length + H within every model context')
     output = Path(cfg['output'])
     output.mkdir(parents=True,exist_ok=True)
     root = Path(__file__).resolve().parents[1]
@@ -50,6 +55,7 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
     manifest = {'schema':1,'method_version':'1.1','spec_revision':2,'code_revision':revision,
                 'python':platform.python_version(),'torch':torch.__version__,'documents':documents,
                 'config':cfg,'models':identities,'tokenizer':info,'split_hash':digest(prompts),
+                'ineligible_prompts':{'rule':'len(prompt_ids)+H > min model context','ids':ineligible},
                 'route':route,'precision':str(next(student.parameters()).dtype),'feature_dtype':'float32',
                 'terminal_convention':'sampled EOS included once; H after prompt; no forced EOS',
                 'seed_streams':['split','prefix','candidate/student_ref','candidate/teacher_plus',

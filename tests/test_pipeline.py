@@ -134,3 +134,22 @@ def test_selection_and_checkpoint_cadence(tmp_path: Path, monkeypatch: pytest.Mo
     unresolved = {k:v for k,v in cfg.items() if k != 'selection_interval'}
     with pytest.raises(ValueError,match='explicit selection_interval'):
         validate({**unresolved,'synthetic':False})
+
+
+def test_overlong_prompts_dropped_before_generation(tmp_path: Path) -> None:
+    """Prompt + H beyond any model context is excluded by rule and recorded, not fatal (§5.2)."""
+    import json
+    from chunkratio.artifacts import read_json
+    from chunkratio.pipeline import pipeline
+    prompts = tmp_path/'prompts.jsonl'
+    rows = [{'prompt_ids':[1,2],'split':'train'},{'prompt_ids':[1]*2043,'split':'train'},
+            {'prompt_ids':[2]*2042,'split':'train'}]
+    prompts.write_text(''.join(json.dumps(r)+'\n' for r in rows),encoding='utf-8')
+    cfg = {**load_config('config/crpd/smoke.json'),'prompts':str(prompts),'output':str(tmp_path/'run')}
+    states = pipeline(cfg,'collect-prefixes')['states']
+    manifest = read_json(tmp_path/'run'/'manifest.json')
+    dropped = manifest['ineligible_prompts']['ids']
+    assert dropped == [prepare_prompts([rows[1]],0)[0]['id']]
+    assert states > 0
+    with pytest.raises(ValueError,match='no prompt fits'):
+        pipeline({**cfg,'horizon':4096,'output':str(tmp_path/'none')},'validate-config')
