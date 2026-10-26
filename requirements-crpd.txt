@@ -1,0 +1,6 @@
+torch>=2.6
+pytest>=8
+PyYAML>=6
+# Only real checkpoint loading / reward evaluation needs these:
+transformers==4.52.4
+datasets==3.5.0
