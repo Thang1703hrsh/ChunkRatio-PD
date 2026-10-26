@@ -1,3 +1,10 @@
+# Opt-in CRPD dispatch must precede legacy Unix/FSDP imports (CRPD spec §3).
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--crpd":
+        from chunkratio.cli import main as crpd_main
+        raise SystemExit(crpd_main(sys.argv[2:]))
+
 import torch
 
 torch.backends.cuda.matmul.allow_tf32 = True
