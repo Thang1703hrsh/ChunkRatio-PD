@@ -52,7 +52,11 @@ def validate(cfg: dict[str,Any]) -> None:
         raise ValueError('anchor requires fixed lambda and beta')
     if cfg['variant'] == 'crpd_audit' and cfg.get('audit_replicates',0) < 2:
         raise ValueError('exponential audit needs replicated independent estimates')
+    if not isinstance(cfg.get('selection_interval',1),int) or cfg.get('selection_interval',1) <= 0:
+        raise ValueError('selection_interval must be positive integer')
     if not cfg.get('synthetic',False):
+        if 'selection_interval' not in cfg:
+            raise ValueError('real runs need an explicit selection_interval (RM selection per checkpoint)')
         for role,model in cfg['models'].items():
             if not model.get('path') or not model.get('revision'):
                 raise ValueError(f'exact path and revision required for {role}')

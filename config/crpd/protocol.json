@@ -8,6 +8,7 @@
   "optimizer": "AdamW",
   "batch_size": 128,
   "steps": 1000,
+  "selection_interval": 100,
   "seed": 0,
   "head_epochs": 20,
   "head_learning_rate": 0.001,

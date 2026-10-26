@@ -11,7 +11,7 @@ from chunkratio.collection import (collect_candidates, collect_correction, colle
 from chunkratio.config import load_config
 from chunkratio.models import load_models
 from chunkratio.sampling import generate, stream, terminal
-from chunkratio.scoring import fingerprint, preflight
+from chunkratio.scoring import fingerprint, preflight, score_batch
 from chunkratio.targets import build_targets
 from chunkratio.training import ChunkRatioTrainer
 
@@ -104,3 +104,30 @@ def test_no_alignment_update_and_exact_zero(tmp_path: Path) -> None:
                    'logp_teacher_plus':-.3,'logp_teacher_base':-.4,'logp_student_ref':-.5} for i in range(2)]
     result = build_targets([{'state':state,'candidates':candidates,'skipped':False}],None,models,cfg,info['eos'],'exact_zero_residual')
     assert all(c['endpoint_mu'] == 0 for c in result['records'][0]['candidates'])
+
+
+def test_selection_and_checkpoint_cadence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """RM selection and resume checkpoints run every selection_interval steps and at the end (§§10,11.1)."""
+    import chunkratio.training as training
+    cfg = {**load_config('config/crpd/smoke.json'),'steps':5,'selection_interval':2}
+    models,student,_,info = load_models(cfg)
+    state = {'id':'state','prefix_ids':[1],'prompt_id':'p','split':'train','n':0}
+    candidates = [{'id':str(i),'tokens':[i+2],'terminal':False,'logp_teacher_plus':-.3*i,
+                   'logp_teacher_base':-.4,'logp_student_ref':-.5} for i in range(2)]
+    targets = build_targets([{'state':state,'candidates':candidates,'skipped':False}],None,models,cfg,
+                            info['eos'],'exact_zero_residual')
+    for pair in targets['pairs']:
+        for side in ('c','d'):
+            pair[side]['logp_student_ref'] = score_batch(models['student_ref'],[[1]],[pair[side]['tokens']],info['eos']).item()
+    calls, saves = [],[]
+    original = training.save_tensor
+    monkeypatch.setattr(training,'save_tensor',lambda path,payload:(saves.append(payload['step']),original(path,payload)))
+    trainer = ChunkRatioTrainer(student,models['student_ref'],targets,[],cfg,info['eos'],
+                                selector=lambda model:calls.append(1) or -len(calls))
+    result = trainer.train(tmp_path/'policy.pt')
+    assert len(calls) == 3 and saves == [2,4,5]
+    assert [h['selection_score'] is not None for h in result['history']] == [False,True,False,True,True]
+    assert result['optimizer_steps'] == 5
+    with pytest.raises(ValueError,match='selection_interval'):
+        load_config('config/crpd/smoke.json') and __import__('chunkratio.config').config.validate(
+            {**cfg,'synthetic':False,'selection_interval':0})

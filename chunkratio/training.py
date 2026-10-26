@@ -96,6 +96,7 @@ class ChunkRatioTrainer:
             start,best,best_state = saved['step'],saved['best'],saved['best_state']
             self.history = saved['history']
         frozen_hash = fingerprint(self.rho)
+        interval = cfg.get('selection_interval',1)
         for step in range(start,cfg['steps']):
             self.student.eval()  # no dropout, gradients intentionally enabled
             optimizer.zero_grad(set_to_none=True)
@@ -119,6 +120,11 @@ class ChunkRatioTrainer:
                 loss_total += anchor.item()
             optimizer.step()
             scheduler.step()
+            # Selection and resume checkpoints share one cadence and always include the last step;
+            # an interrupted run replays from the last checkpoint with its saved sampler/RNG state.
+            if (step+1) % interval and step+1 != cfg['steps']:
+                self.history.append({'step':step+1,'loss':loss_total,'selection_score':None,**diag})
+                continue
             if self.selector is not None:
                 score = float(self.selector(self.student))
             else:
