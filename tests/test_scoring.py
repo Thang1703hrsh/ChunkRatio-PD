@@ -3,7 +3,8 @@ import pytest
 
 torch = pytest.importorskip('torch',reason='PyTorch unavailable for active interpreter')
 from chunkratio.sampling import generate, stream
-from chunkratio.scoring import continuation_increments, score_batch, score_tokens, state_features
+from chunkratio.scoring import (continuation_increments, score_batch, score_tokens, state_features,
+                                trajectory_features)
 from chunkratio.tiny import TinyLM
 
 
@@ -33,6 +34,11 @@ def test_batching_features_causality_and_frozen_gradients() -> None:
     torch.testing.assert_close(f[0],state_features(model,[[1,2]])[0])
     extended = model(torch.tensor([[1,2,3,4]]),output_hidden_states=True).hidden_states[-1][0,1].detach()
     torch.testing.assert_close(f[0],extended)
+    # One causal pass gives every state's feature; each equals the prefix run alone.
+    trajectory = trajectory_features(model,[1,2],[3,4,0])
+    assert trajectory.shape == (3,8)
+    for t,state in enumerate([[1,2],[1,2,3],[1,2,3,4]]):
+        torch.testing.assert_close(trajectory[t],state_features(model,[state])[0])
     policy_scores = score_batch(model,prefixes,chunks,0,frozen=False)
     assert policy_scores.requires_grad
     policy_scores.sum().backward()
@@ -57,7 +63,8 @@ def test_frozen_roles_always_run_under_no_grad() -> None:
     tokens = generate(probe,[1,2],3,0,stream(1,'probe'))
     assert not continuation_increments(probe,[1,2],[3,4],0).requires_grad
     assert not state_features(probe,[[1,2]]).requires_grad
+    assert not trajectory_features(probe,[1,2],[3,4]).requires_grad
     assert not score_batch(probe,[[1]],[[2]],0,frozen=True).requires_grad
-    assert len(probe.modes) == len(tokens)+3 and not any(probe.modes)
+    assert len(probe.modes) == len(tokens)+4 and not any(probe.modes)
     score_batch(probe,[[1]],[[2]],0,frozen=False)
     assert probe.modes[-1]

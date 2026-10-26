@@ -11,7 +11,7 @@ from torch import nn
 from .artifacts import ShardStore, digest, read_jsonl
 from .math import suffix_returns
 from .sampling import generate, stream, terminal
-from .scoring import continuation_increments, score_batch, state_features
+from .scoring import continuation_increments, score_batch, trajectory_features
 
 
 def prepare_prompts(records: list[dict[str,Any]], seed: int) -> list[dict[str,Any]]:
@@ -136,8 +136,7 @@ def collect_correction(candidates: list[dict[str,Any]], models: dict[str,nn.Modu
             b = continuation_increments(models['teacher_base'],seed['prefix_ids'],tokens,eos)
             increments = a-b
             labels = suffix_returns(increments)
-            visited = [seed['prefix_ids']+tokens[:t] for t in range(len(tokens))]
-            features = state_features(models['student_ref'],visited).cpu().tolist()
+            features = trajectory_features(models['student_ref'],seed['prefix_ids'],tokens).cpu().tolist()
             budgets = [(cfg['horizon']-seed['n']-t)/cfg['horizon'] for t in range(len(tokens))]
             store.put(job_id,{'id':job_id,'seed':seed,'tokens':tokens,'features':features,'budgets':budgets,
                               'increments':increments.cpu().tolist(),'labels':labels.cpu().tolist(),

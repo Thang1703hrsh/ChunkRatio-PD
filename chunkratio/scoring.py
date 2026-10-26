@@ -112,6 +112,16 @@ def state_features(model: nn.Module, states: list[list[int]]) -> Tensor:
 
 
 @torch.no_grad()
+def trajectory_features(model: nn.Module, prefix: list[int], tokens: list[int]) -> Tensor:
+    """Features of every state before tokens[t] from one causal pass, position P+t-1 (§6.2)."""
+    assert prefix and tokens
+    model.eval()
+    ids = torch.tensor([prefix+tokens[:-1]],device=next(model.parameters()).device)
+    hidden = model(ids,attention_mask=torch.ones_like(ids),output_hidden_states=True,use_cache=False).hidden_states[-1]
+    return hidden[0,len(prefix)-1:].detach().float()
+
+
+@torch.no_grad()
 def continuation_increments(model: nn.Module, prefix: list[int], tokens: list[int], eos: int) -> Tensor:
     """Per-token frozen likelihoods for reverse suffix labels (§7.3)."""
     if not tokens:
