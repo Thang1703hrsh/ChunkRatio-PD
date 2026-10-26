@@ -41,6 +41,7 @@ Paths above are relative to chunkratio/ unless qualified.
 - [x] 8. Cross-platform tiny CPU smoke stages and variants (Windows + Git Bash).
 - [x] 9. Execute tests/smoke, resolve the stable-wheel block using official CPU nightly.
 - [x] 10. Re-read the specification, complete verification matrix/report, and commit delivery.
+- [x] 11. Independent review: formula audit, mutation check, scale fixes, verdict (REVIEW.md).
 
 Checked steps mean work delivered/reviewed; executed verification status and
 unfulfilled requirements are stated individually in REPORT.md.
