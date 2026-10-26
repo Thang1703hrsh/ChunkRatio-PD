@@ -1,8 +1,9 @@
 """Canonical split/prefix/candidate/correction records with resume (§§5–7,10)."""
 from __future__ import annotations
 
+import contextlib
 import copy
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,15 @@ from .artifacts import ShardStore, digest, read_jsonl
 from .math import suffix_returns
 from .sampling import generate, stream, terminal
 from .scoring import continuation_increments, score_batch, trajectory_features
+
+
+@contextlib.contextmanager
+def record_errors(kind: str, record_id: str) -> Iterator[None]:
+    """Non-finite or invalid scores fail with the record that produced them (§6.1)."""
+    try:
+        yield
+    except AssertionError as exc:
+        raise ValueError(f'nonfinite or invalid score in {kind} {record_id}') from exc
 
 
 def prepare_prompts(records: list[dict[str,Any]], seed: int) -> list[dict[str,Any]]:
@@ -74,30 +84,31 @@ def collect_candidates(states: list[dict[str,Any]], models: dict[str,nn.Module],
     for state in states:
         if store.get(state['id']) is not None:
             continue
-        candidates: dict[tuple[int,...],dict[str,Any]] = {}
-        counts = {'student_ref':0,'teacher_plus':0}
-        rng_states = {}
-        for source in ('student_ref','teacher_plus'):
-            rng = stream(cfg['seed'],'candidate/'+state['id']+'/'+source)
-            before = rng.get_state().tolist()
-            for _ in range(2):
-                tokens = generate(models[source],state['prefix_ids'],cfg['horizon']-state['n'],eos,rng,
-                                  None if cfg['variant'] == 'crpd_suffix' else length)
-                counts[source] += len(tokens)
-                key = tuple(tokens)
-                if key in candidates:
-                    candidates[key]['sources'].append(source)
-                else:
-                    candidates[key] = {'id':digest([state['id'],tokens]),'tokens':tokens,'sources':[source],
-                                       'terminal':terminal(state['response_ids']+tokens,cfg['horizon'],eos)}
-            rng_states[source] = {'before':before,'after':rng.get_state().tolist()}
-        rows = list(candidates.values())
-        for row in rows:
-            for source,model in models.items():
-                row['logp_'+source] = score_batch(model,[state['prefix_ids']],[row['tokens']],eos).item()
-        scored = {source:sum(len(row['tokens']) for row in rows) for source in models}
-        store.put(state['id'],{'state':state,'candidates':rows,'skipped':len(rows)<2,
-                               'rng':rng_states,'generated_tokens':counts,'scored_tokens':scored})
+        with record_errors('candidate state',state['id']):
+            candidates: dict[tuple[int,...],dict[str,Any]] = {}
+            counts = {'student_ref':0,'teacher_plus':0}
+            rng_states = {}
+            for source in ('student_ref','teacher_plus'):
+                rng = stream(cfg['seed'],'candidate/'+state['id']+'/'+source)
+                before = rng.get_state().tolist()
+                for _ in range(2):
+                    tokens = generate(models[source],state['prefix_ids'],cfg['horizon']-state['n'],eos,rng,
+                                      None if cfg['variant'] == 'crpd_suffix' else length)
+                    counts[source] += len(tokens)
+                    key = tuple(tokens)
+                    if key in candidates:
+                        candidates[key]['sources'].append(source)
+                    else:
+                        candidates[key] = {'id':digest([state['id'],tokens]),'tokens':tokens,'sources':[source],
+                                           'terminal':terminal(state['response_ids']+tokens,cfg['horizon'],eos)}
+                rng_states[source] = {'before':before,'after':rng.get_state().tolist()}
+            rows = list(candidates.values())
+            for row in rows:
+                for source,model in models.items():
+                    row['logp_'+source] = score_batch(model,[state['prefix_ids']],[row['tokens']],eos).item()
+            scored = {source:sum(len(row['tokens']) for row in rows) for source in models}
+            store.put(state['id'],{'state':state,'candidates':rows,'skipped':len(rows)<2,
+                                   'rng':rng_states,'generated_tokens':counts,'scored_tokens':scored})
     return store.records()
 
 
@@ -129,24 +140,25 @@ def collect_correction(candidates: list[dict[str,Any]], models: dict[str,nn.Modu
             job_id = digest([seed['id'],replica,source])
             if store.get(job_id) is not None:
                 continue
-            rng = stream(cfg['seed'],'correction/'+job_id)
-            before = rng.get_state().tolist()
-            tokens = generate(models[source],seed['prefix_ids'],cfg['horizon']-seed['n'],eos,rng)
-            numerator = 'student_ref' if teacher_direction else 'teacher_plus'
-            a = continuation_increments(models[numerator],seed['prefix_ids'],tokens,eos)
-            b = continuation_increments(models['teacher_base'],seed['prefix_ids'],tokens,eos)
-            increments = a-b
-            labels = suffix_returns(increments)
-            # Binary attachment written first; the JSON commit records its content hash.
-            features = trajectory_features(models['student_ref'],seed['prefix_ids'],tokens)
-            features_sha256 = store.put_tensor(job_id,'features',features)
-            budgets = [(cfg['horizon']-seed['n']-t)/cfg['horizon'] for t in range(len(tokens))]
-            store.put(job_id,{'id':job_id,'seed':seed,'tokens':tokens,'features_sha256':features_sha256,
-                              'features_shape':list(features.shape),'budgets':budgets,
-                              'increments':increments.cpu().tolist(),'labels':labels.cpu().tolist(),
-                              'terminal_target':0.,'rng_before':before,'rng_after':rng.get_state().tolist(),
-                              'generated_tokens':{source:len(tokens)},
-                              'scored_tokens':{numerator:len(tokens),'teacher_base':len(tokens)}})
+            with record_errors('correction job',job_id):
+                rng = stream(cfg['seed'],'correction/'+job_id)
+                before = rng.get_state().tolist()
+                tokens = generate(models[source],seed['prefix_ids'],cfg['horizon']-seed['n'],eos,rng)
+                numerator = 'student_ref' if teacher_direction else 'teacher_plus'
+                a = continuation_increments(models[numerator],seed['prefix_ids'],tokens,eos)
+                b = continuation_increments(models['teacher_base'],seed['prefix_ids'],tokens,eos)
+                increments = a-b
+                labels = suffix_returns(increments)
+                # Binary attachment written first; the JSON commit records its content hash.
+                features = trajectory_features(models['student_ref'],seed['prefix_ids'],tokens)
+                features_sha256 = store.put_tensor(job_id,'features',features)
+                budgets = [(cfg['horizon']-seed['n']-t)/cfg['horizon'] for t in range(len(tokens))]
+                store.put(job_id,{'id':job_id,'seed':seed,'tokens':tokens,'features_sha256':features_sha256,
+                                  'features_shape':list(features.shape),'budgets':budgets,
+                                  'increments':increments.cpu().tolist(),'labels':labels.cpu().tolist(),
+                                  'terminal_target':0.,'rng_before':before,'rng_after':rng.get_state().tolist(),
+                                  'generated_tokens':{source:len(tokens)},
+                                  'scored_tokens':{numerator:len(tokens),'teacher_base':len(tokens)}})
     return store.records()
 
 

@@ -69,3 +69,26 @@ def test_candidate_budget_is_global_and_chunk_cutoff_nonterminal(tmp_path: Path)
     for c in records['early']['candidates']:
         assert 1 <= len(c['tokens']) <= 4 and eos not in c['tokens'][:-1]
         assert c['terminal'] == (c['tokens'][-1] == eos)
+
+
+def test_nonfinite_scores_fail_with_record_id(tmp_path: Path) -> None:
+    """A NaN-producing frozen model fails with the offending state/job id (§6.1)."""
+    from types import SimpleNamespace
+    cfg = load_config('config/crpd/smoke.json')
+    models,_,_,info = load_models(cfg)
+
+    class NaNModel(torch.nn.Module):
+        """Frozen role whose logits are NaN (§6.1)."""
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1))
+        def forward(self, ids: torch.Tensor, **kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(logits=torch.full((*ids.shape,11),float('nan')))
+    state = {'id':'bad-state','prompt_id':'p','split':'train','prefix_ids':[1,2],'response_ids':[],'n':0}
+    with pytest.raises(ValueError,match='candidate state bad-state'):
+        collect_candidates([state],{**models,'teacher_base':NaNModel()},cfg,info['eos'],
+                           ShardStore(tmp_path/'c',{'t':'c'}))
+    record = {'state':state,'candidates':[],'skipped':True}
+    with pytest.raises(ValueError,match='correction job'):
+        collect_correction([record],{**models,'teacher_base':NaNModel()},cfg,info['eos'],
+                           ShardStore(tmp_path/'r',{'t':'r'}))
