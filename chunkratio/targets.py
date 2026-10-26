@@ -10,6 +10,7 @@ import torch
 from torch import nn
 
 from .artifacts import digest
+from .math import target_score
 from .sampling import generate, stream
 from .scoring import continuation_increments, state_features
 from .value_head import MeanHead
@@ -62,7 +63,9 @@ def build_targets(records: list[dict[str,Any]], head: MeanHead | None, models: d
                 with torch.no_grad():
                     mu = head(f,budget).item()
             row['endpoint_mu'] = mu
-            row['target_score'] = row['logp_teacher_plus']-row['logp_teacher_base']+mu
+            row['target_score'] = target_score(*(torch.tensor([row[k]],dtype=torch.float64) for k in
+                                                 ('logp_teacher_plus','logp_teacher_base','endpoint_mu')),
+                                               torch.tensor([row['terminal']])).item()
             candidates.append(row)
             if cfg['variant'] == 'crpd_audit' and not row['terminal'] and len(audits) < cfg.get('audit_endpoints',8):
                 audits.append({'candidate_id':row['id'],'mu_hat':mu,**exponential_audit(
