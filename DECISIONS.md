@@ -44,3 +44,54 @@
     are not present. Do not substitute CRPD variants. Benchmark CLI plans require
     pinned external installations and official generation/annotator configs;
     generated plans are reviewable templates, not verified benchmark results.
+
+## Review (27 October 2026)
+
+Reviewer decisions. Each fix is in a separate `review:` commit; REVIEW.md lists them.
+
+13. **Single target formula**: `build_targets` now calls `math.target_score`
+    instead of repeating the formula inline, so one tested function defines
+    `t_s(c) = delta_T + mu_hat` with terminal `mu_hat = 0`. Values are unchanged.
+14. **Correction features**: the spec (§6.2) defines the feature of the state
+    before `y_t` as the hidden state at position `P+t-1`. One causal forward pass
+    over prefix+suffix gives all of them, and the per-prefix batch (all hidden
+    layers for N prefixes of length up to P+N) cannot fit in GPU memory at H=512.
+    Features are stored as binary tensor attachments to each correction shard.
+    The JSON record commits only the content hash, which is verified on every
+    load. This replaces JSON float lists (about 20 MB per trajectory at d=2048),
+    which ruled out any LLM-scale run.
+15. **Head minibatches**: the objective is unchanged (sum over a trajectory /
+    H, mean over the trajectories in an optimizer step). Codex's loop took a
+    single full-batch step per epoch, so the declared 20 epochs meant 20 Adam
+    steps. `head_batch_size` (trajectories per step, shuffled by the
+    `head-batches/<epoch>` stream) is optional and defaults to full batch,
+    which keeps smoke results identical. Research configs use 64, a declared
+    starting setting rather than a tuned value.
+16. **Selection cadence**: reward-model selection on `select` prompts and the
+    full resume checkpoint now run every `selection_interval` steps and at the
+    final step. Synthetic runs default to 1. Real configs must set it, and
+    research configs use 100 (10 RM selections in 1000 steps). The selection
+    rule itself is unchanged and identical for every method. Resume restarts
+    from the last checkpoint with its saved sampler/RNG state, so it stays exact.
+17. **Ineligible prompts**: following spec §5.2, prompts with
+    len(prompt)+H > the smallest model context are dropped before generation,
+    and their ids are recorded in the manifest. Previously one such prompt
+    aborted the run. A model without a known context length still fails closed.
+18. **EOS convention**: `prepare-data` now rejects chat templates whose
+    assistant turn does not contain the tokenizer EOS (for example Llama-3
+    `<|eot_id|>` with `eos_token=<|end_of_text|>`). The collection sampler stops
+    only at that EOS, so such a template would silently run every response to H.
+19. **Audit endpoints**: spec §7.4 requires replicated audits on fixed
+    endpoints, including teacher-proposed ones. The audit quota is now split
+    equally between proposing sources (first source of a deduplicated
+    candidate), in record order and independent of outcomes.
+20. **Device and dtype per teacher**: teachers may set their own `device` and
+    `dtype`. The student reference, student and head share the top-level device;
+    validation enforces this. Defaults are unchanged (all FP32, one device).
+    The protocol still declares FP32 because bf16 forward noise can be
+    comparable to a small `log T+ - log T0`. Placing the teachers on a second
+    GPU is the intended way to fit two FP32 8B teachers.
+21. **Not changed**: `correction_replicates=4` (Decision 9) is kept as Codex's
+    declared setting, although the spec does not require replicates in the
+    training data and it multiplies correction cost by 4. Revisit it after
+    measuring pilot throughput, and decide before observing returns.
