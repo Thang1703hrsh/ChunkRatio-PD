@@ -1,0 +1,11 @@
+{
+  "model": null,
+  "revision": null,
+  "data": "data/deita_10k.jsonl",
+  "device": "cuda",
+  "seed": 0,
+  "output": "output/preparation/sft_student",
+  "epochs": 3,
+  "learning_rate": 2e-05,
+  "batch_size": 128
+}

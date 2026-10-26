@@ -13,6 +13,8 @@ from .artifacts import digest
 
 def freeze(model: nn.Module) -> nn.Module:
     """Frozen models are eval/no parameter gradients (§§2,6)."""
+    for parameter in model.parameters():
+        parameter.grad = None
     return model.eval().requires_grad_(False)
 
 

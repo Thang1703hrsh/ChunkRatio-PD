@@ -1,0 +1,12 @@
+{
+  "model": null,
+  "revision": null,
+  "data": "data/preference.jsonl",
+  "device": "cuda",
+  "seed": 0,
+  "output": "output/preparation/dpo_teacher",
+  "epochs": 2,
+  "learning_rate": 5e-07,
+  "batch_size": 128,
+  "beta": 0.05
+}

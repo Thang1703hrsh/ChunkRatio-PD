@@ -1,0 +1,77 @@
+{
+  "variant": "crpd_suffix",
+  "horizon": 512,
+  "chunk_length": 32,
+  "candidates": 4,
+  "alpha": 0.3,
+  "learning_rate": 1e-06,
+  "optimizer": "AdamW",
+  "batch_size": 128,
+  "steps": 1000,
+  "seed": 0,
+  "head_epochs": 20,
+  "head_learning_rate": 0.001,
+  "endpoint_fraction": 0.5,
+  "correction_replicates": 4,
+  "output": "output/crpd_suffix",
+  "prompts": "data/dpo_mix_7k.jsonl",
+  "device": "cuda",
+  "dtype": "float32",
+  "weight_decay": 0,
+  "collection_decoding": {
+    "temperature": 1,
+    "top_k": 0,
+    "top_p": 1
+  },
+  "models": {
+    "teacher_plus": {
+      "path": null,
+      "revision": null
+    },
+    "teacher_base": {
+      "path": null,
+      "revision": null
+    },
+    "student_ref": {
+      "path": null,
+      "revision": null
+    }
+  },
+  "teacher_dpo_reference_verified": false,
+  "selection": {
+    "reward_model_revision": null,
+    "decoding": {
+      "max_new_tokens": 1024,
+      "do_sample": false
+    }
+  },
+  "preparation": {
+    "sft_dataset": "Deita-10K-V0",
+    "sft_epochs": 3,
+    "sft_learning_rate": 2e-05,
+    "sft_batch_size": 128,
+    "teacher_dpo_beta": 0.05,
+    "teacher_dpo_learning_rate": 5e-07,
+    "teacher_dpo_batch_size": 128,
+    "teacher_dpo_epochs": 2
+  },
+  "protocol": {
+    "teacher_family": "LLaMA-3.1-8B",
+    "student_family": "LLaMA-3.2-1B",
+    "datasets": [
+      "DPO-MIX-7K",
+      "HelpSteer2"
+    ],
+    "second_pair": "Mistral-7B/Danube only after tokenizer preflight; otherwise LLaMA-3.2-3B",
+    "seeds": [
+      0,
+      1,
+      2
+    ]
+  },
+  "anchor_lambda": 0.1,
+  "anchor_beta": 0.05,
+  "audit_replicates": 16,
+  "audit_endpoints": 8,
+  "synthetic": false
+}
