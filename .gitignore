@@ -1,0 +1,4 @@
+winrate_results/
+__pycache__/
+*.pyc
+output/

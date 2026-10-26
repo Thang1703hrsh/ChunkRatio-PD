@@ -1,0 +1,48 @@
+# ChunkRPO: chunk-level, one-sided SBA Bregman ratio matching.
+#
+# Changes the unit of preference optimization from a token (TBPO) or a full
+# response (DPO/BPO) to a deterministic discourse-aware *chunk*. The objective is
+# alignment-free (m != n allowed), one-sided (already-separated chunks frozen),
+# and value-head-free (single forward pass per response, cross-response baseline).
+name: ChunkRPO
+
+# SBA Bregman generator h_lambda (Eq. 9). lambda -> 0 recovers the KL/logistic
+# generator. lambda is the per-chunk robustness knob: larger lambda downweights
+# grossly-violating (R_hat -> 0) chunks more aggressively (Prop. 3).
+bregman_loss:
+  name: sba
+  lam: 0.5
+  s: 4.0       # scale; s = R_C^{lambda+1} recovers the squared-hinge ChunkRPO (Prop. 2)
+  # clip log R for numerical stability (used by shared h-function utilities)
+  l_logr: -30.0
+  u_logr: 30.0
+
+# ChunkRPO-specific knobs
+chunkrpo:
+  # chunk log-ratio (Eq. 4)
+  eta: 1.0              # length-normalization exponent in [0.5, 1]; 1.0 = mean per-token
+
+  # robust cross-response baseline (Eq. 5)
+  alpha: 0.1            # trimming fraction in [0, 0.5); 0 recovers the raw group mean
+  n_min: 4             # below this many chunks, fall back to the median baseline
+  standardize: false    # robust (MAD) standardization of advantages (Eq. 8); off by default
+
+  # one-sided target margin (Eq. 10): R_C = exp(tau_c), tau_c >= 0
+  tau_c: 0.0
+
+  # saliency weighting (Eq. 12, ablation). rho = 0 -> uniform weights (default loss)
+  rho: 0.0
+  saliency_temp: 1.0
+
+  # deterministic chunker regularizers (Section 3.1)
+  min_chunk_tokens: 4
+  max_chunk_tokens: 64
+
+# preference scale beta (Eq. 4)
+beta: 0.1
+
+# token_level kept for interface compatibility with the shared data path
+token_level: true
+
+# label smoothing is not used by ChunkRPO (the one-sided gate handles fidelity)
+label_smoothing: 0
