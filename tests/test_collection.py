@@ -5,7 +5,8 @@ import pytest
 
 torch = pytest.importorskip('torch',reason='collection requires PyTorch')
 from chunkratio.artifacts import ShardStore, read_jsonl
-from chunkratio.collection import collect_candidates, collect_correction, collect_prefixes, prepare_prompts
+from chunkratio.collection import (collect_candidates, collect_correction, collect_prefixes, correction_features,
+                                  prepare_prompts)
 from chunkratio.config import load_config
 from chunkratio.models import load_models
 from chunkratio.sampling import generate, stream, terminal
@@ -32,8 +33,10 @@ def test_correction_rollouts_labels_and_features(tmp_path: Path, variant: str, s
     prompts = prepare_prompts(read_jsonl(Path(cfg['prompts'])),cfg['seed'])
     states = collect_prefixes(prompts,models['student_ref'],cfg,eos,ShardStore(tmp_path/'p',{'t':'p'}))
     records = collect_candidates(states[:3],models,cfg,eos,ShardStore(tmp_path/'c',{'t':'c'}))
-    rows = collect_correction(records,models,cfg,eos,ShardStore(tmp_path/'r',{'t':'r'}))
-    assert rows
+    store = ShardStore(tmp_path/'r',{'t':'r'})
+    rows = collect_correction(records,models,cfg,eos,store)
+    assert rows and all('features' not in row for row in rows)
+    load = correction_features(store)
     for row in rows:
         seed, tokens = row['seed'], row['tokens']
         assert set(row['generated_tokens']) == {source}
@@ -46,9 +49,11 @@ def test_correction_rollouts_labels_and_features(tmp_path: Path, variant: str, s
                                           token_logps(models['teacher_base'],seed['prefix_ids'],tokens))]
         assert row['labels'] == pytest.approx([sum(increments[t:]) for t in range(len(tokens))],abs=1e-5)
         assert row['budgets'] == pytest.approx([(horizon-seed['n']-t)/horizon for t in range(len(tokens))])
+        features = load(row)
+        assert features.shape == (len(tokens),12) and features.dtype == torch.float32
         for t in range(len(tokens)):
             alone = state_features(models['student_ref'],[seed['prefix_ids']+tokens[:t]])[0]
-            torch.testing.assert_close(torch.tensor(row['features'][t]),alone,atol=1e-6,rtol=0)
+            torch.testing.assert_close(features[t],alone,atol=1e-6,rtol=0)
 
 
 def test_candidate_budget_is_global_and_chunk_cutoff_nonterminal(tmp_path: Path) -> None:

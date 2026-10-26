@@ -12,7 +12,8 @@ from typing import Any
 import torch
 
 from .artifacts import ShardStore, digest, read_jsonl, stage_key, write_json
-from .collection import collect_candidates, collect_correction, collect_prefixes, prepare_prompts
+from .collection import (collect_candidates, collect_correction, collect_prefixes, correction_features,
+                         prepare_prompts)
 from .cost import ForwardMeter
 from .evaluation import reward_selector
 from .math import diagnostics, routing
@@ -100,7 +101,7 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
         if until == 'collect-correction':
             return {'trajectories':len(corrections),'route':route}
         head_path = output/'cache'/stage_key('head',{**correction_deps,'epochs':cfg['head_epochs'],'lr':cfg['head_learning_rate']})/'head.pt'
-        head,head_meta = fit_head(corrections,cfg,head_path)
+        head,head_meta = fit_head(corrections,cfg,head_path,correction_features(correction_store))
     if until in ('collect-correction','fit-head'):
         return {'head':head_meta,'route':route,'bypassed':bypass_head}
     targets = build_targets(records,head,models,cfg,eos,route)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,7 @@ from torch import Tensor, nn
 
 from .artifacts import atomic_bytes, digest
 from .math import head_objective
+from .sampling import stream
 from .scoring import fingerprint, freeze
 
 
@@ -35,28 +37,47 @@ class MeanHead(nn.Module):
         return self.net(torch.cat([features.detach().float(),budgets[:,None].float()],dim=-1)).squeeze(-1)
 
 
-def trajectory_loss(head: MeanHead, rows: list[dict[str,Any]], horizon: int) -> Tensor:
+FeatureLoader = Callable[[dict[str,Any]],Tensor]
+
+
+def row_features(row: dict[str,Any], features: FeatureLoader | None) -> Tensor:
+    """Inline features, or a binary shard loaded on demand (§§6.2,10)."""
+    if 'features' in row:
+        return torch.tensor(row['features'],dtype=torch.float32)
+    if features is None:
+        raise ValueError('correction row stores features in a shard; pass its loader')
+    return features(row)
+
+
+def trajectory_loss(head: MeanHead, rows: list[dict[str,Any]], horizon: int,
+                    features: FeatureLoader | None = None) -> Tensor:
     """Trajectory-uniform SSE/H including all nonterminal visited states (§7.4)."""
     device = next(head.parameters()).device
     predictions, labels = [],[]
     for row in rows:
-        features = torch.tensor(row['features'],dtype=torch.float32,device=device)
+        values = row_features(row,features).to(device=device,dtype=torch.float32)
         budgets = torch.tensor(row['budgets'],device=device)
-        predictions.append(head(features,budgets))
+        assert values.shape == (len(row['labels']),head.net[0].in_features-1)
+        predictions.append(head(values,budgets))
         labels.append(torch.tensor(row['labels'],dtype=torch.float32,device=device))
     return head_objective(predictions,labels,horizon)
 
 
-def fit_head(rows: list[dict[str,Any]], cfg: dict[str,Any], path: Path) -> tuple[MeanHead,dict[str,Any]]:
+def fit_head(rows: list[dict[str,Any]], cfg: dict[str,Any], path: Path,
+             features: FeatureLoader | None = None) -> tuple[MeanHead,dict[str,Any]]:
     """Fit, head_val-select, resume epoch/optimizer/RNG and freeze (§§7.4,10)."""
     train = [r for r in rows if r['seed']['split'] == 'train']
     validation = [r for r in rows if r['seed']['split'] == 'head_val']
     if not train or not validation:
         raise ValueError('head fitting requires disjoint train and head_val prompts')
+    # Trajectories per optimizer step; default is the full train set (one step per epoch).
+    batch_size = min(cfg.get('head_batch_size',len(train)),len(train))
+    hidden_size = row_features(train[0],features).shape[1]
     identity = digest({'rows':rows,'horizon':cfg['horizon'],'lr':cfg['head_learning_rate'],
-                       'seed':cfg['seed'],'architecture':'Linear(d+1,256)-GELU-Linear(256,1)'})
+                       'seed':cfg['seed'],'architecture':'Linear(d+1,256)-GELU-Linear(256,1)',
+                       'batch_size':batch_size})
     torch.manual_seed(cfg['seed']+503)
-    head = MeanHead(len(train[0]['features'][0])).to(cfg['device'])
+    head = MeanHead(hidden_size).to(cfg['device'])
     optimizer = torch.optim.AdamW(head.parameters(),lr=cfg['head_learning_rate'],weight_decay=0)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer,lambda _:1.)
     epoch, best, best_state, history = 0,float('inf'),None,[]
@@ -72,19 +93,24 @@ def fit_head(rows: list[dict[str,Any]], cfg: dict[str,Any], path: Path) -> tuple
         epoch,best,best_state,history = saved['epoch'],saved['best'],saved['best_state'],saved['history']
     for i in range(epoch,cfg['head_epochs']):
         head.train()
-        optimizer.zero_grad(set_to_none=True)
-        # Accumulate one trajectory at a time; normalize by total trajectories * H.
+        # Epoch order comes from its own stream, so resuming at an epoch boundary is exact.
+        order = (list(range(len(train))) if batch_size == len(train) else
+                 torch.randperm(len(train),generator=stream(cfg['seed'],f'head-batches/{i}')).tolist())
         total = 0.
-        for row in train:
-            loss = trajectory_loss(head,[row],cfg['horizon'])/len(train)
-            assert torch.isfinite(loss)
-            loss.backward()
-            total += loss.item()
-        optimizer.step()
-        scheduler.step()
+        for start in range(0,len(train),batch_size):
+            batch = [train[j] for j in order[start:start+batch_size]]
+            optimizer.zero_grad(set_to_none=True)
+            # Accumulate one trajectory at a time; normalize by step trajectories * H.
+            for row in batch:
+                loss = trajectory_loss(head,[row],cfg['horizon'],features)/len(batch)
+                assert torch.isfinite(loss)
+                loss.backward()
+                total += loss.item()*len(batch)/len(train)
+            optimizer.step()
+            scheduler.step()
         head.eval()
         with torch.no_grad():
-            val = trajectory_loss(head,validation,cfg['horizon']).item()
+            val = trajectory_loss(head,validation,cfg['horizon'],features).item()
         if val < best:
             best = val
             best_state = {k:v.detach().cpu().clone() for k,v in head.state_dict().items()}
@@ -97,6 +123,6 @@ def fit_head(rows: list[dict[str,Any]], cfg: dict[str,Any], path: Path) -> tuple
     freeze(head)
     metadata = {'identity':identity,'hash':fingerprint(head),'head_val':best,'history':history,
                 'feature_layer':'final','feature_dtype':'float32','budget_encoding':'(H-n)/H',
-                'hidden_size':len(train[0]['features'][0]),'train_prompt_reuse':True}
+                'hidden_size':hidden_size,'batch_trajectories':batch_size,'train_prompt_reuse':True}
     save_tensor(path,{'metadata':metadata,'state_dict':head.state_dict()})
     return head,metadata

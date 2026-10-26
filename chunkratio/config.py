@@ -38,6 +38,8 @@ def validate(cfg: dict[str,Any]) -> None:
     for key in ('alpha','learning_rate','head_learning_rate'):
         if not math.isfinite(cfg[key]) or cfg[key] <= 0:
             raise ValueError(f'{key} must be finite and positive')
+    if not isinstance(cfg.get('head_batch_size',1),int) or cfg.get('head_batch_size',1) <= 0:
+        raise ValueError('head_batch_size must be positive integer')
     if cfg['candidates'] != 4 or not 0 <= cfg['endpoint_fraction'] <= 1:
         raise ValueError('initial protocol requires K=4 and valid endpoint fraction')
     if cfg.get('weight_decay',0) != 0 or cfg['optimizer'] not in ('AdamW','Adam','RMSprop'):

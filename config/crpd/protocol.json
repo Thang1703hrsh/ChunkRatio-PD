@@ -11,6 +11,7 @@
   "seed": 0,
   "head_epochs": 20,
   "head_learning_rate": 0.001,
+  "head_batch_size": 64,
   "endpoint_fraction": 0.5,
   "correction_replicates": 4,
   "output": "output/crpd/DPO-MIX-7K/seed0",

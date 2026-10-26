@@ -80,6 +80,25 @@ class ShardStore:
         record = {'job_id':job_id,'payload':payload,'sha256':digest(payload)}
         atomic_bytes(self.path/(digest(job_id)+'.jsonl'),(json.dumps(record,sort_keys=True,allow_nan=False)+'\n').encode())
 
+    def put_tensor(self, job_id: str, name: str, tensor: Any) -> str:
+        """Atomically attach a binary tensor before its record commits; return content hash (§10)."""
+        import io
+        import torch
+        tensor = tensor.detach().cpu().contiguous()
+        buffer = io.BytesIO()
+        torch.save(tensor,buffer)
+        atomic_bytes(self.path/f'{digest(job_id)}.{name}.pt',buffer.getvalue())
+        return tensor_digest(tensor)
+
+    def get_tensor(self, job_id: str, name: str, sha256: str) -> Any:
+        """Load an attachment and verify it against the committed record hash (§10)."""
+        import torch
+        path = self.path/f'{digest(job_id)}.{name}.pt'
+        tensor = torch.load(path,map_location='cpu',weights_only=True)
+        if tensor_digest(tensor) != sha256:
+            raise ValueError(f'corrupt tensor shard {path}')
+        return tensor
+
     def records(self) -> list[dict[str,Any]]:
         """Read every completed shard deterministically (§10)."""
         result = []
@@ -89,6 +108,15 @@ class ShardStore:
             assert payload is not None
             result.append(payload)
         return result
+
+
+def tensor_digest(tensor: Any) -> str:
+    """Content identity of shape, dtype and raw values, independent of file encoding (§10)."""
+    h = hashlib.sha256(str((tuple(tensor.shape),str(tensor.dtype))).encode())
+    data = tensor.detach().cpu().contiguous().untyped_storage()
+    for start in range(0,len(data),1024*1024):
+        h.update(bytes(data[start:start+1024*1024]))
+    return h.hexdigest()
 
 
 def stage_key(stage: str, dependencies: dict[str,Any]) -> str:

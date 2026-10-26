@@ -6,7 +6,8 @@ import pytest
 
 torch = pytest.importorskip('torch',reason='pipeline runtime requires PyTorch')
 from chunkratio.artifacts import ShardStore
-from chunkratio.collection import collect_candidates, collect_correction, collect_prefixes, prepare_prompts
+from chunkratio.collection import (collect_candidates, collect_correction, collect_prefixes, correction_features,
+                                  prepare_prompts)
 from chunkratio.config import load_config
 from chunkratio.models import load_models
 from chunkratio.sampling import generate, stream, terminal
@@ -61,7 +62,7 @@ def test_collection_resume_and_gradient_routing(tmp_path: Path) -> None:
     records = collect_candidates(states,models,cfg,info['eos'],b)
     rows = collect_correction(records,models,cfg,info['eos'],c)
     assert rows == collect_correction(records,models,cfg,info['eos'],c)
-    head,_ = fit_head(rows,cfg,tmp_path/'head.pt')
+    head,_ = fit_head(rows,cfg,tmp_path/'head.pt',correction_features(c))
     targets = build_targets(records,head,models,cfg,info['eos'],'reference_mean')
     assert sum(p['weight'] for p in targets['pairs']) == pytest.approx(1.)
     frozen_before = {k:fingerprint(v) for k,v in models.items()}

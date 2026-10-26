@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -136,11 +137,19 @@ def collect_correction(candidates: list[dict[str,Any]], models: dict[str,nn.Modu
             b = continuation_increments(models['teacher_base'],seed['prefix_ids'],tokens,eos)
             increments = a-b
             labels = suffix_returns(increments)
-            features = trajectory_features(models['student_ref'],seed['prefix_ids'],tokens).cpu().tolist()
+            # Binary attachment written first; the JSON commit records its content hash.
+            features = trajectory_features(models['student_ref'],seed['prefix_ids'],tokens)
+            features_sha256 = store.put_tensor(job_id,'features',features)
             budgets = [(cfg['horizon']-seed['n']-t)/cfg['horizon'] for t in range(len(tokens))]
-            store.put(job_id,{'id':job_id,'seed':seed,'tokens':tokens,'features':features,'budgets':budgets,
+            store.put(job_id,{'id':job_id,'seed':seed,'tokens':tokens,'features_sha256':features_sha256,
+                              'features_shape':list(features.shape),'budgets':budgets,
                               'increments':increments.cpu().tolist(),'labels':labels.cpu().tolist(),
                               'terminal_target':0.,'rng_before':before,'rng_after':rng.get_state().tolist(),
                               'generated_tokens':{source:len(tokens)},
                               'scored_tokens':{numerator:len(tokens),'teacher_base':len(tokens)}})
     return store.records()
+
+
+def correction_features(store: ShardStore) -> Callable[[dict[str,Any]],torch.Tensor]:
+    """Lazy hash-verified loader for a correction row's detached rho features (§§6.2,10)."""
+    return lambda row: store.get_tensor(row['id'],'features',row['features_sha256'])
