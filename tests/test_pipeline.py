@@ -128,6 +128,9 @@ def test_selection_and_checkpoint_cadence(tmp_path: Path, monkeypatch: pytest.Mo
     assert len(calls) == 3 and saves == [2,4,5]
     assert [h['selection_score'] is not None for h in result['history']] == [False,True,False,True,True]
     assert result['optimizer_steps'] == 5
+    from chunkratio.config import validate
     with pytest.raises(ValueError,match='selection_interval'):
-        load_config('config/crpd/smoke.json') and __import__('chunkratio.config').config.validate(
-            {**cfg,'synthetic':False,'selection_interval':0})
+        validate({**cfg,'selection_interval':0})
+    unresolved = {k:v for k,v in cfg.items() if k != 'selection_interval'}
+    with pytest.raises(ValueError,match='explicit selection_interval'):
+        validate({**unresolved,'synthetic':False})
