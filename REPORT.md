@@ -329,3 +329,22 @@ The mathematical method and core verification are delivered. The remaining items
 above prevent claiming that the entire research protocol or every external
 benchmark adapter is complete. PLAN.md checkmarks track delivered workflow work;
 these explicit unresolved requirements are retained for the next reviewer.
+
+## Baseline tag verification (NARVAL task, step 0)
+
+`tbpo-baseline` is a lightweight tag on `01abcff43e4d61903168a0863a3131f1ff3a74f3`
+("first commit", 26 Oct 2026 23:20 +0700, Thang1703hrsh). Its parent is
+`32d21ec0856dbfb2462f2228c4b82c6acb5c2ceb`. `git show --stat tbpo-baseline`:
+
+```text
+ README.md | 3 ---
+ 1 file changed, 3 deletions(-)
+```
+
+The tag is the last of seven user upload commits and precedes Codex's first commit
+`21c84f1` ("crpd step 0"). The TBPO sources (`train.py`, `trainers.py`, `loss/`, `config/`,
+`preference_datasets.py`) and `reference/ChunkRatio_Math_Checks.{py,json}`,
+`reference/ChunkRatio_PD_Method_1_1.md` all arrive in the user's upload `09b1d90`. From
+`09b1d90` to the tag only `README.md` changes. The tagged tree has no `chunkratio/`,
+`prompts/`, `CLAUDE.md`, `AGENTS.md`, plan or decision files. The tag is therefore correct,
+and no `tbpo-original` tag was created.
