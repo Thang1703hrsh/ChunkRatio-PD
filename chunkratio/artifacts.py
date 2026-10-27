@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,22 @@ def digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
 
 
+def replace_with_retry(source: str, destination: Path, attempts: int = 12) -> None:
+    """os.replace, retried briefly when Windows sync/antivirus holds the destination (§10).
+
+    OneDrive or a scanner can lock a just-written file for a moment; replacing it then fails
+    with PermissionError. Any other error, or a lock that persists, still raises.
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(source,destination)
+            return
+        except PermissionError:
+            if attempt == attempts-1:
+                raise
+            time.sleep(min(.05*2**attempt,1.))
+
+
 def atomic_bytes(path: Path, content: bytes) -> None:
     """Commit a whole file using same-directory replace on Windows/Linux (§10)."""
     path.parent.mkdir(parents=True,exist_ok=True)
@@ -25,7 +42,7 @@ def atomic_bytes(path: Path, content: bytes) -> None:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary,path)
+        replace_with_retry(temporary,path)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
