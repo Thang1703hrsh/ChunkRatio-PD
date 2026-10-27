@@ -348,3 +348,122 @@ The tag is the last of seven user upload commits and precedes Codex's first comm
 `09b1d90` to the tag only `README.md` changes. The tagged tree has no `chunkratio/`,
 `prompts/`, `CLAUDE.md`, `AGENTS.md`, plan or decision files. The tag is therefore correct,
 and no `tbpo-original` tag was created.
+
+## NARVAL-comparable protocol (prompt 03)
+
+A second, config-selected protocol (`"protocol_name": "narval"`) sits beside the unchanged
+ADPA/TVKD protocol. The method mathematics, loss, routing, targets and variant semantics did
+not change. What was added (one `narval:` commit each):
+
+- Batched, KV-cached collection sampler (`sampling.generate_batch`). Prefixes are left-padded,
+  each row has its own `torch.Generator` named by the job's semantic id, and sampling uses
+  temperature 1 over raw logits with no truncation, penalty or forced EOS. Batched and
+  unbatched runs give identical tokens (`tests/test_sampling.py`, TinyLM, tiny Llama and tiny
+  Qwen3). The micro-benchmark is logged to `output/benchmarks/sampler_throughput.json`, not
+  asserted. On a tiny CPU Llama (16 rows x 24 tokens) the batched path was about 8.7x faster;
+  that is not a GPU estimate.
+- Pre-registration (DECISIONS items 22-25): collection shared by training seeds
+  (`collection_seed`), `correction_replicates = 1`, `states_per_prompt` (pilot value 4), and
+  per-row streams.
+- `python -m chunkratio diagnose-displacement`: d_s moments, empirical Jensen gap with a
+  bootstrap interval and a rare-tail flag, and sibling gap spread omega_s. Labelled a
+  diagnostic. Its exact-tree convergence test is `tests/test_diagnostics.py`.
+- `config/crpd/narval/{qwen3_8b_to_1p7b,qwen3_1p7b_to_0p6b,llama31_8b_to_llama32_1b}.json`
+  with fail-closed validation and the 1.7B -> 0.6B provenance link.
+- `prepare-data` for UltraFeedback Binarized (`--format ultrafeedback`, `--assign-split test`,
+  `--chat-template-kwargs`). `head_val` and `select` are held out of train_prefs by prompt id,
+  and the assignment hash is written to `<output>.splits.json`.
+- Preflight: padded output dims must be identical for all four models, and a declared
+  `eos_token` must be every tokenizer's EOS. Tiny Qwen3-style checkpoints are built in code
+  (`chunkratio/tiny.py::build_tiny_qwen3`, no download).
+- `narval-benchmark-plan` (templates only; no API calls) and `report --layout narval`.
+- `python -m chunkratio smoke --protocol narval-tiny`, which both smoke launchers now run.
+
+The NARVAL code itself was not inspected in this task. Everything that depends on it is
+`null` below. The Table 1/2 column order in `report --layout narval` follows the metric list
+in the task text and must be checked against the paper before publication.
+
+## Open inputs (NARVAL)
+
+Every item is `null` in all three protocol files and makes `validate-config` fail with the full
+list. Fill them only from the NARVAL repository, the paper or verified checkpoints.
+
+| Group | Fields | Notes |
+|---|---|---|
+| Checkpoints | `models.{teacher_plus,teacher_base,student_ref}.{path,revision}`; `narval.reference_rows.{teacher_dpo,teacher_sft,student_sft,student_dpo}.{path,revision}` | For qwen3_1p7b_to_0p6b, T0/T+ must equal the `student_sft`/`student_dpo` rows of qwen3_8b_to_1p7b (checked) |
+| Base checkpoints | `narval.base_checkpoints.{teacher,student}` | Base vs post-trained Qwen3/Llama ids |
+| SFT recipe | `narval.sft.{dataset_revision,epochs,learning_rate,batch_size,max_length}` | Deita-10K-V0 for teacher and student |
+| Teacher DPO | `narval.teacher_dpo.{dataset_revision,beta,learning_rate,epochs,max_length}` | UltraFeedback train_prefs. If max_length differs from H=512, revisit H (spec §5.2) |
+| Preference data | `narval.preference_data.{revision,split_manifest_sha256}` | Copy `assignment_sha256` from the `.splits.json` written by prepare-data |
+| Selection | `selection.reward_model_revision` | CRPD's own checkpoint-selection rule (FsfairX on `select`), the same for every method |
+| Open LLM | `open_llm.lm_eval_version`; per task `num_fewshot`, `metric`; `task` for ARC and TruthfulQA | ARC (challenge/easy) and TruthfulQA (mc1/mc2) variants are not verified |
+| MT-Bench | `mt_bench.{judge,judge_version}` | 8 categories plus average |
+| HH-RLHF | `hh_rlhf.{dataset_revision,subset_ids_file,subset_sha256,judge,judge_version,reference_outputs,reference_model}` | The task text names GPT-4o-mini as reference and GPT-5.4-mini as judge; not verified here |
+| EOS (Llama pair only) | `eos_token` | Must be the template's end-of-turn token for all four models |
+
+Declared (ours, not NARVAL's): H=512, L=32, K=4, alpha=0.3, lr=1e-6, 1000 steps, batch 128,
+`selection_interval=100`, `states_per_prompt=4`, `correction_replicates=1`, head settings,
+`anchor_lambda=0.1`, `anchor_beta=0.05`, held-out fractions 0.05/0.05, `generation_batch_size=16`.
+
+## Pilot: Qwen3-1.7B -> Qwen3-0.6B (commands)
+
+Run on Linux CUDA from the repository root after every open input above is filled. Nothing
+here has been run. The checkpoint, data and revision placeholders (`<...>`) are yours to fill.
+
+```text
+# 0. Local copies of UltraFeedback (requires the `datasets` package)
+python -c "from datasets import load_dataset as l; l('HuggingFaceH4/ultrafeedback_binarized',revision='<REV>',split='train_prefs').to_json('data/narval/raw/uf_train_prefs.jsonl')"
+python -c "from datasets import load_dataset as l; l('HuggingFaceH4/ultrafeedback_binarized',revision='<REV>',split='test_prefs').to_json('data/narval/raw/uf_test_prefs.jsonl')"
+
+# 1. Canonical prompts with the student-SFT tokenizer, thinking disabled
+python -m chunkratio prepare-data --input data/narval/raw/uf_train_prefs.jsonl --tokenizer <STUDENT_SFT_0P6B> --revision <REV> --output data/narval/qwen3_1p7b_to_0p6b/ultrafeedback_train.jsonl --format ultrafeedback --chat-template-kwargs '{"enable_thinking": false}'
+python -m chunkratio prepare-data --input data/narval/raw/uf_test_prefs.jsonl --tokenizer <STUDENT_SFT_0P6B> --revision <REV> --output data/narval/qwen3_1p7b_to_0p6b/ultrafeedback_test.jsonl --format ultrafeedback --assign-split test --chat-template-kwargs '{"enable_thinking": false}'
+
+# 2. Fill both Qwen3 protocol files, then check provenance and open inputs
+python -m chunkratio validate-config --config config/crpd/narval/qwen3_8b_to_1p7b.json
+python -m chunkratio validate-config --config config/crpd/narval/qwen3_1p7b_to_0p6b.json
+
+# 3. Verify the SFT/DPO reference rows against NARVAL Table 1 before any CRPD run
+python -m chunkratio narval-benchmark-plan --config config/crpd/narval/qwen3_1p7b_to_0p6b.json --model <STUDENT_SFT_0P6B> --model-id qwen3-0p6b-sft --output output/narval/rows/student_sft/plan.json
+python -m chunkratio benchmark-run --plan output/narval/rows/student_sft/plan.json --output output/narval/rows/student_sft/execution.json
+#    (repeat for teacher_sft, teacher_dpo and student_dpo; normalise to measured.jsonl and put the paper's numbers in reported.jsonl)
+python -m chunkratio report --layout narval --input output/narval/rows/measured.jsonl --reported output/narval/rows/reported.jsonl --output output/narval/rows/table1_check.md
+
+# 4. Displacement diagnostic on 100 train prompts (before training any student)
+python -m chunkratio diagnose-displacement --config config/crpd/narval/qwen3_1p7b_to_0p6b.json --prompts 100 --replicates 16 --output output/narval/qwen3_1p7b_to_0p6b/diagnostic
+
+# 5. One seed of each variant (copies of the protocol file with "variant" and "output" changed)
+python -m chunkratio evaluate --config config/crpd/narval/local/qwen3_1p7b_to_0p6b_crpd_main.json
+python -m chunkratio evaluate --config config/crpd/narval/local/qwen3_1p7b_to_0p6b_crpd_raw.json
+python -m chunkratio evaluate --config config/crpd/narval/local/qwen3_1p7b_to_0p6b_crpd_anchor.json
+```
+
+The protocol files set one `cache_root` per pair, so the three variants reuse a single prefix
+pool and candidate set, and `crpd_main` and `crpd_anchor` also reuse the correction rollouts and
+the head (`crpd_raw` needs none). Stage keys still separate everything a variant changes. On a
+budget, keep `generation_batch_size` as high as GPU memory allows: it does not change results.
+Place both FP32 teachers on a second GPU with `models.<teacher>.device`.
+
+## Verification after prompt 03 (27 October 2026)
+
+```text
+python -m pytest -q
+72 passed in 113.99s
+
+script/smoke_test.ps1 -Output output/smoke-narval-ps3          (Windows PowerShell 5.1)
+SMOKE PASSED: 7 variants, all stages, export/reload and standalone generation
+NARVAL-TINY SMOKE PASSED: prepare-data, diagnose-displacement, 3 variants, report --layout narval
+
+bash --noprofile --norc script/smoke_test.sh --output output/smoke-narval-bash
+SMOKE PASSED: 7 variants, all stages, export/reload and standalone generation
+NARVAL-TINY SMOKE PASSED: prepare-data, diagnose-displacement, 3 variants, report --layout narval
+
+python script/mutation_check.py
+34 of 34 mutations killed (29 earlier + shared collection broken, state selection reading an
+outcome, per-row generator removed, EOS from PAD, EOS check skipped)
+```
+
+The first PowerShell run failed with `PermissionError` in `os.replace` on `manifest.json`: the
+repository is in OneDrive, which briefly locks freshly written files. Atomic writes now retry
+that replace with bounded backoff (`artifacts.replace_with_retry`). Native Linux and CUDA are
+still not run; no NARVAL checkpoint, dataset or judge was used.

@@ -42,6 +42,9 @@ Paths above are relative to chunkratio/ unless qualified.
 - [x] 9. Execute tests/smoke, resolve the stable-wheel block using official CPU nightly.
 - [x] 10. Re-read the specification, complete verification matrix/report, and commit delivery.
 - [x] 11. Independent review: formula audit, mutation check, scale fixes, verdict (REVIEW.md).
+- [x] 12. NARVAL-comparable protocol (prompt 03): batched sampler, pre-registration, displacement diagnostic,
+      config/crpd/narval, UltraFeedback/Qwen3 preparation, evaluation templates, narval-tiny smoke.
+- [ ] 13. Fill NARVAL open inputs (REPORT.md) and run the Qwen3-1.7B -> 0.6B pilot on CUDA.
 
 Checked steps mean work delivered/reviewed; executed verification status and
 unfulfilled requirements are stated individually in REPORT.md.

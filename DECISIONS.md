@@ -122,3 +122,26 @@ Fixed on 27 October 2026, before any pilot collection or return was observed.
     because results do not depend on it. Candidate streams changed from one per source to
     one per draw, so caches from earlier revisions are not reused (the code revision is
     in every key anyway).
+
+## NARVAL protocol (prompt 03 implementation)
+
+26. **Second protocol, same method.** `"protocol_name": "narval"` adds validation rules but no
+    mathematics: variants `crpd_main`, `crpd_raw`, `crpd_anchor` only; `correction_replicates = 1`;
+    Qwen3 pairs fix `eos_token = <|im_end|>` and `enable_thinking = false`. Outside synthetic runs
+    every `null` fails closed with the complete list of open inputs.
+27. **Padded vocabularies.** Preflight now accepts an output layer larger than the tokenizer
+    (Qwen3 pads 151,669 tokens to 151,936 logits) only when all four models have the same padded
+    size. Sampling still uses softmax over every raw logit, as spec §5.3 says; trained models put
+    negligible mass on padded ids, and the tiny random models do not, which is harmless.
+28. **UltraFeedback splits.** The first pair per `prompt_id` (file order) is kept; later duplicates
+    are listed in the split manifest. `head_val` and `select` are held out of `train_prefs` by a
+    rank rule on sha256([seed, 'uf-split', prompt_id]) with declared fractions 0.05/0.05 (at least
+    one prompt each), so small files cannot leave a split empty. `test_prefs` is all `test`.
+29. **Synthetic runs with local checkpoints.** A synthetic config that names local model paths now
+    loads them with the HF classes (narval-tiny); TinyLM is used only when no path is given.
+30. **Shared cache per pair.** `cache_root` lets the three variants reuse every stage whose key
+    matches. Keys already include the schedule, candidate rule, correction direction, head
+    settings (now including `head_batch_size`), variant (targets) and full config (policy).
+31. **Report layout is provisional.** `report --layout narval` uses the metric columns named in the
+    task text. The NARVAL paper was not read here, so the exact Table 1/2 column order and metric
+    variants (ARC, TruthfulQA) remain open inputs.
