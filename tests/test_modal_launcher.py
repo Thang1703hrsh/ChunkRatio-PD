@@ -19,3 +19,15 @@ def test_launcher_stages_and_hardware() -> None:
     assert "@app.function(cpu=0.25,memory=1024,**common)\ndef run_pilot" in source
     assert "gpu='L40S',cpu=4.0,memory=16384,retries=1,**common)\ndef sft_student" in source
     assert module.VARIANTS == ('crpd_main','crpd_raw','crpd_anchor')
+
+
+def test_launcher_imports_inside_container(tmp_path,monkeypatch) -> None:
+    """Modal re-imports the file as /root/qwen3_pilot.py, where parents[2] does not exist."""
+    import modal
+    shallow = tmp_path/'qwen3_pilot.py'
+    shallow.write_text(Path('script/modal/qwen3_pilot.py').read_text(encoding='utf-8'),encoding='utf-8')
+    monkeypatch.setattr(modal,'is_local',lambda: False)
+    spec = importlib.util.spec_from_file_location('qwen3_pilot_remote',shallow)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module.REPO == Path(module.REMOTE_REPO)

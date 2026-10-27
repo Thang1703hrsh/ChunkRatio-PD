@@ -28,8 +28,9 @@ from pathlib import Path
 import modal
 
 APP_NAME = 'crpd-qwen3-pilot'
-REPO = Path(__file__).resolve().parents[2]
 REMOTE_REPO = '/root/repo'
+# Inside a container this file is /root/qwen3_pilot.py, so the repo root only exists locally.
+REPO = Path(__file__).resolve().parents[2] if modal.is_local() else Path(REMOTE_REPO)
 VOLUME_PATH = '/vol'
 PAIR = 'qwen3_1p7b_to_0p6b'
 DATA = f'data/narval/{PAIR}'
