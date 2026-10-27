@@ -32,6 +32,27 @@ def test_resume_integrity_and_incompatible_metadata(tmp_path: Path) -> None:
         store.get('job')
 
 
+def test_tensor_shards_hash_elements_fast_and_store_only_the_view(tmp_path: Path) -> None:
+    """Digest covers shape, dtype and the view's own bytes; a 16 MB shard round-trips quickly (§10)."""
+    import hashlib
+    import time
+    torch = pytest.importorskip('torch')
+    from chunkratio.artifacts import tensor_digest
+    hidden = torch.randn(1,40,8)
+    view = hidden[0,10:]
+    expected = hashlib.sha256(str((tuple(view.shape),str(view.dtype))).encode())
+    expected.update(bytes(view.contiguous().clone().untyped_storage()))
+    assert tensor_digest(view) == expected.hexdigest() == tensor_digest(view.clone())
+    store = ShardStore(tmp_path,{'kind':'features'})
+    sha = store.put_tensor('job','features',view)
+    loaded = store.get_tensor('job','features',sha)
+    assert torch.equal(loaded,view) and loaded.untyped_storage().nbytes() == view.numel()*4
+    big = torch.randn(4096,1024)
+    start = time.perf_counter()
+    store.get_tensor('big','features',store.put_tensor('big','features',big))
+    assert time.perf_counter()-start < 5.
+
+
 def test_stage_identity() -> None:
     """Dependency changes yield isolated cache namespaces (§10)."""
     assert stage_key('targets',{'head':'a'}) != stage_key('targets',{'head':'b'})

@@ -174,9 +174,75 @@ def check(revision: str) -> dict:
     return report
 
 
+@app.function(image=image,gpu='L40S',cpu=4.0,memory=32768,timeout=15*60,volumes={VOLUME_PATH:volume})
+def profile(revision: str, horizon: int) -> dict:
+    """Per-stage wall time on real Qwen3 weights with the pilot's L=32, K=4 and 4 states per prompt."""
+    import torch
+    work = Path('/root/work')
+    work.mkdir(exist_ok=True)
+    for name in ('chunkratio','config','reference','script'):
+        if not (work/name).exists():
+            (work/name).symlink_to(Path(REMOTE_REPO)/name)
+    os.chdir(work)
+    sys.path.insert(0,str(work))
+    os.environ['CRPD_CODE_REVISION'] = revision
+    import chunkratio.pipeline as stages_module
+    from transformers import AutoTokenizer
+    from chunkratio.artifacts import read_json
+    from chunkratio.config import validate
+    from chunkratio.data import prepare_data
+    from chunkratio.pilot import POLICY_TUNING
+    seconds = {}
+    def timer(name, function):
+        """Accumulate synchronized wall time per stage and print it as soon as the stage ends."""
+        def wrapped(*args, **kwargs):
+            """Timed call."""
+            torch.cuda.synchronize()
+            start = time.perf_counter()
+            value = function(*args,**kwargs)
+            torch.cuda.synchronize()
+            seconds[name] = round(seconds.get(name,0.)+time.perf_counter()-start,1)
+            print(json.dumps({'stage':name,'seconds':seconds[name],
+                              'peak_gb':round(torch.cuda.max_memory_allocated()/2**30,2)}),flush=True)
+            return value
+        return wrapped
+    for name in ('load_models','eligible_prompts','collect_prefixes','collect_candidates','collect_correction',
+                 'fit_head','build_targets'):
+        setattr(stages_module,name,timer(name,getattr(stages_module,name)))
+    stages_module.ChunkRatioTrainer.train = timer('train_policy',stages_module.ChunkRatioTrainer.train)
+    real = Path(f'output/gpu-profile/h{horizon}')
+    ultrafeedback_rows(real/'data'/'uf.jsonl')
+    shared = AutoTokenizer.from_pretrained('Qwen/Qwen3-0.6B-Base',revision='main')
+    shared.eos_token = '<|im_end|>'
+    shared.save_pretrained(real/'tokenizer')
+    tokenizer = str(real/'tokenizer')
+    prepare_data(real/'data'/'uf.jsonl',tokenizer,'local',real/'data'/'train.jsonl',0,
+                 'ultrafeedback',None,{'enable_thinking':False},.2,.1,'<|im_end|>')
+    roles = {'teacher_plus':'Qwen/Qwen3-1.7B','teacher_base':'Qwen/Qwen3-1.7B-Base','student_ref':'Qwen/Qwen3-0.6B-Base'}
+    cfg = read_json(Path('config/crpd/narval/qwen3_1p7b_to_0p6b.json'))
+    cfg.update(synthetic=True,device='cuda',horizon=horizon,batch_size=16,steps=10,head_epochs=20,head_batch_size=64,
+               generation_batch_size=64,selection_interval=10,prompts=str(real/'data'/'train.jsonl'),
+               cache_root=str(real/'cache'),variant='crpd_main',output=str(real/'crpd_main'),**POLICY_TUNING,
+               models={role:{'path':path,'revision':'main','tokenizer':tokenizer,'tokenizer_revision':'local'}
+                       for role,path in roles.items()})
+    validate(cfg)
+    start = time.perf_counter()
+    result = stages_module.pipeline(cfg,'evaluate')
+    total = time.perf_counter()-start
+    report = {'gpu':torch.cuda.get_device_name(0),'horizon':horizon,
+              'settings':{k:cfg[k] for k in ('chunk_length','candidates','states_per_prompt','correction_replicates',
+                                             'endpoint_fraction','batch_size','steps','policy_microbatch_size',
+                                             'generation_batch_size','head_epochs')},
+              'train_prompts':sum(1 for line in open(cfg['prompts'],encoding='utf-8') if '"train"' in line),
+              'stage_seconds':seconds,'pipeline_seconds':round(total,1),'counts':result['counts'],
+              'cost':result['cost'],'last_loss':result['policy']['history'][-1]}
+    print('PROFILE DONE',flush=True)
+    return report
+
+
 @app.local_entrypoint()
-def main() -> None:
-    """Run the check once and print its report (ephemeral app; stops when done)."""
+def main(mode: str = 'check', horizon: int = 128) -> None:
+    """Run the check (default) or `--mode profile --horizon H` once and print its report."""
     revision = subprocess.check_output(['git','rev-parse','HEAD'],cwd=REPO,text=True).strip()
-    report = check.remote(revision)
+    report = check.remote(revision) if mode == 'check' else profile.remote(revision,horizon)
     print(json.dumps(report,indent=2,ensure_ascii=False))

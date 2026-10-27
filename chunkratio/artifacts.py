@@ -105,7 +105,8 @@ class ShardStore:
         """Atomically attach a binary tensor before its record commits; return content hash (§10)."""
         import io
         import torch
-        tensor = tensor.detach().cpu().contiguous()
+        # clone(): torch.save writes a view's whole storage (e.g. prompt-position hidden states).
+        tensor = tensor.detach().cpu().contiguous().clone()
         buffer = io.BytesIO()
         torch.save(tensor,buffer)
         atomic_bytes(self.path/f'{digest(job_id)}.{name}.pt',buffer.getvalue())
@@ -133,10 +134,11 @@ class ShardStore:
 
 def tensor_digest(tensor: Any) -> str:
     """Content identity of shape, dtype and raw values, independent of file encoding (§10)."""
+    import torch
     h = hashlib.sha256(str((tuple(tensor.shape),str(tensor.dtype))).encode())
-    data = tensor.detach().cpu().contiguous().untyped_storage()
-    for start in range(0,len(data),1024*1024):
-        h.update(bytes(data[start:start+1024*1024]))
+    # The tensor's own element bytes, hashed in one call: bytes(UntypedStorage) looped per byte
+    # in Python (minutes per feature shard) and also hashed storage outside a sliced view.
+    h.update(tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy())
     return h.hexdigest()
 
 
