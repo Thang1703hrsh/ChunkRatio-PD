@@ -12,6 +12,7 @@ from typing import Any
 import torch
 
 from .artifacts import ShardStore, digest, read_jsonl, stage_key, write_json
+from .config import collection_seed
 from .collection import (collect_candidates, collect_correction, collect_prefixes, correction_features,
                          prepare_prompts)
 from .cost import ForwardMeter
@@ -33,7 +34,7 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
     eos = info['eos']
     identities = {role:fingerprint(model) for role,model in models.items()}
     route = routing(identities['teacher_plus'],identities['teacher_base'],identities['student_ref'])
-    prompts = prepare_prompts(read_jsonl(Path(cfg['prompts'])),cfg['seed'])
+    prompts = prepare_prompts(read_jsonl(Path(cfg['prompts'])),collection_seed(cfg))
     contexts = [getattr(model.config,'max_position_embeddings',None) or getattr(model.config,'n_positions',None)
                 for model in models.values()]
     if any(context is None for context in contexts):
@@ -72,7 +73,7 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
     if until == 'validate-config':
         return manifest
     common = {'models':identities,'tokenizer':info,'horizon':cfg['horizon'],'precision':manifest['precision'],
-              'split_hash':manifest['split_hash'],'seed':cfg['seed'],'schema':1,'code_revision':revision,
+              'split_hash':manifest['split_hash'],'collection_seed':collection_seed(cfg),'schema':1,'code_revision':revision,
               'documents':documents,'feature_convention':'last-valid-token/final-layer/budget'}
     length = 1 if cfg['variant'] == 'crpd_token' else cfg['chunk_length']
     dependencies = {**common,'schedule':length}

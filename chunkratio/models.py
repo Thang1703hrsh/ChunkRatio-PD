@@ -7,6 +7,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from .config import collection_seed
 from .scoring import freeze, preflight
 from .tiny import TinyLM, TinyTokenizer
 
@@ -14,14 +15,14 @@ from .tiny import TinyLM, TinyTokenizer
 def load_models(cfg: dict[str,Any]) -> tuple[dict[str,nn.Module],nn.Module,list[Any],dict[str,Any]]:
     """Four model roles with identical tokenization and frozen initialization (§2)."""
     if cfg.get('synthetic',False):
-        torch.manual_seed(cfg['seed']+101)
+        torch.manual_seed(collection_seed(cfg)+101)
         base = TinyLM()
         plus = copy.deepcopy(base)
-        gen = torch.Generator().manual_seed(cfg['seed']+103)
+        gen = torch.Generator().manual_seed(collection_seed(cfg)+103)
         with torch.no_grad():
             for p in plus.parameters():
                 p.add_(torch.randn(p.shape,generator=gen)*.07)
-        torch.manual_seed(cfg['seed']+107)
+        torch.manual_seed(collection_seed(cfg)+107)
         rho = TinyLM()
         tokenizers = [TinyTokenizer() for _ in range(4)]
     else:

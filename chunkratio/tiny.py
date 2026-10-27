@@ -19,10 +19,30 @@ class TinyLM(nn.Module):
         self.config = SimpleNamespace(vocab_size=vocab_size,hidden_size=hidden_size,max_position_embeddings=2048)
 
     def forward(self, input_ids: Tensor, attention_mask: Tensor | None = None,
-                output_hidden_states: bool = False, use_cache: bool = False) -> SimpleNamespace:
-        """Right-padded suffixes cannot affect earlier hidden states (§6.2)."""
-        hidden,_ = self.recurrent(self.embedding(input_ids))
-        return SimpleNamespace(logits=self.lm_head(hidden),hidden_states=(hidden,) if output_hidden_states else None)
+                output_hidden_states: bool = False, use_cache: bool = False,
+                past_key_values: Tensor | None = None, position_ids: Tensor | None = None) -> SimpleNamespace:
+        """Masked positions (left or right padding) leave the recurrent state unchanged (§6.2).
+
+        The recurrent state is the cache: past_key_values continues from earlier tokens.
+        """
+        steps = input_ids.shape[1]
+        mask = (torch.ones_like(input_ids) if attention_mask is None else attention_mask[:,-steps:]).bool()
+        state = (torch.zeros(1,len(input_ids),self.config.hidden_size,device=input_ids.device)
+                 if past_key_values is None else past_key_values)
+        embedded, outputs = self.embedding(input_ids), []
+        right_padded = bool((mask.long().cummin(-1).values == mask.long()).all())
+        if mask.all() or (right_padded and not use_cache):
+            # Trailing padding cannot change earlier outputs; one fused recurrent call suffices.
+            hidden,state = self.recurrent(embedded,state)
+            return SimpleNamespace(logits=self.lm_head(hidden),hidden_states=(hidden,) if output_hidden_states else None,
+                                   past_key_values=state if use_cache else None)
+        for t in range(steps):
+            output,updated = self.recurrent(embedded[:,t:t+1],state)
+            state = torch.where(mask[None,:,t,None],updated,state)
+            outputs.append(output)
+        hidden = torch.cat(outputs,dim=1)
+        return SimpleNamespace(logits=self.lm_head(hidden),hidden_states=(hidden,) if output_hidden_states else None,
+                               past_key_values=state if use_cache else None)
 
     def get_output_embeddings(self) -> nn.Linear:
         """Expose output vocabulary for canonical preflight (§5.1)."""

@@ -10,6 +10,7 @@ import torch
 from torch import Tensor, nn
 
 from .artifacts import atomic_bytes, digest
+from .config import collection_seed
 from .math import head_objective
 from .sampling import stream
 from .scoring import fingerprint, freeze
@@ -74,9 +75,9 @@ def fit_head(rows: list[dict[str,Any]], cfg: dict[str,Any], path: Path,
     batch_size = min(cfg.get('head_batch_size',len(train)),len(train))
     hidden_size = row_features(train[0],features).shape[1]
     identity = digest({'rows':rows,'horizon':cfg['horizon'],'lr':cfg['head_learning_rate'],
-                       'seed':cfg['seed'],'architecture':'Linear(d+1,256)-GELU-Linear(256,1)',
+                       'seed':collection_seed(cfg),'architecture':'Linear(d+1,256)-GELU-Linear(256,1)',
                        'batch_size':batch_size})
-    torch.manual_seed(cfg['seed']+503)
+    torch.manual_seed(collection_seed(cfg)+503)
     head = MeanHead(hidden_size).to(cfg['device'])
     optimizer = torch.optim.AdamW(head.parameters(),lr=cfg['head_learning_rate'],weight_decay=0)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer,lambda _:1.)
@@ -95,7 +96,7 @@ def fit_head(rows: list[dict[str,Any]], cfg: dict[str,Any], path: Path,
         head.train()
         # Epoch order comes from its own stream, so resuming at an epoch boundary is exact.
         order = (list(range(len(train))) if batch_size == len(train) else
-                 torch.randperm(len(train),generator=stream(cfg['seed'],f'head-batches/{i}')).tolist())
+                 torch.randperm(len(train),generator=stream(collection_seed(cfg),f'head-batches/{i}')).tolist())
         total = 0.
         for start in range(0,len(train),batch_size):
             batch = [train[j] for j in order[start:start+batch_size]]

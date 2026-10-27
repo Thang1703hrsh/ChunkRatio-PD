@@ -10,6 +10,14 @@ VARIANTS = ('crpd_main','crpd_raw','crpd_mu_teacher','crpd_token','crpd_suffix',
 STAGES = ('validate-config','collect-prefixes','collect-candidates','collect-correction','fit-head','build-targets','train-policy','evaluate')
 
 
+def collection_seed(cfg: dict[str,Any]) -> int:
+    """Seed for splits, synthetic models, collection, endpoint selection and the head (§10).
+
+    Training seeds share it; they vary only policy sampling and minibatch order.
+    """
+    return cfg.get('collection_seed',0)
+
+
 def load_config(path: str | Path) -> dict[str,Any]:
     """Read explicit JSON/YAML config without silently inheriting TBPO values (§8)."""
     p = Path(path)

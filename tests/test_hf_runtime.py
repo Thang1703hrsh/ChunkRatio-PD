@@ -168,3 +168,28 @@ def test_per_role_teacher_dtype_and_device(tmp_path: Path) -> None:
     assert pipeline(cfg,'build-targets')['route'] == 'reference_mean'
     with pytest.raises(ValueError,match='top-level device'):
         validate({**cfg,'models':{**cfg['models'],'student_ref':{**cfg['models']['student_ref'],'device':'cuda:1'}}})
+
+
+def test_hf_batched_cached_sampling_and_throughput_log(tmp_path: Path) -> None:
+    """Left-padded KV-cached Llama rows equal unbatched rows; throughput is logged, not asserted (§§5.3,10)."""
+    import time
+    from chunkratio.artifacts import write_json
+    from chunkratio.sampling import generate, generate_batch, stream
+    from test_sampling import check_batch_invariance
+    paths = checkpoints(tmp_path)
+    model = transformers.LlamaForCausalLM.from_pretrained(paths['student_ref']).eval()
+    check_batch_invariance(model,0,None)
+    check_batch_invariance(model,0,2)
+    prefixes = [[1,2+i%10,3] for i in range(16)]
+    started = time.perf_counter()
+    single = [generate(model,p,24,99,stream(0,f'bench/{i}')) for i,p in enumerate(prefixes)]
+    sequential = time.perf_counter()-started
+    started = time.perf_counter()
+    batched = generate_batch(model,prefixes,[24]*16,99,[stream(0,f'bench/{i}') for i in range(16)])
+    together = time.perf_counter()-started
+    assert batched == single
+    tokens = sum(map(len,batched))
+    log = {'rows':16,'tokens':tokens,'sequential_tokens_per_second':tokens/sequential,
+           'batched_tokens_per_second':tokens/together,'note':'tiny CPU Llama; logged only, not a GPU estimate'}
+    write_json(Path('output/benchmarks/sampler_throughput.json'),log)
+    print('sampler throughput',log)

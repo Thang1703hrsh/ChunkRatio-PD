@@ -10,8 +10,9 @@ import torch
 from torch import nn
 
 from .artifacts import digest
+from .config import collection_seed
 from .math import target_score
-from .sampling import generate, stream
+from .sampling import generate_batch, stream
 from .scoring import continuation_increments, state_features
 from .value_head import MeanHead
 
@@ -20,10 +21,10 @@ from .value_head import MeanHead
 def exponential_audit(prefix: list[int], remaining: int, models: dict[str,nn.Module],
                       cfg: dict[str,Any], eos: int, job: str) -> dict[str,Any]:
     """Replicated log-mean-exp estimate, delta-method SE and bootstrap uncertainty (§9)."""
-    rng = stream(cfg['seed'],'exponential-audit/'+job)
+    rngs = [stream(collection_seed(cfg),f'exponential-audit/{job}/{r}') for r in range(cfg['audit_replicates'])]
+    suffixes = generate_batch(models['student_ref'],[prefix]*len(rngs),[remaining]*len(rngs),eos,rngs)
     values, tokens = [],0
-    for _ in range(cfg['audit_replicates']):
-        suffix = generate(models['student_ref'],prefix,remaining,eos,rng)
+    for suffix in suffixes:
         a = continuation_increments(models['teacher_plus'],prefix,suffix,eos)
         b = continuation_increments(models['teacher_base'],prefix,suffix,eos)
         values.append(float((a.cpu().double()-b.cpu().double()).sum()))
@@ -32,7 +33,7 @@ def exponential_audit(prefix: list[int], remaining: int, models: dict[str,nn.Mod
     shifted = (d-d.max()).exp()
     phi = float(d.max()+shifted.mean().log())
     se = float(shifted.std(unbiased=True)/len(d)**.5/shifted.mean())
-    bootstrap = stream(cfg['seed'],'audit-bootstrap/'+job)
+    bootstrap = stream(collection_seed(cfg),'audit-bootstrap/'+job)
     indices = torch.randint(len(d),(256,len(d)),generator=bootstrap)
     replicas = torch.logsumexp(d[indices],dim=1)-math.log(len(d))
     interval = torch.quantile(replicas,torch.tensor([.025,.975],dtype=torch.float64)).tolist()
