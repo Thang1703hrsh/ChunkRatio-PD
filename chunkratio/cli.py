@@ -57,6 +57,11 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_argument('--revision',required=True)
     sub.add_argument('--output',required=True)
     sub.add_argument('--seed',type=int,default=0)
+    sub.add_argument('--format',choices=('auto','ultrafeedback'),default='auto')
+    sub.add_argument('--assign-split',choices=('train','head_val','select','test'))
+    sub.add_argument('--chat-template-kwargs',default='{}')
+    sub.add_argument('--head-val-fraction',type=float,default=.05)
+    sub.add_argument('--select-fraction',type=float,default=.05)
     for name in ('train-sft','train-teacher-dpo'):
         sub = commands.add_parser(name)
         sub.add_argument('--config',required=True)
@@ -98,7 +103,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == 'prepare-data':
             from .data import prepare_data
-            prepare_data(Path(args.input),args.tokenizer,args.revision,Path(args.output),args.seed)
+            prepare_data(Path(args.input),args.tokenizer,args.revision,Path(args.output),args.seed,args.format,
+                         args.assign_split,json.loads(args.chat_template_kwargs),args.head_val_fraction,args.select_fraction)
             return 0
         if args.command in ('train-sft','train-teacher-dpo'):
             from .preparation import prepare_checkpoint

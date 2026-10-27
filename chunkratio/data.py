@@ -5,7 +5,7 @@ import itertools
 from pathlib import Path
 from typing import Any
 
-from .artifacts import atomic_bytes, read_jsonl
+from .artifacts import atomic_bytes, digest, read_jsonl, write_json
 
 
 def helpsteer_pairs(rows: list[dict[str,Any]]) -> list[dict[str,Any]]:
@@ -24,15 +24,71 @@ def helpsteer_pairs(rows: list[dict[str,Any]]) -> list[dict[str,Any]]:
     return pairs
 
 
-def prepare_data(source: Path, tokenizer_path: str, revision: str, destination: Path, seed: int) -> None:
+def ultrafeedback_pairs(rows: list[dict[str,Any]]) -> list[dict[str,Any]]:
+    """UltraFeedback Binarized rows: shared conversation prefix, last assistant turns as the pair (§11, NARVAL)."""
+    pairs, seen = [],set()
+    for row in rows:
+        # Keep the first pair per prompt id in file order; later duplicates are recorded by the caller.
+        if row['prompt_id'] in seen:
+            continue
+        seen.add(row['prompt_id'])
+        chosen, rejected = row['chosen'], row['rejected']
+        if chosen[:-1] != rejected[:-1] or chosen[-1]['role'] != 'assistant' or rejected[-1]['role'] != 'assistant':
+            raise ValueError(f"malformed UltraFeedback pair {row.get('prompt_id')}")
+        pairs.append({'messages':chosen[:-1],'chosen':chosen[-1]['content'],'rejected':rejected[-1]['content'],
+                      'group_id':row['prompt_id']})
+    return pairs
+
+
+def rank_split(group_ids: list[str], seed: int, head_val_fraction: float, select_fraction: float) -> dict[str,str]:
+    """Hold out head_val and select by prompt id before any generation; never touches test (§7.1).
+
+    Groups are ranked by sha256([seed, 'uf-split', id]); the first round(f*n) (at least one when
+    f > 0) go to head_val, the next to select, the rest to train.
+    """
+    unique = sorted(set(group_ids),key=lambda g:digest([seed,'uf-split',g]))
+    counts = [max(1,round(f*len(unique))) if f > 0 else 0 for f in (head_val_fraction,select_fraction)]
+    if sum(counts) >= len(unique):
+        raise ValueError('held-out fractions leave no train prompts')
+    split = {g:'head_val' for g in unique[:counts[0]]}
+    split.update({g:'select' for g in unique[counts[0]:sum(counts)]})
+    split.update({g:'train' for g in unique[sum(counts):]})
+    return split
+
+
+def prepare_data(source: Path, tokenizer_path: str, revision: str, destination: Path, seed: int,
+                 fmt: str = 'auto', assign_split: str | None = None,
+                 template_kwargs: dict[str,Any] | None = None,
+                 head_val_fraction: float = .05, select_fraction: float = .05) -> None:
     """Serialize prompts once; strict template seam; retain human pairs for anchors only (§5.1)."""
     import json
     from transformers import AutoTokenizer
     from .collection import prepare_prompts
     tok = AutoTokenizer.from_pretrained(tokenizer_path,revision=revision)
     rows = read_jsonl(source)
+    template_kwargs = template_kwargs or {}
+    ultrafeedback = fmt == 'ultrafeedback' or (fmt == 'auto' and rows and 'prompt_id' in rows[0]
+                                               and isinstance(rows[0].get('chosen'),list))
     if rows and 'helpfulness' in rows[0]:
         rows = helpsteer_pairs(rows)
+    elif ultrafeedback:
+        raw_ids = [r['prompt_id'] for r in rows]
+        rows = ultrafeedback_pairs(rows)
+        duplicates = sorted({g for g in raw_ids if raw_ids.count(g) > 1})
+        if assign_split is None:
+            assignment = rank_split([r['group_id'] for r in rows],seed,head_val_fraction,select_fraction)
+            rule = "rank by sha256([seed,'uf-split',prompt_id]); first round(f*n) head_val, next select, rest train"
+        else:
+            assignment = {r['group_id']:assign_split for r in rows}
+            rule = f'all rows assigned to {assign_split}'
+        for row in rows:
+            row['split'] = assignment[row['group_id']]
+        write_json(destination.with_name(destination.stem+'.splits.json'),
+                   {'source':source.name,'format':'ultrafeedback_binarized','seed':seed,'rule':rule,
+                    'fractions':{'head_val':head_val_fraction,'select':select_fraction},
+                    'counts':{s:sum(v == s for v in assignment.values()) for s in sorted(set(assignment.values()))},
+                    'assignment_sha256':digest(sorted(assignment.items())),
+                    'duplicate_prompt_ids_first_pair_kept':duplicates,'rows_in':len(raw_ids),'rows_out':len(rows)})
     output = []
     for row in rows:
         messages = row.get('messages')
@@ -44,10 +100,11 @@ def prepare_data(source: Path, tokenizer_path: str, revision: str, destination: 
             chosen,rejected = row['chosen'][-1]['content'],row['rejected'][-1]['content']
         else:
             chosen,rejected = row['chosen'],row['rejected']
-        prefix = tok.apply_chat_template(messages,tokenize=True,add_generation_prompt=True)
+        prefix = tok.apply_chat_template(messages,tokenize=True,add_generation_prompt=True,**template_kwargs)
         result = {'messages':messages,'prompt_ids':prefix,'tokenizer_revision':revision}
         for label,text in (('chosen',chosen),('rejected',rejected)):
-            full = tok.apply_chat_template(messages+[{'role':'assistant','content':text}],tokenize=True,add_generation_prompt=False)
+            full = tok.apply_chat_template(messages+[{'role':'assistant','content':text}],tokenize=True,
+                                           add_generation_prompt=False,**template_kwargs)
             if full[:len(prefix)] != prefix:
                 raise ValueError('template prompt/response seam differs; no silent re-tokenization allowed')
             continuation = full[len(prefix):]

@@ -224,3 +224,33 @@ def test_qwen3_preflight_eos_padded_vocab_and_sampling(tmp_path: Path) -> None:
     padded = transformers.Qwen3ForCausalLM(transformers.Qwen3Config(**{**student.config.to_dict(),'vocab_size':32}))
     with pytest.raises(ValueError,match='padded output vocabulary'):
         preflight(tokenizers,roles[:3]+[padded],'<|im_end|>')
+
+
+def test_prepare_ultrafeedback_qwen3_template(tmp_path: Path) -> None:
+    """UltraFeedback rows: thinking-disabled template, <|im_end|> once, prompt-id held-out splits with hash (§§5.1,7.1)."""
+    from chunkratio.artifacts import read_jsonl
+    from chunkratio.data import prepare_data
+    from chunkratio.tiny import synthetic_ultrafeedback, tiny_qwen3_tokenizer
+    tiny_qwen3_tokenizer().save_pretrained(tmp_path/'tok')
+    source = tmp_path/'uf_train.jsonl'
+    synthetic_ultrafeedback(source)
+    kwargs = {'enable_thinking':False}
+    prepare_data(source,str(tmp_path/'tok'),'local',tmp_path/'train.jsonl',0,template_kwargs=kwargs)
+    rows = read_jsonl(tmp_path/'train.jsonl')
+    manifest = read_json(tmp_path/'train.splits.json')
+    assert manifest['counts'] == {'head_val':1,'select':1,'train':7} and len(manifest['assignment_sha256']) == 64
+    assert manifest['duplicate_prompt_ids_first_pair_kept'] == ['p0'] and manifest['rows_out'] == 9
+    by_group = {}
+    for row in rows:
+        by_group.setdefault(row['group_id'],set()).add(row['split'])
+        assert row['prompt_ids'][-2:] == [3,4] and row['chosen_ids'][-1] == 2 and row['chosen_ids'].count(2) == 1
+    assert all(len(splits) == 1 for splits in by_group.values()) and len(by_group) == 9
+    prepare_data(source,str(tmp_path/'tok'),'local',tmp_path/'again.jsonl',0,template_kwargs=kwargs)
+    assert read_json(tmp_path/'again.splits.json') == manifest
+    prepare_data(source,str(tmp_path/'tok'),'local',tmp_path/'test.jsonl',0,assign_split='test',template_kwargs=kwargs)
+    assert {r['split'] for r in read_jsonl(tmp_path/'test.jsonl')} == {'test'}
+    # Without enable_thinking=False the prompt stops at 'assistant' and the think block moves into the
+    # response, so the template kwarg must be fixed in config (validate-config enforces it).
+    prepare_data(source,str(tmp_path/'tok'),'local',tmp_path/'think.jsonl',0)
+    thinking = read_jsonl(tmp_path/'think.jsonl')[0]
+    assert thinking['prompt_ids'][-1] == 6 and thinking['chosen_ids'][:2] == [3,4]

@@ -121,3 +121,21 @@ def build_tiny_qwen3(root: Path, seed: int = 0) -> dict[str,Path]:
         model.save_pretrained(paths[role])
         tiny_qwen3_tokenizer().save_pretrained(paths[role])
     return paths
+
+
+def synthetic_ultrafeedback(path: Path, rows: int = 10) -> None:
+    """Write UltraFeedback-Binarized-format rows over the tiny Qwen3 vocabulary (synthetic, §12)."""
+    import json
+    lines = []
+    for i in range(rows):
+        user = {'role':'user','content':f'w{i%12} w{(i+3)%12}'}
+        # The last row repeats prompt p0, as UltraFeedback can hold several pairs per prompt.
+        prompt_id = 'p0' if i == rows-1 else f'p{i}'
+        if i == rows-1:
+            user = {'role':'user','content':'w0 w3'}
+        lines.append(json.dumps({'prompt_id':prompt_id,'prompt':user['content'],
+                                 'chosen':[user,{'role':'assistant','content':f'w{(i+5)%12} w{(i+6)%12}'}],
+                                 'rejected':[user,{'role':'assistant','content':f'w{(i+7)%12}'}],
+                                 'score_chosen':8.0,'score_rejected':4.0}))
+    path.parent.mkdir(parents=True,exist_ok=True)
+    path.write_text('\n'.join(lines)+'\n',encoding='utf-8')
