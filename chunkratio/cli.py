@@ -21,6 +21,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = commands.add_parser('smoke')
     sub.add_argument('--config',default='config/crpd/smoke.json')
     sub.add_argument('--output',default='output/smoke')
+    sub.add_argument('--protocol',choices=('default','narval-tiny'),default='default')
     sub = commands.add_parser('toy-check')
     sub.add_argument('--output',default='output/reference-checks.json')
     sub = commands.add_parser('learned-tree')
@@ -126,8 +127,9 @@ def main(argv: list[str] | None = None) -> int:
             prepare_checkpoint(read_json(Path(args.config)),args.command)
             return 0
         if args.command == 'smoke':
-            from .smoke import smoke
-            result = smoke(Path(args.output),load_config(args.config))
+            from .smoke import smoke, smoke_narval
+            result = (smoke_narval(Path(args.output)) if args.protocol == 'narval-tiny'
+                      else smoke(Path(args.output),load_config(args.config)))
             print(result['summary'])
             return 0
         if args.command == 'learned-tree':

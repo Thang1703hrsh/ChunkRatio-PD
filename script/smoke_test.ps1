@@ -6,4 +6,6 @@ try {
     $ErrorActionPreference = 'Continue'
     python -m chunkratio smoke --output $Output
     if ($LASTEXITCODE -ne 0) { throw "CRPD smoke failed with exit code $LASTEXITCODE" }
+    python -m chunkratio smoke --protocol narval-tiny --output "$Output/narval-tiny"
+    if ($LASTEXITCODE -ne 0) { throw "CRPD narval-tiny smoke failed with exit code $LASTEXITCODE" }
 } finally { Pop-Location }
