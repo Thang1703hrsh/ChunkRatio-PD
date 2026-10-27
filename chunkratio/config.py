@@ -52,6 +52,8 @@ def validate(cfg: dict[str,Any]) -> None:
         value = cfg.get(key)
         if value is not None and (not isinstance(value,int) or value < (0 if key == 'collection_seed' else 1)):
             raise ValueError(f'{key} must be a positive integer or null')
+    if cfg.get('cache_root') is not None and (not isinstance(cfg['cache_root'],str) or Path(cfg['cache_root']).is_absolute()):
+        raise ValueError('cache_root must be a relative path')
     if cfg['candidates'] != 4 or not 0 <= cfg['endpoint_fraction'] <= 1:
         raise ValueError('initial protocol requires K=4 and valid endpoint fraction')
     if cfg.get('weight_decay',0) != 0 or cfg['optimizer'] not in ('AdamW','Adam','RMSprop'):

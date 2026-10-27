@@ -55,6 +55,8 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
     prompts,ineligible = eligible_prompts(cfg,models,tokenizers)
     output = Path(cfg['output'])
     output.mkdir(parents=True,exist_ok=True)
+    # A shared cache_root lets variants of one pair reuse every stage whose key matches (§10).
+    cache = Path(cfg['cache_root']) if cfg.get('cache_root') else output/'cache'
     root = Path(__file__).resolve().parents[1]
     documents = {str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
                  for p in sorted((root/'reference').glob('*')) if p.suffix in ('.md','.py','.json')}
@@ -85,7 +87,7 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
     dependencies = {**common,'schedule':length,'states_per_prompt':cfg.get('states_per_prompt')}
     def store(stage: str, metadata: dict[str,Any]) -> ShardStore:
         """Stage namespace follows only its upstream dependencies (§10)."""
-        return ShardStore(output/'cache'/stage_key(stage,metadata),metadata)
+        return ShardStore(cache/stage_key(stage,metadata),metadata)
     if route == 'no_alignment_update':
         # Routing precedes any correction collection and ANY optimization.
         if not cfg.get('synthetic',False):
@@ -113,12 +115,13 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
         corrections = collect_correction(records,models,cfg,eos,correction_store)
         if until == 'collect-correction':
             return {'trajectories':len(corrections),'route':route}
-        head_path = output/'cache'/stage_key('head',{**correction_deps,'epochs':cfg['head_epochs'],'lr':cfg['head_learning_rate']})/'head.pt'
+        head_path = cache/stage_key('head',{**correction_deps,'epochs':cfg['head_epochs'],'lr':cfg['head_learning_rate'],
+                                                         'batch':cfg.get('head_batch_size')})/'head.pt'
         head,head_meta = fit_head(corrections,cfg,head_path,correction_features(correction_store))
     if until in ('collect-correction','fit-head'):
         return {'head':head_meta,'route':route,'bypassed':bypass_head}
     targets = build_targets(records,head,models,cfg,eos,route)
-    target_path = output/'cache'/stage_key('targets',{**candidate_deps,'head':head_meta['hash'],
+    target_path = cache/stage_key('targets',{**candidate_deps,'head':head_meta['hash'],
                 'variant':cfg['variant'],'audit_replicates':cfg.get('audit_replicates',0)})
     write_json(target_path/'targets.json',targets)
     write_json(output/'target_index.json',{'path':str(target_path/'targets.json'),'head_hash':head_meta['hash']})
@@ -128,7 +131,7 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
     trainer = ChunkRatioTrainer(student,models['student_ref'],targets,prompts,cfg,eos,selector)
     policy_deps = {'code_revision':revision,'targets':digest(targets),
                    'config':{k:v for k,v in cfg.items() if k not in ('output','steps')}}
-    policy_path = output/'cache'/stage_key('policy',policy_deps)/'resume.pt'
+    policy_path = cache/stage_key('policy',policy_deps)/'resume.pt'
     policy = trainer.train(policy_path)
     write_json(output/'policy_index.json',{'path':str(policy_path),'code_revision':revision})
     frozen_after = {role:fingerprint(model) for role,model in models.items()}

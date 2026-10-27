@@ -144,3 +144,18 @@ def test_training_seeds_share_collection_and_head(tmp_path: Path) -> None:
     third = stage_dirs(tmp_path/'a')
     assert {k:v for k,v in third.items() if k != 'policy'} == {k:v for k,v in first.items() if k != 'policy'}
     assert len(third['policy']) == 2
+
+
+def test_variants_share_cache_root(tmp_path: Path) -> None:
+    """With one cache_root, crpd_raw and crpd_anchor reuse crpd_main's prefixes, candidates, corrections and head."""
+    from chunkratio.pipeline import pipeline
+    base = {**load_config('config/crpd/smoke.json'),'steps':1,'cache_root':str(tmp_path/'cache')}
+    pipeline({**base,'output':str(tmp_path/'main')},'train-policy')
+    before = {p.name for p in (tmp_path/'cache').iterdir()}
+    pipeline({**base,'variant':'crpd_anchor','output':str(tmp_path/'anchor')},'train-policy')
+    pipeline({**base,'variant':'crpd_raw','output':str(tmp_path/'raw')},'train-policy')
+    added = {p.name for p in (tmp_path/'cache').iterdir()}-before
+    assert sorted(n.split('-')[0] for n in added) == ['policy','policy','targets','targets']
+    with pytest.raises(ValueError,match='relative'):
+        from chunkratio.config import validate
+        validate({**base,'cache_root':str((tmp_path/'abs').resolve())})

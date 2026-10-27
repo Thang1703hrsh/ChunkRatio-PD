@@ -20,6 +20,7 @@
   "states_per_prompt": 4,
   "generation_batch_size": 16,
   "output": "output/narval/qwen3_8b_to_1p7b/crpd_main/seed0",
+  "cache_root": "output/narval/qwen3_8b_to_1p7b/cache",
   "prompts": "data/narval/qwen3_8b_to_1p7b/ultrafeedback_train.jsonl",
   "device": "cuda",
   "dtype": "float32",
