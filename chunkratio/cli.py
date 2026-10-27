@@ -35,6 +35,11 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_argument('--input',required=True)
     sub.add_argument('--output',required=True)
     sub.add_argument('--allow-incomplete',action='store_true')
+    sub.add_argument('--layout',choices=('default','narval'),default='default')
+    sub.add_argument('--reported')
+    sub = commands.add_parser('narval-benchmark-plan')
+    for name in ('config','model','model-id','output'):
+        sub.add_argument('--'+name,required=True)
     sub = commands.add_parser('benchmark-plan')
     for name in ('model','model-id','judge','adpa-outputs','output'):
         sub.add_argument('--'+name,required=True)
@@ -82,11 +87,21 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == 'report':
             from .evaluation import report_tables
+            if args.layout == 'narval':
+                from .evaluation import report_narval
+                reported = read_jsonl(Path(args.reported)) if args.reported else []
+                atomic_bytes(Path(args.output),report_narval(read_jsonl(Path(args.input)),reported,args.allow_incomplete).encode())
+                return 0
             atomic_bytes(Path(args.output),report_tables(read_jsonl(Path(args.input)),args.allow_incomplete).encode())
             return 0
         if args.command == 'benchmark-plan':
             from .experiment import benchmark_plan
             write_json(Path(args.output),benchmark_plan(args.model,args.model_id,args.judge,args.adpa_outputs,str(Path(args.output).parent)))
+            return 0
+        if args.command == 'narval-benchmark-plan':
+            from .experiment import narval_benchmark_plan
+            write_json(Path(args.output),narval_benchmark_plan(read_json(Path(args.config)),args.model,args.model_id,
+                                                              str(Path(args.output).parent)))
             return 0
         if args.command == 'benchmark-run':
             from .experiment import execute_plan

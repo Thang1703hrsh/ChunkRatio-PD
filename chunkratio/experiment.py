@@ -67,3 +67,35 @@ def estimate_cost(states: int, trajectories: int, average_suffix: float,
     return {'generated_tokens':generated,'scored_tokens':scored,'estimated_gpu_hours':estimate,
             'assumptions':'L=32 K=4; aggregate single-GPU rates; excludes prefix prefill, head fit, policy, preparation and tuning',
             'status':'conditional estimate' if estimate is not None else 'unavailable: provide measured target-hardware throughput'}
+
+
+def narval_benchmark_plan(cfg: dict[str,Any], model: str, model_id: str, output: str) -> dict[str,Any]:
+    """NARVAL-comparable evaluation plan from config; every null fails closed; never calls an API (§11.4)."""
+    from .config import open_inputs
+    evaluation = cfg['narval']['evaluation']
+    missing = open_inputs(evaluation,'narval.evaluation')
+    if missing:
+        raise ValueError('NARVAL evaluation open inputs: '+', '.join(missing))
+    jobs = []
+    for name,task in evaluation['open_llm']['tasks'].items():
+        jobs.append({'metric':name,'metric_name':task['metric'],'cwd':'.','argv':[
+            sys.executable,'-m','lm_eval','--model','hf','--model_args','pretrained='+model,'--tasks',task['task'],
+            '--num_fewshot',str(task['num_fewshot']),'--batch_size','auto','--log_samples',
+            '--output_path',f'{output}/open_llm/{name}']})
+    mt = evaluation['mt_bench']
+    jobs += [{'metric':'mt_bench_answers','cwd':'mtbench/FastChat','argv':[sys.executable,'-m','fastchat.llm_judge.gen_model_answer',
+              '--model-path',model,'--model-id',model_id]},
+             {'metric':'mt_bench','categories':mt['categories'],'judge':mt['judge'],'judge_version':mt['judge_version'],
+              'cwd':'mtbench/FastChat','argv':[sys.executable,'-m','fastchat.llm_judge.gen_judgment','--model-list',model_id,
+              '--judge-model',mt['judge'],'--mode','single']}]
+    hh = evaluation['hh_rlhf']
+    jobs.append({'metric':'hh_rlhf_pairwise','subset_ids_file':hh['subset_ids_file'],'subset_sha256':hh['subset_sha256'],
+                 'judge':hh['judge'],'judge_version':hh['judge_version'],'reference_model':hh['reference_model'],'cwd':'.',
+                 'argv':[sys.executable,'-m','alpaca_eval','evaluate','--model_outputs',f'{output}/hh_rlhf_outputs.json',
+                         '--reference_outputs',hh['reference_outputs'],'--annotators_config',f'{output}/hh_annotator.yaml',
+                         '--output_path',f'{output}/hh_rlhf']})
+    return {'model':model,'model_id':model_id,'protocol':'narval','pair':cfg['narval']['pair'],'jobs':jobs,
+            'requires':{'lm_eval':evaluation['open_llm']['lm_eval_version'],'fastchat':'vendored','alpaca_eval':'PIN_REQUIRED'},
+            'notes':['Template only: generate HH-RLHF outputs on the pinned subset ids before running the judge.',
+                     'MT-Bench reports the 8 categories plus the average from the single-answer judgments.',
+                     'No API is called when the plan is created.']}

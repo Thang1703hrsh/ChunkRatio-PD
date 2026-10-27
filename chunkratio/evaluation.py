@@ -189,3 +189,55 @@ def evaluate_reward_model(cfg: dict[str,Any], model_path: str, output: Path) -> 
                'wall_seconds':time.perf_counter()-start,'reward_model':name,'revision':revision,'split':'test'}
     write_json(output.with_suffix('.summary.json'),summary)
     return summary
+
+
+NARVAL_OPEN_LLM = (('hellaswag','HellaSwag'),('arc','ARC'),('mmlu','MMLU'),('truthfulqa','TruthfulQA'),
+                   ('winogrande','Winogrande'),('gsm8k','GSM8K'))
+MT_BENCH_CATEGORIES = ('writing','roleplay','reasoning','math','coding','extraction','stem','humanities')
+NARVAL_TABLE2 = tuple(('mt_bench_'+c,c.title()) for c in MT_BENCH_CATEGORIES)+(
+    ('mt_bench_avg','MT avg'),('hh_lc_win_rate','HH LC WR'),('hh_win_rate','HH WR'))
+
+
+def report_narval(measured: list[dict[str,Any]], reported: list[dict[str,Any]], allow_incomplete: bool = False) -> str:
+    """NARVAL Table 1/2 column layout; reported rows are rendered apart and never enter any test.
+
+    Measured rows: method, pair, seed, metrics, synthetic=false, split=test. Reported rows:
+    source 'NARVAL Table 1' or 'NARVAL Table 2', reported=true, method, pair, metrics.
+    """
+    known = {m for m,_ in NARVAL_OPEN_LLM}|{m for m,_ in NARVAL_TABLE2}
+    for row in measured:
+        if row.get('reported') or row.get('synthetic',True) or row.get('split') != 'test':
+            raise ValueError('measured NARVAL rows must be non-synthetic held-out test outcomes')
+    for row in reported:
+        if row.get('reported') is not True or row.get('source') not in ('NARVAL Table 1','NARVAL Table 2'):
+            raise ValueError('reported rows need reported=true and source NARVAL Table 1/2')
+    for row in measured+reported:
+        if set(row['metrics'])-known or not all(math.isfinite(v) for v in row['metrics'].values()):
+            raise ValueError('unknown or nonfinite NARVAL metric')
+    if not measured and not allow_incomplete:
+        raise ValueError('no measured rows; use --allow-incomplete for a reported-only layout check')
+    lines = ['# NARVAL-comparable results'+('' if measured and not allow_incomplete else ' (incomplete)'),'',
+             'Disclosure: crpd_main uses prompts only (labels come from the teacher pair); label-using baselines '
+             'see human pairs, and crpd_anchor is the like-for-like comparison.',
+             'Reported rows are copied from the NARVAL paper, not measured here, and are excluded from every '
+             'significance test. Missing values are not estimates.']
+    for title,columns in (('Table 1 layout: Open LLM',NARVAL_OPEN_LLM+(('open_llm_avg','Avg'),)),
+                          ('Table 2 layout: MT-Bench and HH-RLHF',NARVAL_TABLE2)):
+        for pair in sorted({r['pair'] for r in measured+reported}):
+            lines += ['',f'## {title}: {pair}']
+            for label,rows in (('Measured here (mean over training seeds)',measured),('Reported by NARVAL (not measured)',reported)):
+                subset = [r for r in rows if r['pair'] == pair]
+                if not subset:
+                    continue
+                lines += ['',f'### {label}','','| Method | '+' | '.join(c for _,c in columns)+' |',
+                          '|---|'+'---|'*len(columns)]
+                for method in sorted({r['method'] for r in subset}):
+                    group = [r for r in subset if r['method'] == method]
+                    means = {m:statistics.mean(r['metrics'][m] for r in group if m in r['metrics'])
+                             for m,_ in NARVAL_OPEN_LLM+NARVAL_TABLE2 if any(m in r['metrics'] for r in group)}
+                    if all(m in means for m,_ in NARVAL_OPEN_LLM):
+                        means['open_llm_avg'] = statistics.mean(means[m] for m,_ in NARVAL_OPEN_LLM)
+                    tag = ' (synthetic placeholder)' if any(r.get('synthetic') for r in group) else ''
+                    lines.append(f'| {method}{tag} | '+' | '.join(f'{means[m]:.2f}' if m in means else 'missing'
+                                                                    for m,_ in columns)+' |')
+    return '\n'.join(lines)+'\n'

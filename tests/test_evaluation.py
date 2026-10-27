@@ -39,3 +39,51 @@ def test_benchmark_plan_and_conditional_cost() -> None:
     assert 'truthfulqa_mc2' in ','.join(plan['jobs'][0]['argv'])
     assert estimate_cost(100,200,128)['estimated_gpu_hours'] is None
     assert estimate_cost(100,200,128,100,500)['estimated_gpu_hours'] > 0
+
+
+def narval_row(method: str, value: float, **extra: object) -> dict:
+    """One NARVAL-layout row with every Table 1/2 metric."""
+    from chunkratio.evaluation import NARVAL_OPEN_LLM, NARVAL_TABLE2
+    metrics = {m:value for m,_ in NARVAL_OPEN_LLM+NARVAL_TABLE2}
+    return {'method':method,'pair':'qwen3_1p7b_to_0p6b','metrics':metrics,**extra}
+
+
+def test_narval_layout_separates_reported_rows() -> None:
+    """Reported NARVAL numbers render in their own section, are labelled, and never mix with measured rows."""
+    from chunkratio.evaluation import report_narval
+    measured = [narval_row('crpd_main',v,seed=s,synthetic=False,split='test') for s,v in ((0,50.),(1,52.))]
+    reported = [narval_row('narval',60.,source='NARVAL Table 1',reported=True)]
+    text = report_narval(measured,reported)
+    assert 'crpd_main uses prompts only' in text and 'excluded from every significance test' in text
+    measured_part, reported_part = text.split('### Reported by NARVAL (not measured)')[0], text.split('### Reported by NARVAL (not measured)')[1]
+    assert '| crpd_main | 51.00 |' in measured_part and 'narval' not in measured_part.split('## Table 1')[1].split('###')[1]
+    assert '| narval | 60.00 |' in reported_part
+    synthetic = [narval_row('narval',1.,source='NARVAL Table 1',reported=True,synthetic=True)]
+    assert '(synthetic placeholder)' in report_narval([],synthetic,allow_incomplete=True)
+    with pytest.raises(ValueError,match='reported=true'):
+        report_narval(measured,[narval_row('narval',1.,source='paper')])
+    with pytest.raises(ValueError,match='measured NARVAL rows'):
+        report_narval(reported,[])
+    with pytest.raises(ValueError,match='no measured rows'):
+        report_narval([],reported)
+
+
+def test_narval_plan_fails_closed_and_uses_config_fields() -> None:
+    """Few-shot counts, metric names, judges and lm-eval version come only from config (§11.4)."""
+    import json
+    from pathlib import Path
+    from chunkratio.experiment import narval_benchmark_plan
+    cfg = json.loads(Path('config/crpd/narval/qwen3_8b_to_1p7b.json').read_text(encoding='utf-8'))
+    with pytest.raises(ValueError,match='num_fewshot'):
+        narval_benchmark_plan(cfg,'model','id','out')
+    evaluation = cfg['narval']['evaluation']
+    for i,task in enumerate(evaluation['open_llm']['tasks'].values()):
+        task.update(task=task['task'] or f'task{i}',num_fewshot=i,metric='acc')
+    evaluation['open_llm']['lm_eval_version'] = '0.0.test'
+    evaluation['mt_bench'].update(judge='judge-x',judge_version='v1')
+    evaluation['hh_rlhf'].update(dataset_revision='r',subset_ids_file='ids.json',subset_sha256='h',judge='j',
+                                 judge_version='v',reference_outputs='ref.json',reference_model='ref')
+    plan = narval_benchmark_plan(cfg,'model','id','out')
+    gsm8k = next(j for j in plan['jobs'] if j['metric'] == 'gsm8k')
+    assert gsm8k['argv'][gsm8k['argv'].index('--num_fewshot')+1] == '5' and plan['requires']['lm_eval'] == '0.0.test'
+    assert next(j for j in plan['jobs'] if j['metric'] == 'mt_bench')['categories'][-1] == 'humanities'
