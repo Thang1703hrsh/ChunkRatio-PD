@@ -26,14 +26,8 @@ from .training import ChunkRatioTrainer
 from .value_head import fit_head, save_tensor
 
 
-def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
-    """Execute requested stage and prerequisites, reusing compatible completed shards (§10)."""
-    started = time.perf_counter()
-    models,student,tokenizers,info = load_models(cfg)
-    meter = ForwardMeter({**models,'student':student})
-    eos = info['eos']
-    identities = {role:fingerprint(model) for role,model in models.items()}
-    route = routing(identities['teacher_plus'],identities['teacher_base'],identities['student_ref'])
+def eligible_prompts(cfg: dict[str,Any], models: dict[str,Any], tokenizers: list[Any]) -> tuple[list[dict[str,Any]],list[str]]:
+    """Split before generation and drop prompts whose prompt + H exceeds a model context (§§5.2,7.1)."""
     prompts = prepare_prompts(read_jsonl(Path(cfg['prompts'])),collection_seed(cfg))
     contexts = [getattr(model.config,'max_position_embeddings',None) or getattr(model.config,'n_positions',None)
                 for model in models.values()]
@@ -47,6 +41,18 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
     prompts = [p for p in prompts if p['id'] not in set(ineligible)]
     if not prompts:
         raise ValueError('no prompt fits prompt length + H within every model context')
+    return prompts,ineligible
+
+
+def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
+    """Execute requested stage and prerequisites, reusing compatible completed shards (§10)."""
+    started = time.perf_counter()
+    models,student,tokenizers,info = load_models(cfg)
+    meter = ForwardMeter({**models,'student':student})
+    eos = info['eos']
+    identities = {role:fingerprint(model) for role,model in models.items()}
+    route = routing(identities['teacher_plus'],identities['teacher_base'],identities['student_ref'])
+    prompts,ineligible = eligible_prompts(cfg,models,tokenizers)
     output = Path(cfg['output'])
     output.mkdir(parents=True,exist_ok=True)
     root = Path(__file__).resolve().parents[1]

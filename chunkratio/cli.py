@@ -26,6 +26,11 @@ def main(argv: list[str] | None = None) -> int:
     sub = commands.add_parser('learned-tree')
     sub.add_argument('--output',default='output/learned-tree.json')
     sub.add_argument('--steps',type=int,default=200)
+    sub = commands.add_parser('diagnose-displacement')
+    sub.add_argument('--config',required=True)
+    sub.add_argument('--prompts',type=int,required=True)
+    sub.add_argument('--replicates',type=int,default=16)
+    sub.add_argument('--output',required=True)
     sub = commands.add_parser('report')
     sub.add_argument('--input',required=True)
     sub.add_argument('--output',required=True)
@@ -65,6 +70,10 @@ def main(argv: list[str] | None = None) -> int:
             cfg = load_config(args.config)
             print(json.dumps({'status':'config_valid','variant':cfg['variant'],
                               'note':'checkpoint/tokenizer/identity preflight runs when models are loaded'},indent=2))
+            return 0
+        if args.command == 'diagnose-displacement':
+            from .diagnostics import diagnose
+            print(json.dumps(diagnose(load_config(args.config),args.prompts,args.replicates,Path(args.output)),indent=2))
             return 0
         if args.command == 'report':
             from .evaluation import report_tables
