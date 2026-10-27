@@ -5,6 +5,8 @@ Research-scale launcher code, never invoked by smoke tests or this implementatio
 from __future__ import annotations
 
 import copy
+import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +62,9 @@ def prepare_checkpoint(cfg: dict[str,Any], stage: str) -> None:
     rng = stream(cfg['seed'],'preparation-shuffle')
     torch.manual_seed(cfg['seed'])
     history = []
+    print(json.dumps({'stage':stage,'rows_used':len(rows),'rows_dropped_over_length':rows_before-len(rows),
+                      'max_length':limit}),flush=True)
+    began = time.perf_counter()
     for epoch in range(cfg['epochs']):
         permutation = torch.randperm(len(rows),generator=rng).tolist()
         for start in range(0,len(rows),cfg['batch_size']):
@@ -82,6 +87,9 @@ def prepare_checkpoint(cfg: dict[str,Any], stage: str) -> None:
                 total += loss.item()
             optimizer.step()
             history.append({'epoch':epoch+1,'batch':start//cfg['batch_size'],'loss':total})
+            # Streamed so a long remote run can be monitored before the manifest exists.
+            print(json.dumps({'stage':stage,**history[-1],'rows':len(batch),
+                              'elapsed_s':round(time.perf_counter()-began,1)}),flush=True)
     output = Path(cfg['output'])
     model.save_pretrained(output)
     tokenizer.save_pretrained(output)

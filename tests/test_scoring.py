@@ -3,9 +3,31 @@ import pytest
 
 torch = pytest.importorskip('torch',reason='PyTorch unavailable for active interpreter')
 from chunkratio.sampling import generate, stream
-from chunkratio.scoring import (continuation_increments, score_batch, score_tokens, state_features,
+from chunkratio.scoring import (continuation_increments, fingerprint, score_batch, score_tokens, state_features,
                                 trajectory_features)
 from chunkratio.tiny import TinyLM
+
+
+def test_fingerprint_bytes_unchanged_and_fast() -> None:
+    """Same digest as hashing each tensor's storage bytes; a 64 MB layer hashes in well under a second (§4.1)."""
+    import hashlib
+    import time
+    def storage_digest(model: torch.nn.Module) -> str:
+        h = hashlib.sha256(type(model).__qualname__.encode())
+        h.update(repr(model).encode())
+        for name,tensor in sorted(model.state_dict().items()):
+            h.update(str((name,tuple(tensor.shape),str(tensor.dtype))).encode())
+            h.update(bytes(tensor.detach().cpu().contiguous().clone().untyped_storage()))
+        return h.hexdigest()
+    model = torch.nn.Sequential(torch.nn.Linear(7,5),torch.nn.Linear(5,3).to(torch.bfloat16))
+    model.register_buffer('ints',torch.arange(11))
+    model.register_buffer('mask',torch.tensor([True,False,True]))
+    model.register_buffer('scalar16',torch.tensor(2.5,dtype=torch.float16))
+    model.register_buffer('view',torch.randn(4,6)[:,1:4])
+    assert fingerprint(model) == storage_digest(model)
+    start = time.perf_counter()
+    fingerprint(torch.nn.Linear(4096,4096))
+    assert time.perf_counter()-start < 2.
 
 
 def test_shift_mask_prompt_padding_eos() -> None:

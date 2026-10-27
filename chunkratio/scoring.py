@@ -29,9 +29,9 @@ def fingerprint(model: nn.Module) -> str:
         h.update(digest(config).encode())
     for name,tensor in sorted(model.state_dict().items()):
         h.update(str((name,tuple(tensor.shape),str(tensor.dtype))).encode())
-        data = tensor.detach().cpu().contiguous().clone().untyped_storage()
-        for start in range(0,len(data),1024*1024):
-            h.update(bytes(data[start:start+1024*1024]))
+        # Same bytes as hashing the tensor's storage, without a per-byte Python loop
+        # (bytes(UntypedStorage) took over an hour for a 1.7B FP32 model).
+        h.update(tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy())
     return h.hexdigest()
 
 
