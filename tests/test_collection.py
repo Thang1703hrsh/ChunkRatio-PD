@@ -92,3 +92,55 @@ def test_nonfinite_scores_fail_with_record_id(tmp_path: Path) -> None:
     with pytest.raises(ValueError,match='correction job'):
         collect_correction([record],{**models,'teacher_base':NaNModel()},cfg,info['eos'],
                            ShardStore(tmp_path/'r',{'t':'r'}))
+
+
+def test_state_selection_is_preregistered(tmp_path: Path) -> None:
+    """Uniform subsample from causal positions, n=0 kept, keyed only by prompt id and seed (§7.2)."""
+    from chunkratio.collection import select_states
+    from chunkratio.targets import build_targets
+    positions = [0,2,4,6,8,10]
+    chosen = select_states(positions,'p1',0,3)
+    assert chosen == select_states(positions,'p1',0,3) and chosen[0] == 0 and len(chosen) == 3
+    assert set(chosen) <= set(positions) and len(set(chosen)) == 3
+    assert select_states(positions,'p1',0,None) == positions and select_states([0,2],'p1',0,4) == [0,2]
+    picks = {tuple(select_states(positions,f'p{i}',0,3)) for i in range(40)}
+    assert len(picks) > 3
+    cfg = {**load_config('config/crpd/smoke.json'),'states_per_prompt':2}
+    models,_,_,info = load_models(cfg)
+    prompts = prepare_prompts(read_jsonl(Path(cfg['prompts'])),0)
+    store = ShardStore(tmp_path/'p',{'t':'p'})
+    collect_prefixes(prompts,models['student_ref'],cfg,info['eos'],store)
+    for record in store.records():
+        response = record['response']
+        expected = [n for n in range(0,len(response)+1,cfg['chunk_length'])
+                    if not terminal(response[:n],cfg['horizon'],info['eos'])]
+        assert record['schedule_positions'] == expected
+        assert record['selected_positions'] == select_states(expected,record['prompt']['id'],0,2)
+        assert [s['n'] for s in record['states']] == record['selected_positions']
+    states = [s for r in store.records() for s in r['states']]
+    records = collect_candidates(states,models,cfg,info['eos'],ShardStore(tmp_path/'c',{'t':'c'}))
+    targets = build_targets(records,None,models,cfg,info['eos'],'exact_zero_residual')
+    assert sum(p['weight'] for p in targets['pairs']) == pytest.approx(1.)
+
+
+def test_training_seeds_share_collection_and_head(tmp_path: Path) -> None:
+    """Seeds 0/1/2 reuse identical collection/head shards; only policy stages differ (§10, pre-registration)."""
+    from chunkratio.pipeline import pipeline
+    base = {**load_config('config/crpd/smoke.json'),'steps':1}
+    def stage_dirs(out: Path) -> dict[str,set[str]]:
+        names = {p.name for p in (out/'cache').iterdir()}
+        return {kind:{n for n in names if n.startswith(kind)} for kind in ('prefixes','candidates','correction','head','targets','policy')}
+    pipeline({**base,'seed':0,'output':str(tmp_path/'a')},'train-policy')
+    first = stage_dirs(tmp_path/'a')
+    pipeline({**base,'seed':1,'output':str(tmp_path/'b')},'train-policy')
+    second = stage_dirs(tmp_path/'b')
+    for kind in ('prefixes','candidates','correction','head','targets'):
+        assert first[kind] == second[kind]
+        for name in first[kind]:
+            for file in (tmp_path/'a'/'cache'/name).iterdir():
+                assert (tmp_path/'b'/'cache'/name/file.name).read_bytes() == file.read_bytes()
+    assert first['policy'] != second['policy']
+    pipeline({**base,'seed':2,'output':str(tmp_path/'a')},'train-policy')
+    third = stage_dirs(tmp_path/'a')
+    assert {k:v for k,v in third.items() if k != 'policy'} == {k:v for k,v in first.items() if k != 'policy'}
+    assert len(third['policy']) == 2
