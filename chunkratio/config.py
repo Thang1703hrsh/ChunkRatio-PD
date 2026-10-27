@@ -68,6 +68,8 @@ def validate(cfg: dict[str,Any]) -> None:
         raise ValueError('exponential audit needs replicated independent estimates')
     if not isinstance(cfg.get('selection_interval',1),int) or cfg.get('selection_interval',1) <= 0:
         raise ValueError('selection_interval must be positive integer')
+    if cfg.get('protocol_name') == 'narval':
+        validate_narval(cfg)
     if not cfg.get('synthetic',False):
         if 'selection_interval' not in cfg:
             raise ValueError('real runs need an explicit selection_interval (RM selection per checkpoint)')
@@ -78,3 +80,49 @@ def validate(cfg: dict[str,Any]) -> None:
             raise ValueError('actual teacher DPO reference must be verified')
         if not cfg.get('selection',{}).get('reward_model_revision'):
             raise ValueError('pin selection reward model revision')
+
+
+NARVAL_VARIANTS = ('crpd_main','crpd_raw','crpd_anchor')
+
+
+def open_inputs(value: Any, prefix: str = '') -> list[str]:
+    """Dotted paths of every null leaf: the inputs a user must still fill (NARVAL protocol)."""
+    if value is None:
+        return [prefix]
+    if isinstance(value,dict):
+        return [p for k,v in value.items() for p in open_inputs(v,f'{prefix}.{k}' if prefix else k)]
+    return []
+
+
+def linked_protocol(path: str) -> dict[str,Any]:
+    """Read a linked protocol relative to the repository root (no absolute paths)."""
+    return json.loads((Path(__file__).resolve().parents[1]/path).read_text(encoding='utf-8-sig'))
+
+
+def validate_narval(cfg: dict[str,Any]) -> None:
+    """NARVAL-comparable protocol: structural rules always; every null fails closed for real runs."""
+    narval = cfg.get('narval')
+    if not isinstance(narval,dict):
+        raise ValueError('narval protocol block required')
+    if cfg['variant'] not in NARVAL_VARIANTS or cfg['variant'] not in narval.get('variants',[]):
+        raise ValueError('NARVAL protocol runs only crpd_main, crpd_raw and crpd_anchor')
+    if cfg['correction_replicates'] != 1:
+        raise ValueError('NARVAL protocol pre-registers correction_replicates = 1')
+    if str(narval.get('pair','')).startswith('qwen3'):
+        if cfg.get('eos_token') != '<|im_end|>':
+            raise ValueError('Qwen3 pairs use <|im_end|> as the EOS of every role')
+        if cfg.get('chat_template_kwargs') != {'enable_thinking':False}:
+            raise ValueError('Qwen3 chat template must be fixed with enable_thinking=false')
+    if cfg.get('synthetic',False):
+        return
+    missing = open_inputs({'eos_token':cfg.get('eos_token'),'models':cfg['models'],
+                           'selection':cfg.get('selection',{}),'narval':narval})
+    if missing:
+        raise ValueError('NARVAL open inputs (fill from the NARVAL repository or verified checkpoints): '+', '.join(missing))
+    for role,link in (narval.get('provenance') or {}).items():
+        if role == 'note':
+            continue
+        row = linked_protocol(link['protocol'])['narval']['reference_rows'][link['row']]
+        mine = cfg['models'][role]
+        if not row.get('path') or (row.get('path'),row.get('revision')) != (mine['path'],mine['revision']):
+            raise ValueError(f"provenance mismatch: {role} must be {link['row']} of {link['protocol']}")

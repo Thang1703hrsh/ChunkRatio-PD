@@ -1,0 +1,200 @@
+{
+  "protocol_name": "narval",
+  "variant": "crpd_main",
+  "horizon": 512,
+  "chunk_length": 32,
+  "candidates": 4,
+  "alpha": 0.3,
+  "learning_rate": 1e-06,
+  "optimizer": "AdamW",
+  "batch_size": 128,
+  "steps": 1000,
+  "selection_interval": 100,
+  "seed": 0,
+  "collection_seed": 0,
+  "head_epochs": 20,
+  "head_learning_rate": 0.001,
+  "head_batch_size": 64,
+  "endpoint_fraction": 0.5,
+  "correction_replicates": 1,
+  "states_per_prompt": 4,
+  "generation_batch_size": 16,
+  "output": "output/narval/qwen3_1p7b_to_0p6b/crpd_main/seed0",
+  "prompts": "data/narval/qwen3_1p7b_to_0p6b/ultrafeedback_train.jsonl",
+  "device": "cuda",
+  "dtype": "float32",
+  "weight_decay": 0,
+  "collection_decoding": {
+    "temperature": 1,
+    "top_k": 0,
+    "top_p": 1
+  },
+  "eos_token": "<|im_end|>",
+  "chat_template_kwargs": {
+    "enable_thinking": false
+  },
+  "models": {
+    "teacher_plus": {
+      "path": null,
+      "revision": null
+    },
+    "teacher_base": {
+      "path": null,
+      "revision": null
+    },
+    "student_ref": {
+      "path": null,
+      "revision": null
+    }
+  },
+  "teacher_dpo_reference_verified": false,
+  "selection": {
+    "reward_model_revision": null,
+    "decoding": {
+      "max_new_tokens": 1024,
+      "do_sample": false
+    }
+  },
+  "anchor_lambda": 0.1,
+  "anchor_beta": 0.05,
+  "audit_replicates": 16,
+  "audit_endpoints": 8,
+  "synthetic": false,
+  "policy_microbatch_size": 1,
+  "evaluation_decoding": {
+    "max_new_tokens": 1024,
+    "do_sample": false
+  },
+  "narval": {
+    "pair": "qwen3_1p7b_to_0p6b",
+    "teacher_family": "Qwen3-1.7B",
+    "student_family": "Qwen3-0.6B",
+    "base_checkpoints": {
+      "teacher": null,
+      "student": null
+    },
+    "sft": {
+      "dataset": "Deita-10K-V0",
+      "dataset_revision": null,
+      "epochs": null,
+      "learning_rate": null,
+      "batch_size": null,
+      "max_length": null
+    },
+    "teacher_dpo": {
+      "dataset": "HuggingFaceH4/ultrafeedback_binarized",
+      "split": "train_prefs",
+      "dataset_revision": null,
+      "beta": null,
+      "learning_rate": null,
+      "epochs": null,
+      "max_length": null
+    },
+    "preference_data": {
+      "name": "HuggingFaceH4/ultrafeedback_binarized",
+      "train": "train_prefs",
+      "test": "test_prefs",
+      "revision": null,
+      "split_manifest_sha256": null
+    },
+    "variants": [
+      "crpd_main",
+      "crpd_raw",
+      "crpd_anchor"
+    ],
+    "reference_rows": {
+      "teacher_dpo": {
+        "path": null,
+        "revision": null
+      },
+      "teacher_sft": {
+        "path": null,
+        "revision": null
+      },
+      "student_sft": {
+        "path": null,
+        "revision": null
+      },
+      "student_dpo": {
+        "path": null,
+        "revision": null
+      }
+    },
+    "provenance": {
+      "note": "NARVAL Table 1: the 1.7B teacher pair is the SFT/DPO Qwen3-1.7B student of qwen3_8b_to_1p7b",
+      "teacher_base": {
+        "protocol": "config/crpd/narval/qwen3_8b_to_1p7b.json",
+        "row": "student_sft"
+      },
+      "teacher_plus": {
+        "protocol": "config/crpd/narval/qwen3_8b_to_1p7b.json",
+        "row": "student_dpo"
+      }
+    },
+    "evaluation": {
+      "open_llm": {
+        "lm_eval_version": null,
+        "tasks": {
+          "hellaswag": {
+            "task": "hellaswag",
+            "num_fewshot": null,
+            "metric": null
+          },
+          "arc": {
+            "task": null,
+            "num_fewshot": null,
+            "metric": null
+          },
+          "mmlu": {
+            "task": "mmlu",
+            "num_fewshot": null,
+            "metric": null
+          },
+          "truthfulqa": {
+            "task": null,
+            "num_fewshot": null,
+            "metric": null
+          },
+          "winogrande": {
+            "task": "winogrande",
+            "num_fewshot": null,
+            "metric": null
+          },
+          "gsm8k": {
+            "task": "gsm8k",
+            "num_fewshot": null,
+            "metric": null
+          }
+        }
+      },
+      "mt_bench": {
+        "judge": null,
+        "judge_version": null,
+        "categories": [
+          "writing",
+          "roleplay",
+          "reasoning",
+          "math",
+          "coding",
+          "extraction",
+          "stem",
+          "humanities"
+        ]
+      },
+      "hh_rlhf": {
+        "dataset": "Anthropic/hh-rlhf",
+        "dataset_revision": null,
+        "subset_ids_file": null,
+        "subset_sha256": null,
+        "judge": null,
+        "judge_version": null,
+        "reference_outputs": null,
+        "reference_model": null,
+        "metrics": [
+          "lc_win_rate",
+          "win_rate"
+        ]
+      }
+    }
+  }
+}
