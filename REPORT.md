@@ -467,3 +467,30 @@ The first PowerShell run failed with `PermissionError` in `os.replace` on `manif
 repository is in OneDrive, which briefly locks freshly written files. Atomic writes now retry
 that replace with bounded backoff (`artifacts.replace_with_retry`). Native Linux and CUDA are
 still not run; no NARVAL checkpoint, dataset or judge was used.
+
+## Modal pilot launcher: Qwen3-1.7B -> Qwen3-0.6B (not yet run)
+
+`script/modal/qwen3_pilot.py` runs the whole pilot on Modal (profile `quangltt280305`, app and
+volume `crpd-qwen3-pilot`). It trains the missing checkpoints itself, with assumed recipes listed
+in `chunkratio/pilot.py::PILOT_ASSUMPTIONS` and copied into every config. These values are not
+verified against NARVAL, and the results are a pilot, not a reproduction.
+
+| Stage | Hardware | What it does |
+|---|---|---|
+| prepare | CPU x4, 16 GB | Pins Hub revisions, downloads Deita-10K-V0 and UltraFeedback, writes canonical data (thinking disabled, EOS `<|im_end|>`), pilot subset 2000/200/64 prompts |
+| sft_teacher | A100-80GB | T0 = SFT of Qwen3-1.7B-Base on Deita (3 epochs, 2e-5, batch 128, max_length 2048, TF32) |
+| sft_student | L40S (parallel with sft_teacher) | rho = SFT of Qwen3-0.6B-Base, same data and recipe |
+| dpo_teacher | A100-80GB | T+ = DPO of T0 on all UltraFeedback train_prefs (beta 0.05, 5e-7, 2 epochs); its frozen reference is T0 |
+| diagnose | L40S | `diagnose-displacement`, 100 prompts, R = 16 |
+| train_variants | A100-80GB, 64 GB RAM | `crpd_main`, `crpd_raw`, `crpd_anchor`, seed 0, one shared `cache_root`; FsfairX selection every 250 steps on 64 prompts |
+| run_pilot / finish | 0.25 CPU | Orchestrators; phase 2 is spawned separately so each phase has 24 h |
+
+`validate-config` runs in pilot mode. Every training input must be filled; evaluation fields may stay
+null, and CRPD refuses to start unless T+'s recorded DPO reference fingerprint equals T0's.
+Deviation: the teacher pair is trained from Qwen3-1.7B-Base directly, not taken from the
+8B -> 1.7B protocol as NARVAL Table 1 does.
+
+No GPU time has been measured. The 1.7B DPO over about 60k pairs (microbatch 1) is expected to be
+the longest stage, and every duration and cost is unknown until a run reports it. Possible early
+failures, all in the cheap CPU `prepare` stage: a Hub download that needs a token, or a Deita
+field layout different from ShareGPT `conversations`.

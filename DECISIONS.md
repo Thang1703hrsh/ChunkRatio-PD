@@ -145,3 +145,17 @@ Fixed on 27 October 2026, before any pilot collection or return was observed.
 31. **Report layout is provisional.** `report --layout narval` uses the metric columns named in the
     task text. The NARVAL paper was not read here, so the exact Table 1/2 column order and metric
     variants (ARC, TruthfulQA) remain open inputs.
+
+## Qwen3 pilot on Modal (user request, 27 October 2026)
+
+32. **Pilot mode.** `"pilot": true` configs must list `pilot_assumptions`; validation then requires
+    every training input but lets evaluation fields and reference rows stay null. The NARVAL
+    protocol files are unchanged and still fail closed.
+33. **Assumed recipes.** With NARVAL's SFT/DPO settings unknown, the pilot uses the launcher's
+    ADPA/TVKD recipe (SFT 3 epochs/2e-5/128; DPO beta 0.05/5e-7/2 epochs/128), max_length 2048
+    (examples longer than that are dropped, never truncated), Base checkpoints, and `<|im_end|>`
+    forced as EOS. TF32 is enabled for SFT/DPO training only; CRPD scoring keeps full FP32.
+34. **Pilot subset.** 2000 train, 200 head_val and 64 select prompts, ranked by
+    sha256([seed, 'pilot', group_id]) before any generation. Teacher DPO still uses all of train_prefs.
+35. **Hardware.** A GPU is attached only where a stage needs one: L40S for the 0.6B SFT and the
+    diagnostic, A100-80GB for 1.7B training and for CRPD (which also holds the 8B FsfairX RM in FP32).
