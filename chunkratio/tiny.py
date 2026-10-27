@@ -1,6 +1,7 @@
 """Offline randomly initialized causal LM/tokenizer for synthetic §12 verification."""
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -72,3 +73,51 @@ class TinyTokenizer:
     def get_added_vocab(self) -> dict[str,int]:
         """No added synthetic tokens (§5.1)."""
         return {}
+
+
+QWEN_TEMPLATE = ("{% for m in messages %}<|im_start|>{{ m['role'] }}\n"
+                 "{% if m['role'] == 'assistant' %}<think>\n\n</think>\n\n{% endif %}{{ m['content'] }}<|im_end|>\n{% endfor %}"
+                 "{% if add_generation_prompt %}<|im_start|>assistant\n"
+                 "{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% endif %}{% endif %}")
+
+
+def tiny_qwen3_tokenizer() -> object:
+    """Word-level stand-in for the Qwen3 tokenizer: <|im_end|> is EOS, <|endoftext|> is PAD (§12)."""
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+    specials = ['<|endoftext|>','<|im_start|>','<|im_end|>','<think>','</think>']
+    vocab = {token:i for i,token in enumerate(specials+['user','assistant','system']+[f'w{i}' for i in range(12)])}
+    core = Tokenizer(models.WordLevel(vocab,unk_token='<|endoftext|>'))
+    core.pre_tokenizer = pre_tokenizers.Whitespace()
+    tok = PreTrainedTokenizerFast(tokenizer_object=core,eos_token='<|im_end|>',pad_token='<|endoftext|>',
+                                  additional_special_tokens=specials[1:2]+specials[3:],
+                                  model_input_names=['input_ids','attention_mask'])
+    tok.chat_template = QWEN_TEMPLATE
+    return tok
+
+
+def build_tiny_qwen3(root: Path, seed: int = 0) -> dict[str,Path]:
+    """Save T0, a perturbed T+ and a distinct rho as tiny Qwen3 checkpoints; no download (§12).
+
+    The output layer is padded (24 logits for a 20-token vocabulary), as in real Qwen3.
+    """
+    import copy
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+    config = Qwen3Config(vocab_size=24,hidden_size=16,intermediate_size=32,num_hidden_layers=2,
+                         num_attention_heads=2,num_key_value_heads=1,head_dim=8,max_position_embeddings=128,
+                         eos_token_id=2,pad_token_id=0,bos_token_id=None,tie_word_embeddings=False,
+                         use_sliding_window=False,sliding_window=None)
+    torch.manual_seed(seed)
+    base = Qwen3ForCausalLM(config)
+    plus = copy.deepcopy(base)
+    with torch.no_grad():
+        for p in plus.parameters():
+            p.add_(torch.randn_like(p)*.05)
+    torch.manual_seed(seed+1)
+    rho = Qwen3ForCausalLM(config)
+    paths = {}
+    for role,model in (('teacher_base',base),('teacher_plus',plus),('student_ref',rho)):
+        paths[role] = root/role
+        model.save_pretrained(paths[role])
+        tiny_qwen3_tokenizer().save_pretrained(paths[role])
+    return paths

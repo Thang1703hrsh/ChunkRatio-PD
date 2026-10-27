@@ -35,21 +35,31 @@ def fingerprint(model: nn.Module) -> str:
     return h.hexdigest()
 
 
-def preflight(tokenizers: list[Any], models: list[nn.Module]) -> dict[str,Any]:
-    """Require full token mapping, added/special tokens, EOS/template and output dims (§5.1)."""
+def preflight(tokenizers: list[Any], models: list[nn.Module], eos_token: str | None = None) -> dict[str,Any]:
+    """Require full token mapping, added/special tokens, EOS/template and output dims (§5.1).
+
+    Output dimensions may be padded beyond the tokenizer (Qwen3), but must be identical for all
+    four models. With a declared eos_token (for example Qwen3 <|im_end|>), every tokenizer's EOS
+    id must be that token.
+    """
     assert len(tokenizers) == len(models) == 4
-    signatures = []
+    signatures, dims = [],[]
     for tok,model in zip(tokenizers,models):
         signatures.append({'vocab':tok.get_vocab(),'added':tok.get_added_vocab(),
                            'special':tok.special_tokens_map,'eos':tok.eos_token_id,
                            'pad':tok.pad_token_id,'bos':tok.bos_token_id,'template':tok.chat_template})
-        if model.get_output_embeddings().weight.shape[0] != len(tok):
-            raise ValueError('output vocabulary differs from tokenizer')
+        dims.append(model.get_output_embeddings().weight.shape[0])
+        if dims[-1] < len(tok):
+            raise ValueError('output vocabulary smaller than tokenizer')
+        if eos_token is not None and tok.get_vocab().get(eos_token) != tok.eos_token_id:
+            raise ValueError(f'tokenizer EOS must be the declared end-of-turn token {eos_token}')
+    if len(set(dims)) != 1:
+        raise ValueError('padded output vocabulary differs between models')
     if any(s != signatures[0] for s in signatures[1:]):
         raise ValueError('unsupported tokenizer or template mismatch')
     if signatures[0]['eos'] is None or not signatures[0]['template']:
         raise ValueError('explicit EOS and canonical chat template required')
-    return {'tokenizer_hash':digest(signatures[0]),'eos':signatures[0]['eos']}
+    return {'tokenizer_hash':digest(signatures[0]),'eos':signatures[0]['eos'],'output_dim':dims[0]}
 
 
 def score_tokens(logits: Tensor, ids: Tensor, attention: Tensor, prompt_lengths: Tensor,

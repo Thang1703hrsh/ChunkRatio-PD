@@ -193,3 +193,34 @@ def test_hf_batched_cached_sampling_and_throughput_log(tmp_path: Path) -> None:
            'batched_tokens_per_second':tokens/together,'note':'tiny CPU Llama; logged only, not a GPU estimate'}
     write_json(Path('output/benchmarks/sampler_throughput.json'),log)
     print('sampler throughput',log)
+
+
+def qwen_config(tmp_path: Path) -> tuple[dict,dict]:
+    """Tiny Qwen3-style checkpoints with the NARVAL EOS/template conventions (§5.1)."""
+    from chunkratio.tiny import build_tiny_qwen3
+    paths = build_tiny_qwen3(tmp_path/'qwen')
+    cfg = {**load_config('config/crpd/smoke.json'),'eos_token':'<|im_end|>','output':str(tmp_path/'run'),
+           'models':{k:{'path':str(v),'revision':'local'} for k,v in paths.items()}}
+    return cfg,paths
+
+
+def test_qwen3_preflight_eos_padded_vocab_and_sampling(tmp_path: Path) -> None:
+    """<|im_end|> is EOS for all roles; padded output dims must match; batched == unbatched (§§5.1,5.3)."""
+    from chunkratio.models import load_models
+    from chunkratio.scoring import preflight
+    from chunkratio.tiny import tiny_qwen3_tokenizer
+    from test_sampling import check_batch_invariance
+    cfg,paths = qwen_config(tmp_path)
+    models,student,tokenizers,info = load_models(cfg)
+    assert info['eos'] == tokenizers[0].get_vocab()['<|im_end|>'] == 2
+    assert info['eos'] != tokenizers[0].pad_token_id and info['output_dim'] == 24 > len(tokenizers[0])
+    check_batch_invariance(models['student_ref'],info['eos'],None)
+    check_batch_invariance(models['teacher_plus'],info['eos'],2)
+    roles = [models['teacher_plus'],models['teacher_base'],models['student_ref'],student]
+    wrong = tiny_qwen3_tokenizer()
+    wrong.eos_token = '<|endoftext|>'
+    with pytest.raises(ValueError,match='declared end-of-turn'):
+        preflight(tokenizers[:3]+[wrong],roles,'<|im_end|>')
+    padded = transformers.Qwen3ForCausalLM(transformers.Qwen3Config(**{**student.config.to_dict(),'vocab_size':32}))
+    with pytest.raises(ValueError,match='padded output vocabulary'):
+        preflight(tokenizers,roles[:3]+[padded],'<|im_end|>')

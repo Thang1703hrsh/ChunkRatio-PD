@@ -14,7 +14,8 @@ from .tiny import TinyLM, TinyTokenizer
 
 def load_models(cfg: dict[str,Any]) -> tuple[dict[str,nn.Module],nn.Module,list[Any],dict[str,Any]]:
     """Four model roles with identical tokenization and frozen initialization (§2)."""
-    if cfg.get('synthetic',False):
+    # Synthetic runs with explicit local paths (narval-tiny) load real HF classes.
+    if cfg.get('synthetic',False) and not any(cfg['models'][r].get('path') for r in cfg['models']):
         torch.manual_seed(collection_seed(cfg)+101)
         base = TinyLM()
         plus = copy.deepcopy(base)
@@ -47,5 +48,5 @@ def load_models(cfg: dict[str,Any]) -> tuple[dict[str,nn.Module],nn.Module,list[
     models = {'teacher_plus':freeze(plus.to(device('teacher_plus'))),'teacher_base':freeze(base.to(device('teacher_base'))),
               'student_ref':freeze(rho.to(cfg['device']))}
     student = copy.deepcopy(rho).requires_grad_(True).eval()
-    info = preflight(tokenizers,[plus,base,rho,student])
+    info = preflight(tokenizers,[plus,base,rho,student],cfg.get('eos_token'))
     return models,student,tokenizers,info
