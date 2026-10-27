@@ -59,8 +59,12 @@ def read_json(path: Path) -> Any:
 
 
 def read_jsonl(path: Path) -> list[dict[str,Any]]:
-    """Read canonical prompt or evaluation records (§10)."""
-    return [json.loads(line) for line in path.read_text(encoding='utf-8-sig').splitlines() if line.strip()]
+    """Read canonical prompt or evaluation records (§10).
+
+    Split on newline only: str.splitlines also breaks on U+2028/U+2029/U+0085, which
+    json.dumps(ensure_ascii=False) leaves unescaped inside strings (Deita has them).
+    """
+    return [json.loads(line) for line in path.read_text(encoding='utf-8-sig').split('\n') if line.strip()]
 
 
 class ShardStore:

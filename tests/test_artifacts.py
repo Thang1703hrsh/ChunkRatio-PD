@@ -3,7 +3,16 @@ from pathlib import Path
 
 import pytest
 
-from chunkratio.artifacts import ShardStore, digest, stage_key
+from chunkratio.artifacts import ShardStore, digest, read_jsonl, stage_key
+
+
+def test_read_jsonl_keeps_unicode_line_separators(tmp_path: Path) -> None:
+    """U+2028/U+2029/U+0085 inside strings stay in one record (the Deita prepare-data crash)."""
+    import json
+    rows = [{'text':'a b c\x85d\x0ce'},{'text':'second'}]
+    path = tmp_path/'rows.jsonl'
+    path.write_text(''.join(json.dumps(r,ensure_ascii=False)+'\n' for r in rows),encoding='utf-8')
+    assert read_jsonl(path) == rows
 
 
 def test_resume_integrity_and_incompatible_metadata(tmp_path: Path) -> None:
