@@ -95,3 +95,30 @@ Reviewer decisions. Each fix is in a separate `review:` commit; REVIEW.md lists 
     declared setting, although the spec does not require replicates in the
     training data and it multiplies correction cost by 4. Revisit it after
     measuring pilot throughput, and decide before observing returns.
+
+## Pre-registration (NARVAL pilot)
+
+Fixed on 27 October 2026, before any pilot collection or return was observed.
+
+22. **Shared collection.** The three policy-training seeds share one collection. Splits,
+    synthetic models, prefix pool, candidates, endpoint selection, correction rollouts, the
+    head and its minibatch order all use `collection_seed` (default 0). The training `seed`
+    is absent from their cache keys. Training seeds vary only policy sampling order, pair
+    sampling and minibatch RNG; the policy cache key keeps `seed`. Between-seed spread
+    therefore measures optimisation noise, not data-sampling noise; report it that way.
+23. **No training-data replicates.** `correction_replicates = 1` in the NARVAL protocol
+    configs; the spec does not require replicates. Replicated estimates stay in `crpd_audit`
+    and in `diagnose-displacement`. The ADPA/TVKD configs keep their declared value 4.
+24. **State subsampling.** `states_per_prompt` (int, or null for all). Positions come from
+    the causal schedule of the frozen-rho prefix trajectory (every L tokens, nonterminal).
+    The prompt state n=0 is always kept; the other k-1 are drawn uniformly without
+    replacement with stream `state-select/<prompt_id>` from `collection_seed`. Selection
+    happens inside `collect-prefixes`, before any candidate or correction exists. It reads
+    only the position list, the prompt id and the seed. Pilot value: 4. Hierarchical
+    weights are unchanged (1/N_prompts x 1/N_states x 1/C(K_s,2)) over selected states.
+25. **Batched sampling.** One generator per row, named by the job's semantic id
+    (`prefix/<prompt>`, `candidate/<state>/<source>/<i>`, `correction/<job>`,
+    `exponential-audit/<job>/<r>`). `generation_batch_size` is excluded from cache keys
+    because results do not depend on it. Candidate streams changed from one per source to
+    one per draw, so caches from earlier revisions are not reused (the code revision is
+    in every key anyway).
