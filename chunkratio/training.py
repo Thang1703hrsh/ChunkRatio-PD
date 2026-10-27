@@ -1,7 +1,10 @@
 """Offline CRPD student trainer: hierarchical batches, gradient routing and resume (§8)."""
 from __future__ import annotations
 
+import contextlib
 import copy
+import json
+import math
 import random
 from collections import defaultdict
 from collections.abc import Callable
@@ -16,6 +19,27 @@ from .artifacts import digest
 from .math import diagnostics, pair_loss
 from .scoring import fingerprint, score_batch
 from .value_head import save_tensor
+
+
+def lr_multiplier(cfg: dict[str,Any]) -> Callable[[int],float]:
+    """Constant by default; opt-in linear warmup, then constant or cosine decay over cfg['steps']."""
+    schedule = cfg.get('lr_schedule','constant')
+    warmup = math.ceil(cfg.get('warmup_ratio',0.)*cfg['steps'])
+    def factor(step: int) -> float:
+        """LambdaLR multiplier for the optimizer step about to run."""
+        if step < warmup:
+            return (step+1)/warmup
+        if schedule == 'constant':
+            return 1.
+        return .5*(1+math.cos(math.pi*(step-warmup)/max(1,cfg['steps']-warmup)))
+    return factor
+
+
+def student_precision(cfg: dict[str,Any]) -> contextlib.AbstractContextManager:
+    """Opt-in bf16 autocast for student forwards only; weights, optimizer and log-softmax stay FP32."""
+    if cfg.get('policy_autocast_dtype') == 'bfloat16':
+        return torch.autocast(torch.device(cfg['device']).type,dtype=torch.bfloat16)
+    return contextlib.nullcontext()
 
 
 class ChunkRatioTrainer:
@@ -39,8 +63,9 @@ class ChunkRatioTrainer:
     def batch_loss(self, batch: list[dict[str,Any]]) -> tuple[torch.Tensor,dict[str,float]]:
         """Hierarchically sampled batch mean implements prescribed measure (§7.2)."""
         prefixes = [p['state']['prefix_ids'] for p in batch]
-        c = score_batch(self.student,prefixes,[p['c']['tokens'] for p in batch],self.eos,frozen=False)
-        d = score_batch(self.student,prefixes,[p['d']['tokens'] for p in batch],self.eos,frozen=False)
+        with student_precision(self.cfg):
+            c = score_batch(self.student,prefixes,[p['c']['tokens'] for p in batch],self.eos,frozen=False)
+            d = score_batch(self.student,prefixes,[p['d']['tokens'] for p in batch],self.eos,frozen=False)
         def column(side: str, key: str) -> torch.Tensor:
             """Move frozen cached scalar scores to the student device (§8)."""
             return c.new_tensor([p[side][key] for p in batch])
@@ -57,7 +82,8 @@ class ChunkRatioTrainer:
         row = self.rng.choice(rows)
         prefix = [row['prompt_ids']]
         c,d = [row['chosen_ids']],[row['rejected_ids']]
-        pi_delta = score_batch(self.student,prefix,c,self.eos,False)-score_batch(self.student,prefix,d,self.eos,False)
+        with student_precision(self.cfg):
+            pi_delta = score_batch(self.student,prefix,c,self.eos,False)-score_batch(self.student,prefix,d,self.eos,False)
         ref_delta = score_batch(self.rho,prefix,c,self.eos)-score_batch(self.rho,prefix,d,self.eos)
         return -F.logsigmoid(self.cfg['anchor_beta']*(pi_delta-ref_delta)).mean()
 
@@ -79,7 +105,7 @@ class ChunkRatioTrainer:
         if not cfg.get('synthetic',False) and self.selector is None:
             raise ValueError('real policy selection requires pinned reward model on select split')
         optimizer = getattr(torch.optim,cfg['optimizer'])(self.student.parameters(),lr=cfg['learning_rate'],weight_decay=0.)
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer,lambda _:1.)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer,lr_multiplier(cfg))
         identity = digest({'targets':self.targets,'config':{k:v for k,v in cfg.items() if k not in ('steps','output')}})
         start,best,best_state = 0,-float('inf'),None
         if path.exists():
@@ -119,6 +145,9 @@ class ChunkRatioTrainer:
                 anchor.backward()
                 loss_total += anchor.item()
             optimizer.step()
+            # Streamed so a long remote run can be monitored between checkpoints.
+            print(json.dumps({'variant':cfg['variant'],'step':step+1,'loss':loss_total,
+                              'lr':optimizer.param_groups[0]['lr'],**diag}),flush=True)
             scheduler.step()
             # Selection and resume checkpoints share one cadence and always include the last step;
             # an interrupted run replays from the last checkpoint with its saved sampler/RNG state.

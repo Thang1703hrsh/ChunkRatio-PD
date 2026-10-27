@@ -41,3 +41,7 @@ def test_pilot_configs_validate_and_record_assumptions() -> None:
         validate({**pilot_config(protocol,'crpd_main',checkpoints,revisions,'splitsha',True),'pilot_assumptions':{}})
     dpo = preparation_config('train-teacher-dpo','m','r','d','o')
     assert dpo['beta'] == .05 and dpo['eos_token'] == '<|im_end|>' and dpo['allow_tf32']
+    assert dpo['autocast_dtype'] == 'bfloat16'
+    tuned = pilot_config(protocol,'crpd_main',checkpoints,revisions,'splitsha',True)
+    assert (tuned['lr_schedule'],tuned['warmup_ratio'],tuned['policy_autocast_dtype']) == ('cosine',.1,'bfloat16')
+    assert tuned['alpha'] == protocol['alpha'] and tuned['policy_microbatch_size'] == 8

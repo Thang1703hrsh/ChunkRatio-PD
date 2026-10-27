@@ -4,6 +4,7 @@ Research-scale launcher code, never invoked by smoke tests or this implementatio
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import time
@@ -64,6 +65,14 @@ def prepare_checkpoint(cfg: dict[str,Any], stage: str) -> None:
     history = []
     print(json.dumps({'stage':stage,'rows_used':len(rows),'rows_dropped_over_length':rows_before-len(rows),
                       'max_length':limit}),flush=True)
+    if cfg.get('autocast_dtype') not in (None,'bfloat16'):
+        raise ValueError('autocast_dtype must be null or bfloat16')
+    def precision() -> contextlib.AbstractContextManager:
+        """Opt-in bf16 autocast (the NARVAL launcher trains in bf16). Weights and optimizer stay FP32,
+        so lr 5e-7 updates are not lost to bf16 rounding; score_batch log-softmaxes in FP32."""
+        if cfg.get('autocast_dtype') == 'bfloat16':
+            return torch.autocast(torch.device(cfg['device']).type,dtype=torch.bfloat16)
+        return contextlib.nullcontext()
     began = time.perf_counter()
     for epoch in range(cfg['epochs']):
         permutation = torch.randperm(len(rows),generator=rng).tolist()
@@ -74,11 +83,13 @@ def prepare_checkpoint(cfg: dict[str,Any], stage: str) -> None:
             for row in batch:
                 prefix = [row['prompt_ids']]
                 chosen = [row['chosen_ids']]
-                chosen_score = score_batch(model,prefix,chosen,tokenizer.eos_token_id,False)
+                with precision():
+                    chosen_score = score_batch(model,prefix,chosen,tokenizer.eos_token_id,False)
+                    if dpo:
+                        rejected = [row['rejected_ids']]
+                        margin = chosen_score-score_batch(model,prefix,rejected,tokenizer.eos_token_id,False)
+                        reference = score_batch(ref,prefix,chosen,tokenizer.eos_token_id)-score_batch(ref,prefix,rejected,tokenizer.eos_token_id)
                 if dpo:
-                    rejected = [row['rejected_ids']]
-                    margin = chosen_score-score_batch(model,prefix,rejected,tokenizer.eos_token_id,False)
-                    reference = score_batch(ref,prefix,chosen,tokenizer.eos_token_id)-score_batch(ref,prefix,rejected,tokenizer.eos_token_id)
                     loss = -F.logsigmoid(cfg['beta']*(margin-reference)).mean()/len(batch)
                 else:
                     loss = -chosen_score.mean()/len(row['chosen_ids'])/len(batch)

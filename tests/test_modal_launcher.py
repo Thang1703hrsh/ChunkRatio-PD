@@ -17,7 +17,8 @@ def test_launcher_stages_and_hardware() -> None:
         assert hasattr(module,name)
     assert "@app.function(cpu=4.0,memory=16384,**common)\ndef prepare" in source
     assert "@app.function(cpu=0.25,memory=1024,**common)\ndef run_pilot" in source
-    assert "gpu='L40S',cpu=4.0,memory=16384,retries=1,**common)\ndef sft_student" in source
+    assert "gpu='L40S',cpu=4.0,memory=16384,retries=0,**sft_limits)\ndef sft_student" in source
+    assert "retries=0,**dpo_limits)\ndef dpo_teacher" in source and module.SFT_DATA.endswith('fit2048.jsonl')
     assert module.VARIANTS == ('crpd_main','crpd_raw','crpd_anchor')
 
 

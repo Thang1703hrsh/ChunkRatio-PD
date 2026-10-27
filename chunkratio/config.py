@@ -70,6 +70,12 @@ def validate(cfg: dict[str,Any]) -> None:
         raise ValueError('exponential audit needs replicated independent estimates')
     if not isinstance(cfg.get('selection_interval',1),int) or cfg.get('selection_interval',1) <= 0:
         raise ValueError('selection_interval must be positive integer')
+    if cfg.get('lr_schedule','constant') not in ('constant','cosine'):
+        raise ValueError('lr_schedule must be constant or cosine')
+    if not 0 <= cfg.get('warmup_ratio',0) < 1:
+        raise ValueError('warmup_ratio must be in [0,1)')
+    if cfg.get('policy_autocast_dtype') not in (None,'bfloat16'):
+        raise ValueError('policy_autocast_dtype must be null or bfloat16 (student forwards only)')
     if cfg.get('protocol_name') == 'narval':
         validate_narval(cfg)
     if not cfg.get('synthetic',False):

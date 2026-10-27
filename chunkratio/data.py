@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import itertools
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -70,11 +71,31 @@ def sharegpt_rows(rows: list[dict[str,Any]]) -> tuple[list[dict[str,Any]],int]:
     return output,skipped
 
 
+def fit_conversation(row: dict[str,Any], length: Callable[[list[dict[str,str]]],int], limit: int) -> dict[str,Any] | None:
+    """Supervise the latest assistant turn whose whole conversation prefix fits `limit` tokens.
+
+    Earlier turns stay as context and no response is cut, so long Deita dialogues still give
+    one SFT row instead of being dropped by the length preflight. None if no turn fits.
+    """
+    turns = row['messages']+[{'role':'assistant','content':row['chosen']}]
+    ends = [i for i,t in enumerate(turns) if t['role'] == 'assistant' and i > 0]
+    low,high,best = 0,len(ends)-1,None
+    while low <= high:
+        middle = (low+high)//2
+        if length(turns[:ends[middle]+1]) <= limit:
+            best,low = ends[middle],middle+1
+        else:
+            high = middle-1
+    if best is None:
+        return None
+    return {**row,'messages':turns[:best],'chosen':turns[best]['content']}
+
+
 def prepare_data(source: Path, tokenizer_path: str, revision: str, destination: Path, seed: int,
                  fmt: str = 'auto', assign_split: str | None = None,
                  template_kwargs: dict[str,Any] | None = None,
                  head_val_fraction: float = .05, select_fraction: float = .05,
-                 eos_token: str | None = None) -> None:
+                 eos_token: str | None = None, fit_max_length: int | None = None) -> None:
     """Serialize prompts once; strict template seam; retain human pairs for anchors only (§5.1)."""
     import json
     from transformers import AutoTokenizer
@@ -95,6 +116,20 @@ def prepare_data(source: Path, tokenizer_path: str, revision: str, destination: 
         rows = helpsteer_pairs(rows)
     elif sharegpt:
         rows,skipped = sharegpt_rows(rows)
+        trimmed = unfit = 0
+        if fit_max_length is not None:
+            def length(turns: list[dict[str,str]]) -> int:
+                """Templated token count of a whole conversation prefix."""
+                return len(tok.apply_chat_template(turns,tokenize=True,add_generation_prompt=False,**(template_kwargs or {})))
+            fitted = []
+            for row in rows:
+                fit = fit_conversation(row,length,fit_max_length)
+                if fit is None:
+                    unfit += 1
+                    continue
+                trimmed += fit['messages'] != row['messages']
+                fitted.append(fit)
+            rows = fitted
     elif ultrafeedback:
         raw_ids = [r['prompt_id'] for r in rows]
         rows = ultrafeedback_pairs(rows)
@@ -159,7 +194,8 @@ def prepare_data(source: Path, tokenizer_path: str, revision: str, destination: 
         write_json(destination.with_name(destination.stem+'.sft.json'),
                    {'source':source.name,'format':'sharegpt','rows_in':len(output)+skipped,'rows_out':len(unique),
                     'skipped_not_ending_with_assistant':skipped,'duplicate_prompts_dropped':len(output)-len(unique),
-                    'eos_token':tok.eos_token})
+                    'eos_token':tok.eos_token,'fit_max_length':fit_max_length,
+                    'turns_trimmed_to_fit':trimmed,'dropped_no_turn_fits':unfit})
         output = unique
     prepared = prepare_prompts(output,seed)
     atomic_bytes(destination,(''.join(json.dumps(row,ensure_ascii=False)+'\n' for row in prepared)).encode())

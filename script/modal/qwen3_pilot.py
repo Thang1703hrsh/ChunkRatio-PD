@@ -35,6 +35,8 @@ VOLUME_PATH = '/vol'
 PAIR = 'qwen3_1p7b_to_0p6b'
 DATA = f'data/narval/{PAIR}'
 CHECKPOINTS = f'output/narval/{PAIR}/pilot/checkpoints'
+# Turn-fitted Deita (98.8% of conversations kept at 2048 tokens instead of 5.4%).
+SFT_DATA = f'{DATA}/deita_sft_fit2048.jsonl'
 VARIANTS = ('crpd_main','crpd_raw','crpd_anchor')
 
 app = modal.App(APP_NAME)
@@ -45,6 +47,9 @@ image = (modal.Image.debian_slim(python_version='3.12')
          .add_local_dir(REPO,REMOTE_REPO,ignore=['output','data','.git','mtbench','winrate_eval','diversity_metrics',
                                                  'promt','prompts','env','reports','**/__pycache__','.pytest_cache']))
 common = {'image':image,'volumes':{VOLUME_PATH:volume},'timeout':24*3600}
+# Preparation stages fail deterministically, so no retries, and a stall cannot hold a GPU for 24 h.
+sft_limits = {**common,'timeout':4*3600}
+dpo_limits = {**common,'timeout':16*3600}
 
 
 def workdir() -> Path:
@@ -96,9 +101,9 @@ def prepare(revision: str) -> None:
     work = workdir()
     sys.path.insert(0,str(work))
     from chunkratio.artifacts import read_jsonl, write_json
-    from chunkratio.pilot import (PREFERENCE_DATASET, REWARD_MODEL, SFT_DATASET, STUDENT_BASE_MODEL,
+    from chunkratio.pilot import (MAX_LENGTH, PREFERENCE_DATASET, REWARD_MODEL, SFT_DATASET, STUDENT_BASE_MODEL,
                                   TEACHER_BASE_MODEL, pilot_subset)
-    if done(f'{DATA}/prepared.json'):
+    if done(f'{DATA}/prepared.json') and done(SFT_DATA):
         print('skip prepare',flush=True)
         return
     from datasets import load_dataset
@@ -124,16 +129,21 @@ def prepare(revision: str) -> None:
     template = json.dumps({'enable_thinking':False})
     tokenizer = ['--tokenizer',STUDENT_BASE_MODEL,'--revision',revisions['student_base_model'],
                  '--eos-token','<|im_end|>','--chat-template-kwargs',template]
-    crpd(revision,'prepare-data','--input',f'{DATA}/raw/deita.jsonl','--output',f'{DATA}/deita_sft.jsonl',
-         '--format','sharegpt','--assign-split','train',*tokenizer)
-    crpd(revision,'prepare-data','--input',f'{DATA}/raw/uf_train_prefs.jsonl','--output',f'{DATA}/ultrafeedback_train.jsonl',
-         '--format','ultrafeedback',*tokenizer)
-    crpd(revision,'prepare-data','--input',f'{DATA}/raw/uf_test_prefs.jsonl','--output',f'{DATA}/ultrafeedback_test.jsonl',
-         '--format','ultrafeedback','--assign-split','test',*tokenizer)
+    # Each output is built once; a later code version can add a file without redoing the others.
+    if not done(SFT_DATA):
+        crpd(revision,'prepare-data','--input',f'{DATA}/raw/deita.jsonl','--output',SFT_DATA,
+             '--format','sharegpt','--assign-split','train','--fit-max-length',str(MAX_LENGTH),*tokenizer)
+    if not done(f'{DATA}/ultrafeedback_train.jsonl'):
+        crpd(revision,'prepare-data','--input',f'{DATA}/raw/uf_train_prefs.jsonl','--output',f'{DATA}/ultrafeedback_train.jsonl',
+             '--format','ultrafeedback',*tokenizer)
+    if not done(f'{DATA}/ultrafeedback_test.jsonl'):
+        crpd(revision,'prepare-data','--input',f'{DATA}/raw/uf_test_prefs.jsonl','--output',f'{DATA}/ultrafeedback_test.jsonl',
+             '--format','ultrafeedback','--assign-split','test',*tokenizer)
     subset = pilot_subset(read_jsonl(work/DATA/'ultrafeedback_train.jsonl'))
     (work/DATA/'ultrafeedback_train_pilot.jsonl').write_text(''.join(json.dumps(r,ensure_ascii=False)+'\n' for r in subset),
                                                              encoding='utf-8')
-    write_json(work/DATA/'prepared.json',{'revisions':revisions,'pilot_rows':len(subset),'code_revision':revision})
+    write_json(work/DATA/'prepared.json',{'revisions':revisions,'pilot_rows':len(subset),'code_revision':revision,
+                                          'sft_data':SFT_DATA})
     volume.commit()
 
 
@@ -142,23 +152,23 @@ def _revisions() -> dict:
     return json.loads((workdir()/DATA/'revisions.json').read_text(encoding='utf-8'))
 
 
-@app.function(gpu='A100-80GB',cpu=4.0,memory=32768,retries=1,**common)
+@app.function(gpu='A100-80GB',cpu=4.0,memory=32768,retries=0,**sft_limits)
 def sft_teacher(revision: str) -> None:
-    """T0: SFT of Qwen3-1.7B-Base on Deita (full fine-tuning, FP32 weights, TF32 matmuls)."""
+    """T0: SFT of Qwen3-1.7B-Base on Deita (full fine-tuning, FP32 weights, bf16 autocast)."""
     volume.reload()
     train_checkpoint(revision,'train-sft','Qwen/Qwen3-1.7B-Base',_revisions()['teacher_base_model'],
-                     f'{DATA}/deita_sft.jsonl',f'{CHECKPOINTS}/teacher_base')
+                     SFT_DATA,f'{CHECKPOINTS}/teacher_base')
 
 
-@app.function(gpu='L40S',cpu=4.0,memory=16384,retries=1,**common)
+@app.function(gpu='L40S',cpu=4.0,memory=16384,retries=0,**sft_limits)
 def sft_student(revision: str) -> None:
     """rho: SFT of Qwen3-0.6B-Base on the same Deita data (L40S is enough for 0.6B)."""
     volume.reload()
     train_checkpoint(revision,'train-sft','Qwen/Qwen3-0.6B-Base',_revisions()['student_base_model'],
-                     f'{DATA}/deita_sft.jsonl',f'{CHECKPOINTS}/student_ref')
+                     SFT_DATA,f'{CHECKPOINTS}/student_ref')
 
 
-@app.function(gpu='A100-80GB',cpu=4.0,memory=32768,retries=1,**common)
+@app.function(gpu='A100-80GB',cpu=4.0,memory=32768,retries=0,**dpo_limits)
 def dpo_teacher(revision: str) -> None:
     """T+: DPO of T0 on UltraFeedback train_prefs; the frozen DPO reference is exactly T0."""
     volume.reload()

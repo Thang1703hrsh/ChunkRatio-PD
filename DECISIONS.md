@@ -159,3 +159,32 @@ Fixed on 27 October 2026, before any pilot collection or return was observed.
     sha256([seed, 'pilot', group_id]) before any generation. Teacher DPO still uses all of train_prefs.
 35. **Hardware.** A GPU is attached only where a stage needs one: L40S for the 0.6B SFT and the
     diagnostic, A100-80GB for 1.7B training and for CRPD (which also holds the 8B FsfairX RM in FP32).
+
+## Comparison with the NARVAL reference code and pilot tuning (user request, 27 October 2026)
+
+The user pointed to github.com/PhiVanDat123/NARVAL as working reference code and asked for tuned
+CRPD settings without having to follow NARVAL's. That repository holds only the NARVAL
+distillation stage (`scripts/run_narval.py`); it has no SFT or teacher-DPO code to compare.
+
+36. **No CRPD defect found by the comparison.** Differences from NARVAL are by design: CRPD scores
+    rho rollouts in chunks with frozen FP32 labels, uses no log-ratio clipping and drops rather
+    than truncates over-length data (spec §§5.2, 6.1). CRPD's prompt ends with the generation
+    prompt and the continuation keeps EOS exactly once, which NARVAL's code also intends.
+37. **Probable defect in the reference, not adopted.** In NARVAL's `apply_chat_template` (task dpo)
+    `text_chosen` is the whole templated conversation, and `tokenize_row` prepends the prompt again,
+    so the prompt appears twice and its second copy is scored. CRPD does not copy this.
+38. **SFT turn fitting (pilot).** `prepare-data --fit-max-length N` supervises, for each ShareGPT
+    conversation, the latest assistant turn whose conversation fits N tokens; earlier turns stay as
+    context and no response is cut. On Deita with the Qwen3 tokenizer at 2048 this keeps 9,708 of
+    9,827 conversations (17.6M tokens) instead of 532 (1.0M), which left SFT with about 15 steps.
+39. **Mixed precision (pilot).** `autocast_dtype: bfloat16` (SFT/DPO) and `policy_autocast_dtype:
+    bfloat16` (student forwards only) follow NARVAL's bf16 training while weights and AdamW stay FP32,
+    so 5e-7 updates are not lost to bf16 rounding. `score_tokens` still log-softmaxes in FP32, and
+    frozen-model scoring (collection, targets, rho in the anchor term) runs without autocast.
+40. **Policy schedule (pilot).** Opt-in `lr_schedule: cosine` with `warmup_ratio: 0.1` at peak lr
+    1e-6 (mean about 5.5e-7, near NARVAL's 5e-7 cosine/10% warmup); `policy_microbatch_size: 8`
+    changes speed, not the objective. Defaults stay constant lr and FP32, so primary configs are
+    unchanged. `alpha` stays 0.3: it rescales targets and margins alike, so its best value needs a
+    select-split sweep, which has not been run.
+41. **Launcher limits.** SFT/DPO stages run with `retries=0` and 4 h / 16 h timeouts, and SFT/DPO and
+    the policy loop print one JSON line per optimizer step so loss can be watched remotely.
