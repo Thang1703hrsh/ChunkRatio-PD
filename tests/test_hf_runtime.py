@@ -254,3 +254,39 @@ def test_prepare_ultrafeedback_qwen3_template(tmp_path: Path) -> None:
     prepare_data(source,str(tmp_path/'tok'),'local',tmp_path/'think.jsonl',0)
     thinking = read_jsonl(tmp_path/'think.jsonl')[0]
     assert thinking['prompt_ids'][-1] == 6 and thinking['chosen_ids'][:2] == [3,4]
+
+
+def test_pilot_sft_preparation_with_eos_override(tmp_path: Path) -> None:
+    """Base-style tokenizer (EOS <|endoftext|>) -> <|im_end|> override in data and checkpoint; long rows dropped."""
+    from chunkratio.artifacts import read_jsonl
+    from chunkratio.data import prepare_data
+    from chunkratio.pilot import preparation_config
+    from chunkratio.preparation import prepare_checkpoint
+    from chunkratio.tiny import build_tiny_qwen3, tiny_qwen3_tokenizer
+    paths = build_tiny_qwen3(tmp_path/'qwen')
+    base_tok = tiny_qwen3_tokenizer()
+    base_tok.eos_token = '<|endoftext|>'
+    base_tok.save_pretrained(paths['teacher_base'])
+    source = tmp_path/'deita.jsonl'
+    conversations = [[{'from':'human','value':'w1 w2'},{'from':'gpt','value':'w3 w4'}],
+                     [{'from':'human','value':'w5'},{'from':'gpt','value':'w6'},{'from':'human','value':'w7'},
+                      {'from':'gpt','value':' '.join(['w8']*40)}],
+                     [{'from':'human','value':'w1 w2'},{'from':'gpt','value':'w9'}],
+                     [{'from':'human','value':'w10'}]]
+    source.write_text(''.join(json.dumps({'id':str(i),'conversations':c})+'\n' for i,c in enumerate(conversations)),encoding='utf-8')
+    with pytest.raises(ValueError,match='EOS'):
+        prepare_data(source,str(paths['teacher_base']),'local',tmp_path/'bad.jsonl',0,assign_split='train',
+                     template_kwargs={'enable_thinking':False})
+    prepare_data(source,str(paths['teacher_base']),'local',tmp_path/'sft.jsonl',0,assign_split='train',
+                 template_kwargs={'enable_thinking':False},eos_token='<|im_end|>')
+    data = read_jsonl(tmp_path/'sft.jsonl')
+    summary = read_json(tmp_path/'sft.sft.json')
+    assert summary['skipped_not_ending_with_assistant'] == 1 and summary['duplicate_prompts_dropped'] == 1
+    assert len(data) == 2 and all(r['chosen_ids'][-1] == 2 and 'rejected_ids' not in r for r in data)
+    cfg = {**preparation_config('train-sft',str(paths['teacher_base']),'local',str(tmp_path/'sft.jsonl'),
+                                str(tmp_path/'t0')),'device':'cpu','max_length':30}
+    prepare_checkpoint(cfg,'train-sft')
+    manifest = read_json(tmp_path/'t0'/'preparation_manifest.json')
+    assert manifest['rows_dropped_over_length'] == 1 and manifest['rows_used'] == 1 and manifest['eos_token'] == '<|im_end|>'
+    saved = transformers.AutoTokenizer.from_pretrained(tmp_path/'t0')
+    assert saved.eos_token == '<|im_end|>' and transformers.AutoConfig.from_pretrained(tmp_path/'t0').eos_token_id == 2

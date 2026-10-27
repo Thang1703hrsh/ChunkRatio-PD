@@ -117,8 +117,15 @@ def validate_narval(cfg: dict[str,Any]) -> None:
             raise ValueError('Qwen3 chat template must be fixed with enable_thinking=false')
     if cfg.get('synthetic',False):
         return
+    if cfg.get('pilot'):
+        # Pilot runs need every training input; evaluation fields and reference rows may stay open.
+        if not cfg.get('pilot_assumptions'):
+            raise ValueError('pilot configs must list their assumed (unverified) settings')
+        scope = {k:v for k,v in narval.items() if k not in ('evaluation','reference_rows')}
+    else:
+        scope = narval
     missing = open_inputs({'eos_token':cfg.get('eos_token'),'models':cfg['models'],
-                           'selection':cfg.get('selection',{}),'narval':narval})
+                           'selection':cfg.get('selection',{}),'narval':scope})
     if missing:
         raise ValueError('NARVAL open inputs (fill from the NARVAL repository or verified checkpoints): '+', '.join(missing))
     for role,link in (narval.get('provenance') or {}).items():

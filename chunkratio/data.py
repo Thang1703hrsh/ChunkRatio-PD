@@ -56,21 +56,45 @@ def rank_split(group_ids: list[str], seed: int, head_val_fraction: float, select
     return split
 
 
+def sharegpt_rows(rows: list[dict[str,Any]]) -> tuple[list[dict[str,Any]],int]:
+    """ShareGPT conversations (Deita) -> SFT rows: earlier turns are the prompt, the last
+    assistant turn is chosen; rows that do not end with an assistant turn are skipped and counted."""
+    roles = {'human':'user','user':'user','gpt':'assistant','assistant':'assistant','system':'system'}
+    output, skipped = [],0
+    for row in rows:
+        turns = [{'role':roles[t['from']],'content':t['value']} for t in row['conversations']]
+        if len(turns) < 2 or turns[-1]['role'] != 'assistant':
+            skipped += 1
+            continue
+        output.append({'messages':turns[:-1],'chosen':turns[-1]['content'],'rejected':None})
+    return output,skipped
+
+
 def prepare_data(source: Path, tokenizer_path: str, revision: str, destination: Path, seed: int,
                  fmt: str = 'auto', assign_split: str | None = None,
                  template_kwargs: dict[str,Any] | None = None,
-                 head_val_fraction: float = .05, select_fraction: float = .05) -> None:
+                 head_val_fraction: float = .05, select_fraction: float = .05,
+                 eos_token: str | None = None) -> None:
     """Serialize prompts once; strict template seam; retain human pairs for anchors only (§5.1)."""
     import json
     from transformers import AutoTokenizer
     from .collection import prepare_prompts
     tok = AutoTokenizer.from_pretrained(tokenizer_path,revision=revision)
+    if eos_token is not None:
+        # Base checkpoints may declare another EOS; every role must stop at the end-of-turn token.
+        if eos_token not in tok.get_vocab():
+            raise ValueError(f'{eos_token} is not in the tokenizer vocabulary')
+        tok.eos_token = eos_token
     rows = read_jsonl(source)
     template_kwargs = template_kwargs or {}
     ultrafeedback = fmt == 'ultrafeedback' or (fmt == 'auto' and rows and 'prompt_id' in rows[0]
                                                and isinstance(rows[0].get('chosen'),list))
+    sharegpt = fmt == 'sharegpt' or (fmt == 'auto' and rows and 'conversations' in rows[0])
+    skipped = 0
     if rows and 'helpfulness' in rows[0]:
         rows = helpsteer_pairs(rows)
+    elif sharegpt:
+        rows,skipped = sharegpt_rows(rows)
     elif ultrafeedback:
         raw_ids = [r['prompt_id'] for r in rows]
         rows = ultrafeedback_pairs(rows)
@@ -89,6 +113,9 @@ def prepare_data(source: Path, tokenizer_path: str, revision: str, destination: 
                     'counts':{s:sum(v == s for v in assignment.values()) for s in sorted(set(assignment.values()))},
                     'assignment_sha256':digest(sorted(assignment.items())),
                     'duplicate_prompt_ids_first_pair_kept':duplicates,'rows_in':len(raw_ids),'rows_out':len(rows)})
+    if assign_split is not None and not ultrafeedback:
+        for row in rows:
+            row['split'] = assign_split
     output = []
     for row in rows:
         messages = row.get('messages')
@@ -103,6 +130,8 @@ def prepare_data(source: Path, tokenizer_path: str, revision: str, destination: 
         prefix = tok.apply_chat_template(messages,tokenize=True,add_generation_prompt=True,**template_kwargs)
         result = {'messages':messages,'prompt_ids':prefix,'tokenizer_revision':revision}
         for label,text in (('chosen',chosen),('rejected',rejected)):
+            if text is None:
+                continue
             full = tok.apply_chat_template(messages+[{'role':'assistant','content':text}],tokenize=True,
                                            add_generation_prompt=False,**template_kwargs)
             if full[:len(prefix)] != prefix:
@@ -119,5 +148,18 @@ def prepare_data(source: Path, tokenizer_path: str, revision: str, destination: 
             if key in row:
                 result[key] = row[key]
         output.append(result)
+    if sharegpt:
+        # SFT data: keep the first answer per canonical prompt; record what was dropped.
+        seen, unique = set(),[]
+        for row in output:
+            key = tuple(row['prompt_ids'])
+            if key not in seen:
+                seen.add(key)
+                unique.append(row)
+        write_json(destination.with_name(destination.stem+'.sft.json'),
+                   {'source':source.name,'format':'sharegpt','rows_in':len(output)+skipped,'rows_out':len(unique),
+                    'skipped_not_ending_with_assistant':skipped,'duplicate_prompts_dropped':len(output)-len(unique),
+                    'eos_token':tok.eos_token})
+        output = unique
     prepared = prepare_prompts(output,seed)
     atomic_bytes(destination,(''.join(json.dumps(row,ensure_ascii=False)+'\n' for row in prepared)).encode())

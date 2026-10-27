@@ -28,10 +28,22 @@ def prepare_checkpoint(cfg: dict[str,Any], stage: str) -> None:
         raise ValueError('primary teacher DPO beta must be .05')
     if not cfg.get('revision'):
         raise ValueError('pin base revision')
+    if cfg.get('allow_tf32'):
+        # Training-only speed setting; CRPD scoring keeps full FP32 matmuls.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     tokenizer = AutoTokenizer.from_pretrained(cfg['model'],revision=cfg['revision'])
+    if cfg.get('eos_token'):
+        tokenizer.eos_token = cfg['eos_token']
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(cfg['model'],revision=cfg['revision'],torch_dtype=torch.float32).to(cfg['device'])
+    if cfg.get('eos_token'):
+        # Saved checkpoints carry the same end-of-turn EOS as their tokenizer.
+        model.config.eos_token_id = tokenizer.eos_token_id
+        if model.generation_config is not None:
+            model.generation_config.eos_token_id = tokenizer.eos_token_id
+            model.generation_config.pad_token_id = tokenizer.pad_token_id
     ref = freeze(copy.deepcopy(model)) if dpo else None
     reference_identity = fingerprint(ref) if ref is not None else None
     rows = [r for r in read_jsonl(Path(cfg['data'])) if r['split'] == 'train']
@@ -39,7 +51,9 @@ def prepare_checkpoint(cfg: dict[str,Any], stage: str) -> None:
         raise ValueError('no train data')
     context = model.config.max_position_embeddings
     # Exclude over-budget examples before sampling, never silently truncate responses.
-    rows = [r for r in rows if len(r['prompt_ids'])+max(len(r['chosen_ids']),len(r.get('rejected_ids',[]))) <= context]
+    limit = min(context,cfg.get('max_length') or context)
+    rows_before = len(rows)
+    rows = [r for r in rows if len(r['prompt_ids'])+max(len(r['chosen_ids']),len(r.get('rejected_ids',[]))) <= limit]
     if not rows or any(not row['chosen_ids'] or (dpo and not row.get('rejected_ids')) for row in rows):
         raise ValueError('no eligible nonempty supervised responses after context preflight')
     optimizer = torch.optim.AdamW(model.parameters(),lr=cfg['learning_rate'],weight_decay=0.)
@@ -73,4 +87,5 @@ def prepare_checkpoint(cfg: dict[str,Any], stage: str) -> None:
     tokenizer.save_pretrained(output)
     write_json(output/'preparation_manifest.json',{'stage':stage,'config':cfg,'data_hash':digest(rows),
                 'teacher_dpo_reference_fingerprint':reference_identity,'model_fingerprint':fingerprint(model),
-                'history':history,'note':'single-process full fine tuning; microbatch=1, effective batch=128 except final partial batch'})
+                'history':history,'rows_used':len(rows),'rows_dropped_over_length':rows_before-len(rows),
+                'max_length':limit,'eos_token':tokenizer.eos_token,'note':'single-process full fine tuning; microbatch=1, effective batch=128 except final partial batch'})

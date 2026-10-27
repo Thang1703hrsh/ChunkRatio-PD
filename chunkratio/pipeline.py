@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import importlib.metadata
 import platform
 import subprocess
@@ -60,7 +61,8 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
     root = Path(__file__).resolve().parents[1]
     documents = {str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
                  for p in sorted((root/'reference').glob('*')) if p.suffix in ('.md','.py','.json')}
-    revision = subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip()
+    # Containers without .git (Modal) pass the revision computed where the code was uploaded.
+    revision = os.environ.get('CRPD_CODE_REVISION') or subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip()
     manifest = {'schema':1,'method_version':'1.1','spec_revision':2,'code_revision':revision,
                 'python':platform.python_version(),'torch':torch.__version__,'documents':documents,
                 'config':cfg,'models':identities,'tokenizer':info,'split_hash':digest(prompts),
