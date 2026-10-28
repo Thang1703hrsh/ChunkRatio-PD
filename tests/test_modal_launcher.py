@@ -49,7 +49,12 @@ def test_smoke_scale_and_hf_push_switches(monkeypatch) -> None:
     stability = load('stability','1')
     assert stability.APP_NAME == 'crpd-qwen3-pilot-hub-stability' and stability.VARIANTS == ('crpd_main',)
     assert (stability.SIZES['steps'],stability.SIZES['selection_interval'],stability.SIZES['states_per_prompt']) == (150,50,2)
-    assert stability.HF_PREFIX.endswith('-hub-stability')
+    assert stability.HF_PREFIX.endswith('-hub-stability') and stability.GPU_TAG == ''
+    monkeypatch.setenv('CRPD_GPU','L40S')
+    l40s = load('smoke','0')
+    assert l40s.GPU_TAG == '-l40s' and l40s.CRPD_GPU == 'L40S'
+    assert "'CRPD_GPU':CRPD_GPU" in Path('script/modal/qwen3_pilot.py').read_text(encoding='utf-8')
+    monkeypatch.delenv('CRPD_GPU')
     monkeypatch.setenv('CRPD_TEACHERS','pretrained')
     with pytest.raises(SystemExit,match='CRPD_TEACHERS'):
         load('full','0')

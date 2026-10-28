@@ -90,7 +90,8 @@ image = (modal.Image.debian_slim(python_version='3.12')
                       'huggingface_hub')
          .env({'HF_HOME':f'{VOLUME_PATH}/hf','TOKENIZERS_PARALLELISM':'false','PYTHONUNBUFFERED':'1',
                'PYTORCH_CUDA_ALLOC_CONF':'expandable_segments:True',
-               'CRPD_SCALE':SCALE,'CRPD_HF_PUSH':'1' if HF_PUSH else '0','CRPD_TEACHERS':TEACHERS})
+               'CRPD_SCALE':SCALE,'CRPD_HF_PUSH':'1' if HF_PUSH else '0','CRPD_TEACHERS':TEACHERS,
+               'CRPD_GPU':CRPD_GPU})
          .add_local_dir(REPO,REMOTE_REPO,ignore=['output','data','.git','mtbench','winrate_eval','diversity_metrics',
                                                  'promt','prompts','env','reports','**/__pycache__','.pytest_cache']))
 common = {'image':image,'volumes':{VOLUME_PATH:volume},'timeout':24*3600}
