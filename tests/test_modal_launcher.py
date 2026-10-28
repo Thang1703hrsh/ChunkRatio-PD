@@ -41,6 +41,15 @@ def test_smoke_scale_and_hf_push_switches(monkeypatch) -> None:
     assert full.APP_NAME == 'crpd-qwen3-pilot' and not full.hf_secret and len(full.VARIANTS) == 3
     with pytest.raises(SystemExit,match='CRPD_SCALE'):
         load('huge','0')
+    monkeypatch.setenv('CRPD_TEACHERS','hub')
+    hub = load('full','1')
+    assert hub.APP_NAME == 'crpd-qwen3-pilot-hub' and hub.VARIANTS == ('crpd_main','crpd_raw')
+    assert hub.ROOT == 'output/narval/qwen3_1p7b_to_0p6b_hub/pilot' and hub.SFT_DATA.endswith('ultrachat_sft_fit2048.jsonl')
+    assert hub.SIZES['states_per_prompt'] == 2 and hasattr(hub,'verify_teachers')
+    monkeypatch.setenv('CRPD_TEACHERS','pretrained')
+    with pytest.raises(SystemExit,match='CRPD_TEACHERS'):
+        load('full','0')
+    monkeypatch.delenv('CRPD_TEACHERS')
 
 
 @pytest.mark.parametrize('pair',['qwen3_8b_to_1p7b','llama31_8b_to_llama32_1b'])

@@ -56,11 +56,43 @@ PAIRS = {
                                 'generation_batch_size':16},
 }
 
+# Published Qwen3-1.7B teacher pair (pinned revisions): T+ is a LoRA DPO of T0, and the LoRA is
+# published too, so chunkratio.hub_teachers can check T+ = T0 + LoRA from the weights.
+HUB_TEACHERS = {
+    'teacher_base':{'repo':'ayushshah/Qwen3-1.7B-UltraChat-SFT','revision':'698d09a459656c6909e2b79c6827b66c7a10d70b'},
+    'teacher_plus':{'repo':'ayushshah/Qwen3-1.7B-Chat','revision':'2e46c30d9fba4ed1aaa8f21003e0de58fa7cf944'},
+    'dpo_lora':{'repo':'ayushshah/Qwen3-1.7B-Chat-LoRA','revision':'c1a6e68d4e8adb95ef8c535d705985da6c7b6f15'},
+}
+HUB_PAIR = PAIR+'_hub'
+# rho is our own SFT of Qwen3-0.6B-Base on UltraChat with the teachers' plain ChatML template: the
+# official Qwen3-0.6B uses a thinking template whose prompt tokens differ from the teachers'.
+PAIRS[HUB_PAIR] = {'teacher':HUB_TEACHERS['teacher_base']['repo'],'student':STUDENT_BASE_MODEL,
+                   'tokenizer':HUB_TEACHERS['teacher_base']['repo'],'eos':EOS_TOKEN,
+                   'chat_template_kwargs':{'enable_thinking':False},'gated':False,'generation_batch_size':32}
+HUB_ASSUMPTIONS = {
+    **{k:v for k,v in PILOT_ASSUMPTIONS.items() if k not in ('teacher_pair','teacher_dpo_recipe','sft_data','sft_recipe')},
+    'base_checkpoints':f'{STUDENT_BASE_MODEL} for rho; teachers are published checkpoints, not trained here',
+    'teacher_pair':('T0 = ayushshah/Qwen3-1.7B-UltraChat-SFT (UltraChat-200k SFT of Qwen3-1.7B-Base); '
+                    'T+ = ayushshah/Qwen3-1.7B-Chat (LoRA r32/a64 DPO of T0, lr 5e-6, 1 epoch, argilla UltraFeedback-'
+                    'cleaned 15k + Capybara + Orca pairs); T+ = T0 + LoRA checked from the weights before use'),
+    'sft_data':('rho: first 10,000 HuggingFaceH4/ultrachat_200k train_sft conversations, latest assistant turn that '
+                'fits 2048 tokens supervised, teachers\' plain ChatML template'),
+    'sft_recipe':'rho: 3 epochs, lr 2e-5, effective batch 128, full fine-tuning (not the teachers\' LoRA SFT recipe)',
+    'eos':'<|im_end|> for every role; the teachers\' tokenizer and plain ChatML template are shared by all roles',
+    'pilot_subset':"{'train': 1000, 'head_val': 100, 'select': 64} prompts, ranked by sha256([seed, pilot, group_id])",
+    'states_per_prompt':'2 (pre-registered 4 halved for cost; recorded before collection)',
+    'policy_steps':'300 steps x 64 pairs; RM selection every 150 steps; variants crpd_main and crpd_raw',
+    'contamination':('T+ saw argilla UltraFeedback-cleaned prompts, which share the UltraFeedback prompt pool with '
+                     'H4 test_prefs; held-out prompts seen by T+ must be excluded before reporting'),
+}
+
 
 def pilot_assumptions(pair: str = PAIR) -> dict[str,str]:
     """Unverified settings of one pair's pilot (the default pair keeps PILOT_ASSUMPTIONS exactly)."""
     if pair == PAIR:
         return PILOT_ASSUMPTIONS
+    if pair == HUB_PAIR:
+        return HUB_ASSUMPTIONS
     spec = PAIRS[pair]
     return {**PILOT_ASSUMPTIONS,
             'base_checkpoints':f"{spec['teacher']} and {spec['student']} (Base vs post-trained is an open NARVAL input)",
@@ -104,6 +136,7 @@ def pilot_config(protocol: dict[str,Any], variant: str, checkpoints: dict[str,di
     cfg = copy.deepcopy(protocol)
     root = f'output/narval/{pair}/pilot'
     deviation = ('teacher pair trained directly from Qwen3-1.7B-Base, not taken from the 8B->1.7B protocol' if pair == PAIR
+                 else 'published teacher pair (T+ = T0 + LoRA, checked from weights), not NARVAL\'s checkpoints' if pair == HUB_PAIR
                  else f"teacher pair trained from {spec['teacher']} with the assumed recipe, not NARVAL's checkpoints")
     cfg.update(pilot=True,variant=variant,output=f'{root}/{variant}/seed0',cache_root=f'{root}/cache',
                prompts=f'data/narval/{pair}/ultrafeedback_train_pilot.jsonl',selection_interval=250,

@@ -210,3 +210,24 @@ distillation stage (`scripts/run_narval.py`); it has no SFT or teacher-DPO code 
 45. **Shared checkpoint not exploited.** With the same recipe, the Qwen3-8B pair's rho (SFT of
     Qwen3-1.7B-Base) is the Qwen3-1.7B pair's T0, as in NARVAL Table 1. The launchers do not yet
     reuse it across pairs; each pair trains its own copy.
+
+## Published teacher pair for Qwen3-1.7B -> Qwen3-0.6B (user request, 29 October 2026)
+
+46. **Hub teachers.** `CRPD_TEACHERS=hub` uses T0 = ayushshah/Qwen3-1.7B-UltraChat-SFT@698d09a4 and
+    T+ = ayushshah/Qwen3-1.7B-Chat@2e46c30d instead of training them. The model cards are not
+    evidence: `chunkratio/hub_teachers.py` rebuilds T0 + (alpha/r) B A from the published DPO LoRA
+    (ayushshah/Qwen3-1.7B-Chat-LoRA@c1a6e68d) and requires every untouched tensor to be bit-identical,
+    T+ to differ from T0, and every LoRA-touched element of T+ to lie within 2 ulp of the stored
+    dtype of the rebuilt value. This is a provenance check of a 16-bit merge, not one of the exact
+    routing identities, which stay exact. The run stops before any GPU stage if it fails.
+47. **rho for hub teachers.** The official Qwen3-0.6B uses a thinking chat template whose prompt
+    tokens differ from the teachers' plain ChatML, and it emits <think> blocks the teachers never
+    saw. rho is therefore our full SFT of Qwen3-0.6B-Base on the first 10,000 UltraChat-200k
+    train_sft conversations (the teachers' SFT corpus), turn-fitted at 2048 tokens, with the
+    teachers' tokenizer and template shared by every role.
+48. **Reduced hub pilot, fixed before collection.** 1000 train / 100 head_val / 64 select prompts,
+    states_per_prompt 2 (the pre-registered 4 halved for cost), 300 steps x 64 pairs, RM selection
+    every 150 steps, crpd_main and crpd_raw, diagnostic on 32 prompts x 8 replicates.
+49. **Known contamination risk.** T+ was trained on argilla UltraFeedback-cleaned pairs, which share
+    the UltraFeedback prompt pool with H4 test_prefs; held-out prompts seen by T+ must be removed
+    before any held-out result is reported.

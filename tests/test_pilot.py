@@ -72,6 +72,22 @@ def test_8b_pair_configs_validate_with_their_own_tokenizer_rules(pair: str, eos:
             validate({**bad,'eos_token':'<|end_of_text|>'})
 
 
+def test_hub_pair_configs_record_published_teachers() -> None:
+    """Hub teachers load from pinned commits; assumptions name them and the contamination risk."""
+    from chunkratio.pilot import HUB_PAIR, HUB_TEACHERS, pilot_assumptions
+    protocol = json.loads(Path('config/crpd/narval/qwen3_1p7b_to_0p6b.json').read_text(encoding='utf-8'))
+    checkpoints = {role:{'path':HUB_TEACHERS[role]['repo'],'revision':HUB_TEACHERS[role]['revision']}
+                   for role in ('teacher_base','teacher_plus')}
+    checkpoints['student_ref'] = {'path':'output/pilot/student_ref','revision':'fp'}
+    revisions = {k:'sha' for k in ('reward_model','teacher_base_model','student_base_model','sft_dataset','preference_dataset')}
+    cfg = pilot_config(protocol,'crpd_main',checkpoints,revisions,'splitsha',True,HUB_PAIR)
+    validate(cfg)
+    assert cfg['output'].startswith('output/narval/qwen3_1p7b_to_0p6b_hub/pilot/') and cfg['eos_token'] == '<|im_end|>'
+    assumptions = pilot_assumptions(HUB_PAIR)
+    assert cfg['pilot_assumptions'] == assumptions and 'contamination' in assumptions and 'LoRA' in assumptions['teacher_pair']
+    assert all(len(source['revision']) == 40 for source in HUB_TEACHERS.values())
+
+
 def test_default_pair_is_unchanged() -> None:
     """Adding pairs leaves the Qwen3-1.7B -> 0.6B helpers exactly as before."""
     from chunkratio.pilot import PAIR, pilot_assumptions
