@@ -118,7 +118,8 @@ class ChunkRatioTrainer:
             self.rng.setstate(saved['sampler_state'])
             torch.set_rng_state(saved['torch_rng'].cpu())
             if torch.cuda.is_available() and saved['cuda_rng'] is not None:
-                torch.cuda.set_rng_state_all(saved['cuda_rng'])
+                # map_location put the saved generator states on the GPU; set_rng_state needs CPU bytes.
+                torch.cuda.set_rng_state_all([state.cpu() for state in saved['cuda_rng']])
             start,best,best_state = saved['step'],saved['best'],saved['best_state']
             self.history = saved['history']
         frozen_hash = fingerprint(self.rho)
