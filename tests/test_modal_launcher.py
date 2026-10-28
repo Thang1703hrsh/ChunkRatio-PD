@@ -22,6 +22,26 @@ def test_launcher_stages_and_hardware() -> None:
     assert module.VARIANTS == ('crpd_main','crpd_raw','crpd_anchor')
 
 
+def test_smoke_scale_and_hf_push_switches(monkeypatch) -> None:
+    """Smoke has its own app/volume and HF repo prefix; pushing needs the huggingface secret."""
+    def load(scale: str, push: str):
+        """Import the launcher under one environment."""
+        monkeypatch.setenv('CRPD_SCALE',scale)
+        monkeypatch.setenv('CRPD_HF_PUSH',push)
+        spec = importlib.util.spec_from_file_location(f'qwen3_pilot_{scale}_{push}',Path('script/modal/qwen3_pilot.py'))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    smoke = load('smoke','1')
+    assert smoke.APP_NAME == 'crpd-qwen3-pilot-smoke' and smoke.HF_PREFIX.endswith('-smoke')
+    assert smoke.VARIANTS == ('crpd_main',) and smoke.SMOKE_SIZES['subset'] == {'train':8,'head_val':4,'select':4}
+    assert smoke.hf_secret and hasattr(smoke,'push_hf') and hasattr(smoke,'push_all')
+    full = load('full','0')
+    assert full.APP_NAME == 'crpd-qwen3-pilot' and not full.hf_secret and len(full.VARIANTS) == 3
+    with pytest.raises(SystemExit,match='CRPD_SCALE'):
+        load('huge','0')
+
+
 @pytest.mark.parametrize('pair',['qwen3_8b_to_1p7b','llama31_8b_to_llama32_1b'])
 def test_pair_launcher_hardware_and_stages(pair: str, monkeypatch) -> None:
     """8B stages on B200, one app/volume per pair, gated Llama needs the huggingface secret."""

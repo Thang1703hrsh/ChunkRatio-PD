@@ -1,19 +1,27 @@
 """Modal launcher: ChunkRatio-PD pilot, Qwen3-1.7B teacher pair -> Qwen3-0.6B student.
 
-Stages (idempotent; outputs and Hugging Face cache live on the Modal Volume `crpd-qwen3-pilot`):
+Stages (idempotent; outputs and Hugging Face cache live on the Modal Volume named after the app):
 
   phase 1 (run_pilot): prepare data (CPU) -> SFT 1.7B (A100-80GB) || SFT 0.6B (L40S) -> DPO 1.7B (A100-80GB)
   phase 2 (finish):    displacement diagnostic, 100 prompts (L40S) -> crpd_main, crpd_raw, crpd_anchor (A100-80GB)
 
 Each phase is a separate function call so each stays inside Modal's 24 h limit. GPUs are attached
 only to the stages that need them; orchestrators use a quarter CPU. A finished stage writes a
-marker and is skipped on re-run; CRPD stages resume from their own shards.
+marker and is skipped on re-run; CRPD stages resume from their own shards. Every chunkratio
+command appends wall time, CPU cores, peak RAM and GPU memory/utilization to resources.jsonl.
+
+Environment (read at deploy and at start; baked into the image):
+  CRPD_SCALE=smoke  small data (256 Deita rows, 512 UltraFeedback pairs, 8/4/4 pilot prompts, crpd_main,
+                    10 steps) on the same GPUs and H=512, in its own app/volume crpd-qwen3-pilot-smoke
+  CRPD_HF_PUSH=1    push T0, rho, T+ and each CRPD student to public Hugging Face model repos as soon as
+                    they exist; needs the Modal secret `huggingface` with a write HF_TOKEN
 
 Usage (run from the repository root with the Python that has `modal` installed):
 
   modal deploy script/modal/qwen3_pilot.py
   python script/modal/qwen3_pilot.py start      # spawn phase 1 (+2) on Modal and return
   python script/modal/qwen3_pilot.py finish     # spawn phase 2 only (after phase 1 finished)
+  python script/modal/qwen3_pilot.py push       # (re)push every finished artifact
 
 Unverified settings are listed in chunkratio/pilot.py::PILOT_ASSUMPTIONS and in every config.
 """
@@ -23,33 +31,48 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import modal
 
-APP_NAME = 'crpd-qwen3-pilot'
+SCALE = os.environ.get('CRPD_SCALE','full')
+if SCALE not in ('full','smoke'):
+    raise SystemExit('CRPD_SCALE must be full or smoke')
+SMOKE = SCALE == 'smoke'
+HF_PUSH = os.environ.get('CRPD_HF_PUSH','0') == '1'
+APP_NAME = 'crpd-qwen3-pilot'+('-smoke' if SMOKE else '')
 REMOTE_REPO = '/root/repo'
 # Inside a container this file is /root/qwen3_pilot.py, so the repo root only exists locally.
 REPO = Path(__file__).resolve().parents[2] if modal.is_local() else Path(REMOTE_REPO)
 VOLUME_PATH = '/vol'
 PAIR = 'qwen3_1p7b_to_0p6b'
 DATA = f'data/narval/{PAIR}'
-CHECKPOINTS = f'output/narval/{PAIR}/pilot/checkpoints'
+ROOT = f'output/narval/{PAIR}/pilot'
+CHECKPOINTS = f'{ROOT}/checkpoints'
 # Turn-fitted Deita (98.8% of conversations kept at 2048 tokens instead of 5.4%).
 SFT_DATA = f'{DATA}/deita_sft_fit2048.jsonl'
-VARIANTS = ('crpd_main','crpd_raw','crpd_anchor')
+VARIANTS = ('crpd_main',) if SMOKE else ('crpd_main','crpd_raw','crpd_anchor')
+# Smoke sizes keep the real horizon and chunking so per-prompt and per-pair rates extrapolate.
+SMOKE_SIZES = {'deita_rows':256,'uf_train_rows':512,'uf_test_rows':64,'subset':{'train':8,'head_val':4,'select':4},
+               'steps':10,'batch_size':16,'selection_interval':10,'diagnostic_prompts':8,'diagnostic_replicates':4}
+HF_PREFIX = 'crpd-qwen3-1p7b-to-0p6b'+('-smoke' if SMOKE else '')
 
 app = modal.App(APP_NAME)
 volume = modal.Volume.from_name(APP_NAME,create_if_missing=True)
 image = (modal.Image.debian_slim(python_version='3.12')
-         .pip_install('torch==2.6.0','transformers==4.52.4','datasets==3.5.0','numpy','pyyaml','safetensors','tokenizers')
-         .env({'HF_HOME':f'{VOLUME_PATH}/hf','TOKENIZERS_PARALLELISM':'false','PYTHONUNBUFFERED':'1'})
+         .pip_install('torch==2.6.0','transformers==4.52.4','datasets==3.5.0','numpy','pyyaml','safetensors','tokenizers',
+                      'huggingface_hub')
+         .env({'HF_HOME':f'{VOLUME_PATH}/hf','TOKENIZERS_PARALLELISM':'false','PYTHONUNBUFFERED':'1',
+               'CRPD_SCALE':SCALE,'CRPD_HF_PUSH':'1' if HF_PUSH else '0'})
          .add_local_dir(REPO,REMOTE_REPO,ignore=['output','data','.git','mtbench','winrate_eval','diversity_metrics',
                                                  'promt','prompts','env','reports','**/__pycache__','.pytest_cache']))
 common = {'image':image,'volumes':{VOLUME_PATH:volume},'timeout':24*3600}
 # Preparation stages fail deterministically, so no retries, and a stall cannot hold a GPU for 24 h.
 sft_limits = {**common,'timeout':4*3600}
 dpo_limits = {**common,'timeout':16*3600}
+hf_secret = [modal.Secret.from_name('huggingface')] if HF_PUSH else []
 
 
 def workdir() -> Path:
@@ -66,12 +89,49 @@ def workdir() -> Path:
     return work
 
 
-def crpd(revision: str, *args: str) -> None:
-    """Run one chunkratio CLI command in the work directory."""
+def gpu_sampler(samples: list[tuple[float,float]], stop: threading.Event) -> None:
+    """Every 2 s record (GPU memory used GiB, utilization %) of GPU 0 via nvidia-smi; silent without a GPU."""
+    while not stop.wait(2.):
+        try:
+            line = subprocess.run(['nvidia-smi','--query-gpu=memory.used,utilization.gpu','--format=csv,noheader,nounits'],
+                                  capture_output=True,text=True,timeout=10).stdout.splitlines()[0]
+        except (OSError,IndexError,subprocess.SubprocessError):
+            return
+        memory,utilization = (float(v) for v in line.split(','))
+        samples.append((memory/1024,utilization))
+
+
+def crpd(revision: str, *args: str) -> dict:
+    """Run one chunkratio CLI command in the work directory and log its resource use."""
+    import resource  # Unix only; the launcher itself is also imported on Windows
     work = workdir()
     print('+ python -m chunkratio',' '.join(args),flush=True)
-    subprocess.run([sys.executable,'-m','chunkratio',*args],cwd=work,check=True,
-                   env={**os.environ,'CRPD_CODE_REVISION':revision})
+    samples: list[tuple[float,float]] = []
+    stop = threading.Event()
+    sampler = threading.Thread(target=gpu_sampler,args=(samples,stop),daemon=True)
+    before = resource.getrusage(resource.RUSAGE_CHILDREN)
+    start = time.perf_counter()
+    sampler.start()
+    try:
+        subprocess.run([sys.executable,'-m','chunkratio',*args],cwd=work,check=True,
+                       env={**os.environ,'CRPD_CODE_REVISION':revision})
+    finally:
+        stop.set()
+        sampler.join()
+        wall = time.perf_counter()-start
+        after = resource.getrusage(resource.RUSAGE_CHILDREN)
+        usage = {'command':args[0],'args':list(args[1:]),'scale':SCALE,'wall_s':round(wall,1),
+                 'cpu_cores_mean':round((after.ru_utime+after.ru_stime-before.ru_utime-before.ru_stime)/max(wall,1e-9),2),
+                 'max_rss_gb_so_far':round(after.ru_maxrss/2**20,2),
+                 'gpu_mem_max_gb':round(max((m for m,_ in samples),default=0.),2),
+                 'gpu_util_mean':round(sum(u for _,u in samples)/len(samples),1) if samples else None,
+                 'gpu':os.environ.get('MODAL_GPU_TYPE') or None}
+        print(json.dumps({'resource':usage}),flush=True)
+        log = work/ROOT/'resources.jsonl'
+        log.parent.mkdir(parents=True,exist_ok=True)
+        with open(log,'a',encoding='utf-8') as handle:
+            handle.write(json.dumps(usage)+'\n')
+    return usage
 
 
 def done(path: str) -> bool:
@@ -92,6 +152,15 @@ def train_checkpoint(revision: str, stage: str, model: str, model_revision: str,
     config.write_text(json.dumps(preparation_config(stage,model,model_revision,data,out),indent=2),encoding='utf-8')
     crpd(revision,stage,'--config',str(config.relative_to(workdir())))
     volume.commit()
+
+
+def head_lines(source: Path, destination: Path, rows: int) -> None:
+    """Smoke subset: the first `rows` JSONL records of a raw download."""
+    with open(source,encoding='utf-8') as handle, open(destination,'w',encoding='utf-8') as out:
+        for i,line in enumerate(handle):
+            if i >= rows:
+                break
+            out.write(line)
 
 
 @app.function(cpu=4.0,memory=16384,**common)
@@ -126,24 +195,29 @@ def prepare(revision: str) -> None:
                                    ('uf_test_prefs.jsonl',PREFERENCE_DATASET,'test_prefs','preference_dataset')):
         if not (raw/name).exists():
             load_dataset(dataset,split=split,revision=revisions[key]).to_json(str(raw/name),lines=True,force_ascii=False)
+    sources = {'deita':'deita.jsonl','uf_train':'uf_train_prefs.jsonl','uf_test':'uf_test_prefs.jsonl'}
+    if SMOKE:
+        for key,name in sources.items():
+            head_lines(raw/name,raw/f'smoke_{name}',SMOKE_SIZES[f'{key}_rows'])
+        sources = {key:f'smoke_{name}' for key,name in sources.items()}
     template = json.dumps({'enable_thinking':False})
     tokenizer = ['--tokenizer',STUDENT_BASE_MODEL,'--revision',revisions['student_base_model'],
                  '--eos-token','<|im_end|>','--chat-template-kwargs',template]
     # Each output is built once; a later code version can add a file without redoing the others.
     if not done(SFT_DATA):
-        crpd(revision,'prepare-data','--input',f'{DATA}/raw/deita.jsonl','--output',SFT_DATA,
+        crpd(revision,'prepare-data','--input',f"{DATA}/raw/{sources['deita']}",'--output',SFT_DATA,
              '--format','sharegpt','--assign-split','train','--fit-max-length',str(MAX_LENGTH),*tokenizer)
     if not done(f'{DATA}/ultrafeedback_train.jsonl'):
-        crpd(revision,'prepare-data','--input',f'{DATA}/raw/uf_train_prefs.jsonl','--output',f'{DATA}/ultrafeedback_train.jsonl',
+        crpd(revision,'prepare-data','--input',f"{DATA}/raw/{sources['uf_train']}",'--output',f'{DATA}/ultrafeedback_train.jsonl',
              '--format','ultrafeedback',*tokenizer)
     if not done(f'{DATA}/ultrafeedback_test.jsonl'):
-        crpd(revision,'prepare-data','--input',f'{DATA}/raw/uf_test_prefs.jsonl','--output',f'{DATA}/ultrafeedback_test.jsonl',
+        crpd(revision,'prepare-data','--input',f"{DATA}/raw/{sources['uf_test']}",'--output',f'{DATA}/ultrafeedback_test.jsonl',
              '--format','ultrafeedback','--assign-split','test',*tokenizer)
-    subset = pilot_subset(read_jsonl(work/DATA/'ultrafeedback_train.jsonl'))
+    subset = pilot_subset(read_jsonl(work/DATA/'ultrafeedback_train.jsonl'),sizes=SMOKE_SIZES['subset'] if SMOKE else None)
     (work/DATA/'ultrafeedback_train_pilot.jsonl').write_text(''.join(json.dumps(r,ensure_ascii=False)+'\n' for r in subset),
                                                              encoding='utf-8')
     write_json(work/DATA/'prepared.json',{'revisions':revisions,'pilot_rows':len(subset),'code_revision':revision,
-                                          'sft_data':SFT_DATA})
+                                          'sft_data':SFT_DATA,'scale':SCALE})
     volume.commit()
 
 
@@ -189,9 +263,12 @@ def write_pilot_configs() -> dict[str,str]:
     protocol = json.loads((work/'config/crpd/narval'/f'{PAIR}.json').read_text(encoding='utf-8'))
     paths = {}
     for variant in VARIANTS:
-        path = work/f'output/narval/{PAIR}/pilot/configs/{variant}.json'
+        path = work/f'{ROOT}/configs/{variant}.json'
         path.parent.mkdir(parents=True,exist_ok=True)
-        path.write_text(json.dumps(pilot_config(protocol,variant,checkpoints,_revisions(),split,verified),indent=2),encoding='utf-8')
+        cfg = pilot_config(protocol,variant,checkpoints,_revisions(),split,verified)
+        if SMOKE:
+            cfg.update({k:SMOKE_SIZES[k] for k in ('steps','batch_size','selection_interval')})
+        path.write_text(json.dumps(cfg,indent=2),encoding='utf-8')
         paths[variant] = str(path.relative_to(work))
     return paths
 
@@ -200,27 +277,93 @@ def write_pilot_configs() -> dict[str,str]:
 def diagnose(revision: str) -> None:
     """Displacement diagnostic on 100 pilot train prompts before any student training."""
     volume.reload()
-    out = f'output/narval/{PAIR}/pilot/diagnostic'
+    out = f'{ROOT}/diagnostic'
     if done(f'{out}/displacement.json'):
         print('skip diagnose',flush=True)
         return
     configs = write_pilot_configs()
-    crpd(revision,'diagnose-displacement','--config',configs['crpd_main'],'--prompts','100','--replicates','16','--output',out)
+    prompts,replicates = ((SMOKE_SIZES['diagnostic_prompts'],SMOKE_SIZES['diagnostic_replicates']) if SMOKE else (100,16))
+    crpd(revision,'diagnose-displacement','--config',configs['crpd_main'],'--prompts',str(prompts),
+         '--replicates',str(replicates),'--output',out)
     volume.commit()
 
 
 @app.function(gpu='A100-80GB',cpu=8.0,memory=65536,retries=1,**common)
 def train_variants(revision: str) -> None:
-    """crpd_main, crpd_raw, crpd_anchor (seed 0) sharing one cache_root; each resumes from its shards."""
+    """crpd_main, crpd_raw, crpd_anchor (seed 0) sharing one cache_root; each resumes from its shards.
+
+    Smoke runs every stage as its own command so resources.jsonl times collection, head, targets
+    and training separately (each command also reloads the models; validate-config times that).
+    """
     volume.reload()
     configs = write_pilot_configs()
     for variant in VARIANTS:
         config = json.loads((workdir()/configs[variant]).read_text(encoding='utf-8'))
         if done(f"{config['output']}/diagnostics.json"):
             print('skip',variant,flush=True)
-            continue
-        crpd(revision,'evaluate','--config',configs[variant])
-        volume.commit()
+        else:
+            stages = (('validate-config','collect-prefixes','collect-candidates','collect-correction','fit-head',
+                       'build-targets','train-policy','evaluate') if SMOKE else ('evaluate',))
+            for stage in stages:
+                crpd(revision,stage,'--config',configs[variant])
+                volume.commit()
+        if HF_PUSH:
+            push_hf.spawn(revision,f"{config['output']}/student",variant,config['output'])
+
+
+@app.function(cpu=2.0,memory=8192,timeout=4*3600,retries=2,secrets=hf_secret,image=image,volumes={VOLUME_PATH:volume})
+def push_hf(revision: str, folder: str, role: str, extras: str | None = None) -> str:
+    """Upload one finished model folder to a public Hugging Face repo <user>/<prefix>-<role>, once."""
+    volume.reload()
+    work = workdir()
+    marker = work/ROOT/'hf_pushed'/f'{role}.json'
+    if marker.exists():
+        print('skip push',role,flush=True)
+        return json.loads(marker.read_text(encoding='utf-8'))['repo']
+    from huggingface_hub import HfApi
+    api = HfApi()
+    repo = f"{os.environ.get('HF_NAMESPACE') or api.whoami()['name']}/{HF_PREFIX}-{role.replace('_','-')}"
+    source = work/folder
+    if not (source/'config.json').exists():
+        raise FileNotFoundError(f'{source} is not a saved Hugging Face model')
+    api.create_repo(repo,repo_type='model',private=False,exist_ok=True)
+    prepared = json.loads((work/DATA/'prepared.json').read_text(encoding='utf-8'))
+    card = '\n'.join([
+        '---','license: apache-2.0','library_name: transformers',
+        f"base_model: {'Qwen/Qwen3-0.6B-Base' if role in ('student_ref',)+VARIANTS else 'Qwen/Qwen3-1.7B-Base'}",
+        'datasets:','- hkust-nlp/deita-10k-v0','- HuggingFaceH4/ultrafeedback_binarized',
+        'tags:','- chunkratio-pd','- preference-distillation','---','',
+        f'# {HF_PREFIX}-{role}','',
+        f"ChunkRatio-PD {'SMOKE TEST (tiny data, not a usable model)' if SMOKE else 'pilot'} artifact, role `{role}`, "
+        'pair Qwen3-1.7B -> Qwen3-0.6B. Pilot settings are assumptions, not NARVAL\'s; see `pilot_assumptions` '
+        'in the bundled config. No benchmark result is claimed.','',
+        f'- code revision: `{revision}`',f"- data revisions: `{json.dumps(prepared['revisions'])}`",
+        f'- scale: `{SCALE}`; EOS `<|im_end|>`; chat template with `enable_thinking=false`',''])
+    (source/'README.md').write_text(card,encoding='utf-8')
+    api.upload_folder(repo_id=repo,folder_path=str(source),commit_message=f'{role} from {revision}',
+                      ignore_patterns=['*.config.json'])
+    if extras:
+        for name in ('diagnostics.json','resolved_config.json','manifest.json'):
+            if (work/extras/name).exists():
+                api.upload_file(path_or_fileobj=str(work/extras/name),path_in_repo=f'crpd/{name}',repo_id=repo)
+    marker.parent.mkdir(parents=True,exist_ok=True)
+    marker.write_text(json.dumps({'repo':repo,'role':role,'revision':revision}),encoding='utf-8')
+    volume.commit()
+    print('pushed',role,'->',f'https://huggingface.co/{repo}',flush=True)
+    return repo
+
+
+def push_finished(revision: str) -> list:
+    """Spawn pushes for every finished checkpoint and student (already-pushed ones are skipped)."""
+    calls = []
+    for role in ('teacher_base','student_ref','teacher_plus'):
+        if done(f'{CHECKPOINTS}/{role}/preparation_manifest.json'):
+            calls.append(push_hf.spawn(revision,f'{CHECKPOINTS}/{role}',role))
+    for variant in VARIANTS:
+        output = f'{ROOT}/{variant}/seed0'
+        if done(f'{output}/diagnostics.json') and done(f'{output}/student/config.json'):
+            calls.append(push_hf.spawn(revision,f'{output}/student',variant,output))
+    return calls
 
 
 @app.function(cpu=0.25,memory=1024,**common)
@@ -238,7 +381,18 @@ def run_pilot(revision: str) -> None:
     for call in calls:
         call.get()
     dpo_teacher.remote(revision)
+    if HF_PUSH:
+        volume.reload()
+        push_finished(revision)
     finish.spawn(revision)
+
+
+@app.function(cpu=0.25,memory=1024,**common)
+def push_all(revision: str) -> None:
+    """Re-push every finished artifact; already-pushed roles are skipped by their markers."""
+    volume.reload()
+    for call in push_finished(revision):
+        print(call.get(),flush=True)
 
 
 def local_revision() -> str:
@@ -250,9 +404,12 @@ def local_revision() -> str:
 
 if __name__ == '__main__':
     command = sys.argv[1] if len(sys.argv) > 1 else 'start'
-    if command not in ('start','finish'):
-        raise SystemExit('usage: python script/modal/qwen3_pilot.py [start|finish]')
-    function = modal.Function.from_name(APP_NAME,'run_pilot' if command == 'start' else 'finish')
+    functions = {'start':'run_pilot','finish':'finish','push':'push_all'}
+    if command not in functions:
+        raise SystemExit('usage: python script/modal/qwen3_pilot.py [start|finish|push]')
+    if command == 'push' and not HF_PUSH:
+        raise SystemExit('set CRPD_HF_PUSH=1 (and deploy with it) to push to Hugging Face')
+    function = modal.Function.from_name(APP_NAME,functions[command])
     call = function.spawn(local_revision())
-    print(f'spawned {command} on Modal app {APP_NAME}: {call.object_id}')
-    print(f'logs: modal app logs {APP_NAME}    files: modal volume ls {APP_NAME} output/narval/{PAIR}/pilot')
+    print(f'spawned {command} ({SCALE}) on Modal app {APP_NAME}: {call.object_id}')
+    print(f'logs: modal app logs {APP_NAME}    files: modal volume ls {APP_NAME} {ROOT}')
