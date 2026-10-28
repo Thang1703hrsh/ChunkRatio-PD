@@ -45,3 +45,35 @@ def test_pilot_configs_validate_and_record_assumptions() -> None:
     tuned = pilot_config(protocol,'crpd_main',checkpoints,revisions,'splitsha',True)
     assert (tuned['lr_schedule'],tuned['warmup_ratio'],tuned['policy_autocast_dtype']) == ('cosine',.1,'bfloat16')
     assert tuned['alpha'] == protocol['alpha'] and tuned['policy_microbatch_size'] == 8
+
+
+@pytest.mark.parametrize('pair,eos',[('qwen3_8b_to_1p7b','<|im_end|>'),('llama31_8b_to_llama32_1b','<|eot_id|>')])
+def test_8b_pair_configs_validate_with_their_own_tokenizer_rules(pair: str, eos: str) -> None:
+    """New pairs resolve to valid pilot configs; Llama gets <|eot_id|> and a pinned template date."""
+    from chunkratio.pilot import PAIRS, pilot_assumptions
+    protocol = json.loads(Path(f'config/crpd/narval/{pair}.json').read_text(encoding='utf-8'))
+    checkpoints = {role:{'path':f'output/pilot/{role}','revision':'fp'+role} for role in ('teacher_plus','teacher_base','student_ref')}
+    revisions = {k:'sha' for k in ('reward_model','teacher_base_model','student_base_model','sft_dataset','preference_dataset')}
+    for variant in ('crpd_main','crpd_raw','crpd_anchor'):
+        cfg = pilot_config(protocol,variant,checkpoints,revisions,'splitsha',True,pair)
+        validate(cfg)
+        assert cfg['eos_token'] == eos and cfg['output'].startswith(f'output/narval/{pair}/pilot/')
+        assert cfg['pilot_assumptions'] == pilot_assumptions(pair) != PILOT_ASSUMPTIONS
+        assert cfg['narval']['base_checkpoints']['teacher'] == PAIRS[pair]['teacher']+'@sha'
+    sft = preparation_config('train-sft','m','r','d','o',pair,PAIRS[pair]['tokenizer'],'tsha')
+    assert (sft['eos_token'],sft['tokenizer'],sft['tokenizer_revision']) == (eos,PAIRS[pair]['tokenizer'],'tsha')
+    assert 'tokenizer' not in preparation_config('train-teacher-dpo','m','r','d','o',pair)
+    if pair.startswith('llama'):
+        bad = pilot_config(protocol,'crpd_main',checkpoints,revisions,'splitsha',True,pair)
+        bad['chat_template_kwargs'] = {}
+        with pytest.raises(ValueError,match='date_string'):
+            validate(bad)
+        with pytest.raises(ValueError,match='eot_id'):
+            validate({**bad,'eos_token':'<|end_of_text|>'})
+
+
+def test_default_pair_is_unchanged() -> None:
+    """Adding pairs leaves the Qwen3-1.7B -> 0.6B helpers exactly as before."""
+    from chunkratio.pilot import PAIR, pilot_assumptions
+    assert pilot_assumptions() is PILOT_ASSUMPTIONS and pilot_assumptions(PAIR) is PILOT_ASSUMPTIONS
+    assert 'tokenizer' not in preparation_config('train-sft','m','r','d','o')

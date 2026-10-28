@@ -290,3 +290,14 @@ def test_pilot_sft_preparation_with_eos_override(tmp_path: Path) -> None:
     assert manifest['rows_dropped_over_length'] == 1 and manifest['rows_used'] == 1 and manifest['eos_token'] == '<|im_end|>'
     saved = transformers.AutoTokenizer.from_pretrained(tmp_path/'t0')
     assert saved.eos_token == '<|im_end|>' and transformers.AutoConfig.from_pretrained(tmp_path/'t0').eos_token_id == 2
+    # Shared tokenizer: a model whose own tokenizer has no chat template (Base Llama) saves the shared one.
+    shared = tmp_path/'shared_tokenizer'
+    tiny_qwen3_tokenizer().save_pretrained(shared)
+    bare = tiny_qwen3_tokenizer()
+    bare.chat_template = None
+    bare.save_pretrained(paths['student_ref'])
+    cfg = {**preparation_config('train-sft',str(paths['student_ref']),'local',str(tmp_path/'sft.jsonl'),
+                                str(tmp_path/'rho'),tokenizer=str(shared),tokenizer_revision='local'),'device':'cpu'}
+    prepare_checkpoint(cfg,'train-sft')
+    saved = transformers.AutoTokenizer.from_pretrained(tmp_path/'rho')
+    assert saved.chat_template and saved.eos_token == '<|im_end|>'

@@ -22,6 +22,31 @@ def test_launcher_stages_and_hardware() -> None:
     assert module.VARIANTS == ('crpd_main','crpd_raw','crpd_anchor')
 
 
+@pytest.mark.parametrize('pair',['qwen3_8b_to_1p7b','llama31_8b_to_llama32_1b'])
+def test_pair_launcher_hardware_and_stages(pair: str, monkeypatch) -> None:
+    """8B stages on B200, one app/volume per pair, gated Llama needs the huggingface secret."""
+    monkeypatch.setenv('CRPD_PAIR',pair)
+    spec = importlib.util.spec_from_file_location(f'narval_pair_{pair}',Path('script/modal/narval_pair.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    for name in ('prepare','sft_teacher','sft_student','dpo_teacher','diagnose','train_variants','finish','run_pilot'):
+        assert hasattr(module,name)
+    assert module.APP_NAME == 'crpd-'+pair.replace('_','-') and module.SFT_DATA.endswith('fit2048.jsonl')
+    hardware = module.HARDWARE[pair]
+    assert hardware['sft_teacher'][0] == hardware['dpo_teacher'][0] == hardware['variants'][0] == 'B200'
+    assert module.stage('sft_teacher')['retries'] == 0 and module.stage('variants',retries=1)['retries'] == 1
+    assert bool(module.secrets) == pair.startswith('llama')
+
+
+def test_pair_launcher_requires_a_known_pair(monkeypatch) -> None:
+    """No silent default: an unset or default pair stops before any Modal object is built."""
+    for value in ('','qwen3_1p7b_to_0p6b'):
+        monkeypatch.setenv('CRPD_PAIR',value)
+        spec = importlib.util.spec_from_file_location('narval_pair_bad',Path('script/modal/narval_pair.py'))
+        with pytest.raises(SystemExit,match='CRPD_PAIR'):
+            spec.loader.exec_module(importlib.util.module_from_spec(spec))
+
+
 def test_launcher_imports_inside_container(tmp_path,monkeypatch) -> None:
     """Modal re-imports the file as /root/qwen3_pilot.py, where parents[2] does not exist."""
     import modal

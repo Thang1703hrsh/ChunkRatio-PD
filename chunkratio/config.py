@@ -121,6 +121,11 @@ def validate_narval(cfg: dict[str,Any]) -> None:
             raise ValueError('Qwen3 pairs use <|im_end|> as the EOS of every role')
         if cfg.get('chat_template_kwargs') != {'enable_thinking':False}:
             raise ValueError('Qwen3 chat template must be fixed with enable_thinking=false')
+    if str(narval.get('pair','')).startswith('llama') and cfg.get('eos_token') is not None:
+        if cfg['eos_token'] != '<|eot_id|>':
+            raise ValueError('Llama 3 pairs use <|eot_id|> as the EOS of every role')
+        if not (cfg.get('chat_template_kwargs') or {}).get('date_string'):
+            raise ValueError('Llama 3 chat template must pin date_string (it inserts the current date otherwise)')
     if cfg.get('synthetic',False):
         return
     if cfg.get('pilot'):

@@ -188,3 +188,25 @@ distillation stage (`scripts/run_narval.py`); it has no SFT or teacher-DPO code 
     select-split sweep, which has not been run.
 41. **Launcher limits.** SFT/DPO stages run with `retries=0` and 4 h / 16 h timeouts, and SFT/DPO and
     the policy loop print one JSON line per optimizer step so loss can be watched remotely.
+
+## Launchers for the 8B NARVAL pairs (user request, 28 October 2026)
+
+42. **Pair status.** All three NARVAL protocol files existed; only Qwen3-1.7B -> Qwen3-0.6B had a
+    runnable launcher (`script/modal/qwen3_pilot.py`, unchanged). `script/modal/narval_pair.py`
+    now runs Qwen3-8B -> Qwen3-1.7B and Llama-3.1-8B -> Llama-3.2-1B with the same stages, chosen
+    by `CRPD_PAIR`, one Modal app and volume per pair. Nothing has been run for either pair.
+43. **Per-pair tokenizer rules.** `chunkratio/pilot.py::PAIRS` fixes, per pair, the Base models,
+    one tokenizer shared by every role, the EOS and the chat-template arguments. Llama Base repos
+    ship no chat template, so all Llama roles use the Llama-3.2-1B-Instruct tokenizer (same
+    vocabulary) with EOS `<|eot_id|>` and `date_string` pinned to "26 Jul 2024"; otherwise the
+    template inserts the current date and prompt token ids change from day to day.
+    `validate_narval` enforces both for Llama pairs once `eos_token` is set. SFT accepts an
+    optional `tokenizer`/`tokenizer_revision`; DPO reuses the tokenizer the SFT checkpoint saved.
+44. **Hardware.** In-repo SFT/DPO is single-GPU full FP32 AdamW, about 16 bytes per parameter
+    (128 GB for 8B, plus a 32 GB frozen reference for DPO), so 8B SFT/DPO and the CRPD stage
+    (two FP32 8B teachers, the 1-1.7B student with optimizer, rho and the FP32 8B RM) use B200
+    (192 GB); the diagnostic uses H200; student SFT uses A100-80GB (1.7B) or L40S (1B).
+    Generation batch 16 for these pairs. Memory fit and run time are unmeasured.
+45. **Shared checkpoint not exploited.** With the same recipe, the Qwen3-8B pair's rho (SFT of
+    Qwen3-1.7B-Base) is the Qwen3-1.7B pair's T0, as in NARVAL Table 1. The launchers do not yet
+    reuse it across pairs; each pair trains its own copy.

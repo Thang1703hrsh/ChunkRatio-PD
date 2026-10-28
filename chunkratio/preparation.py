@@ -35,7 +35,9 @@ def prepare_checkpoint(cfg: dict[str,Any], stage: str) -> None:
         # Training-only speed setting; CRPD scoring keeps full FP32 matmuls.
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-    tokenizer = AutoTokenizer.from_pretrained(cfg['model'],revision=cfg['revision'])
+    # A shared tokenizer may replace the model's own (Base Llama repos have no chat template).
+    tokenizer = AutoTokenizer.from_pretrained(cfg.get('tokenizer') or cfg['model'],
+                                              revision=cfg.get('tokenizer_revision') or cfg['revision'])
     if cfg.get('eos_token'):
         tokenizer.eos_token = cfg['eos_token']
     if tokenizer.pad_token_id is None:
