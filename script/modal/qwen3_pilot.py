@@ -301,7 +301,8 @@ def verify_teachers(revision: str) -> dict:
     """Hub teachers: download the pinned T0, T+ and DPO LoRA and check T+ = T0 + LoRA (CPU)."""
     volume.reload()
     out = workdir()/ROOT/'teacher_verification.json'
-    if out.exists():
+    # Only a passed check is a completion marker; a failed report is kept beside it for inspection.
+    if out.exists() and json.loads(out.read_text(encoding='utf-8'))['verified']:
         print('skip verify_teachers',flush=True)
         return json.loads(out.read_text(encoding='utf-8'))
     sys.path.insert(0,str(workdir()))
@@ -313,11 +314,13 @@ def verify_teachers(revision: str) -> dict:
                for role,source in HUB_TEACHERS.items()}
     report = {**verify_lora_merge(folders['teacher_base'],folders['teacher_plus'],folders['dpo_lora']),
               'sources':HUB_TEACHERS,'code_revision':revision}
-    write_json(out,report)
-    volume.commit()
     print(json.dumps({'teacher_verification':{k:v for k,v in report.items() if k != 'sources'}}),flush=True)
     if not report['verified']:
+        write_json(out.with_name('teacher_verification.failed.json'),report)
+        volume.commit()
         raise ValueError('T+ is not T0 + the published LoRA; refusing to use the hub teacher pair')
+    write_json(out,report)
+    volume.commit()
     return report
 
 

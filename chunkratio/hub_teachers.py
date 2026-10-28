@@ -15,7 +15,10 @@ from typing import Any
 import torch
 
 # Rounding is relative to the weight, not to the (much smaller) DPO update, so the tolerance is in
-# units in the last place of the stored dtype: 2 ulp allows a 16-bit merge plus one rounding.
+# units in the last place of the stored dtype: 2 ulp allows a 16-bit merge plus one rounding. The
+# ulp is that of the largest operand (T0, the LoRA update) or result: a 16-bit sum W + d is rounded
+# relative to its operands, so where W and d nearly cancel the error is tiny in absolute terms but
+# many ulp of the near-zero result (the published merge showed 256 such ulp at 99.85% exact matches).
 MAX_ULP = 2.
 MANTISSA_BITS = {torch.bfloat16:7,torch.float16:10,torch.float32:23}
 
@@ -70,7 +73,8 @@ def verify_lora_merge(base: Path, merged: Path, adapter: Path) -> dict[str,Any]:
         if bits is None:
             raise ValueError(f'unsupported dtype {target.dtype} for {key}')
         rebuilt = t0[key].double()+delta.double()
-        magnitude = torch.maximum(rebuilt.abs(),target.double().abs()).clamp(min=torch.finfo(target.dtype).tiny)
+        magnitude = torch.stack([t0[key].double().abs(),delta.double().abs(),rebuilt.abs(),target.double().abs()]).amax(0)
+        magnitude = magnitude.clamp(min=torch.finfo(target.dtype).tiny)
         ulp = torch.exp2(torch.floor(torch.log2(magnitude))-bits)
         distance = float(((target.double()-rebuilt).abs()/ulp).max())
         if distance > worst_ulp:

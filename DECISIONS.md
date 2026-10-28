@@ -231,3 +231,8 @@ distillation stage (`scripts/run_narval.py`); it has no SFT or teacher-DPO code 
 49. **Known contamination risk.** T+ was trained on argilla UltraFeedback-cleaned pairs, which share
     the UltraFeedback prompt pool with H4 test_prefs; held-out prompts seen by T+ must be removed
     before any held-out result is reported.
+50. **Merge check measured against operands.** The first check on the published pair found every
+    untouched tensor identical and 99.85% of LoRA-touched elements exactly equal to bf16(T0 + LoRA),
+    but a 255.75-ulp worst case: ulp had been taken of the result, and where T0 and the LoRA update
+    nearly cancel, a bf16 sum's rounding (bounded by its operands) is many ulp of a near-zero result.
+    The tolerance is now 2 ulp of max(|T0|, |LoRA update|, |result|); unrelated or tampered T+ still fail.

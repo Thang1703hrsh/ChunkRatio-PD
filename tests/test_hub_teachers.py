@@ -45,6 +45,22 @@ def test_published_merge_verifies(tmp_path: Path) -> None:
     assert report['max_ulp_distance'] <= 1 and report['fraction_exact_after_rounding'] == 1.
 
 
+def test_bf16_merge_with_cancellation_verifies(tmp_path: Path) -> None:
+    """A merge done in bf16 arithmetic (W + bf16(d)) passes even where W and d nearly cancel."""
+    t0,tplus,lora = write_pair(tmp_path)
+    from safetensors.torch import load_file
+    base = load_file(str(t0/'model.safetensors'))
+    key = 'model.layers.0.self_attn.q_proj.weight'
+    delta = lora_deltas(lora)[key]
+    base[key] = (-delta).bfloat16()+torch.tensor(1e-3).bfloat16()*(torch.arange(30).reshape(6,5)%2)
+    save_file(base,str(t0/'model.safetensors'))
+    merged = load_file(str(tplus/'model.safetensors'))
+    merged[key] = base[key]+delta.bfloat16()
+    save_file(merged,str(tplus/'model.safetensors'))
+    report = verify_lora_merge(t0,tplus,lora)
+    assert report['verified'] and report['max_ulp_distance'] <= 2
+
+
 @pytest.mark.parametrize('tamper',['untouched','unrelated'])
 def test_tampered_or_unrelated_teacher_fails(tmp_path: Path, tamper: str) -> None:
     """A changed untouched tensor or an update the LoRA does not explain is not verified."""
