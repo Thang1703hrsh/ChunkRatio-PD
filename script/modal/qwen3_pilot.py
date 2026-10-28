@@ -78,6 +78,10 @@ STABILITY_SIZES = {'deita_rows':2000,'ultrachat_rows':2000,'uf_train_rows':2048,
                    'steps':150,'batch_size':32,'selection_interval':50,'diagnostic_prompts':8,'diagnostic_replicates':4}
 SIZES = {'smoke':SMOKE_SIZES,'stability':STABILITY_SIZES}.get(SCALE) or (HUB_SIZES if HUB else None)
 HF_PREFIX = 'crpd-qwen3-1p7b-to-0p6b'+('-hub' if HUB else '')+(f'-{SCALE}' if SMALL else '')
+# GPU of the CRPD stage (collection, head, targets, policy). Another GPU writes its outputs and cache
+# under a GPU tag so a comparison run collects afresh instead of reusing the default GPU's shards.
+CRPD_GPU = os.environ.get('CRPD_GPU','A100-80GB')
+GPU_TAG = '' if CRPD_GPU == 'A100-80GB' else '-'+CRPD_GPU.lower().replace('-','')
 
 app = modal.App(APP_NAME)
 volume = modal.Volume.from_name(APP_NAME,create_if_missing=True)
@@ -358,6 +362,8 @@ def write_pilot_configs() -> dict[str,str]:
         cfg = pilot_config(protocol,variant,checkpoints,_revisions(),split,verified,RUN_PAIR)
         if SIZES:
             cfg.update({k:SIZES[k] for k in ('steps','batch_size','selection_interval','states_per_prompt')})
+        if GPU_TAG:
+            cfg.update(output=f'{ROOT}/{variant}{GPU_TAG}/seed0',cache_root=f'{ROOT}/cache{GPU_TAG}')
         path.write_text(json.dumps(cfg,indent=2),encoding='utf-8')
         paths[variant] = str(path.relative_to(work))
     return paths
@@ -380,7 +386,7 @@ def diagnose(revision: str) -> None:
 
 
 # 64 GB RAM: the FP32 8B selection RM passes through host memory while loading.
-@app.function(gpu='A100-80GB',cpu=4.0,memory=65536,retries=1,**common)
+@app.function(gpu=CRPD_GPU,cpu=4.0,memory=65536,retries=1,**common)
 def train_variants(revision: str) -> None:
     """crpd_main, crpd_raw, crpd_anchor (seed 0) sharing one cache_root; each resumes from its shards.
 
