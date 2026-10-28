@@ -128,9 +128,11 @@ def collect_candidates(states: list[dict[str,Any]], models: dict[str,nn.Module],
                             candidates[key] = {'id':digest([state['id'],tokens]),'tokens':tokens,'sources':[source],
                                                'terminal':terminal(state['response_ids']+tokens,cfg['horizon'],eos)}
                 rows = list(candidates.values())
-                for row in rows:
-                    for source,model in models.items():
-                        row['logp_'+source] = score_batch(model,[state['prefix_ids']],[row['tokens']],eos).item()
+                # One batched forward per model for the state's siblings (batched = unbatched, §6.1).
+                for source,model in models.items():
+                    scores = score_batch(model,[state['prefix_ids']]*len(rows),[row['tokens'] for row in rows],eos)
+                    for row,score in zip(rows,scores.tolist()):
+                        row['logp_'+source] = score
                 scored = {source:sum(len(row['tokens']) for row in rows) for source in models}
                 store.put(state['id'],{'state':state,'candidates':rows,'skipped':len(rows)<2,
                                        'rng':rng_states,'generated_tokens':counts,'scored_tokens':scored})

@@ -1,6 +1,8 @@
 """Raw collection sampling and global response stopping (§§5,7)."""
 from __future__ import annotations
 
+import inspect
+
 import torch
 from torch import nn
 
@@ -16,6 +18,19 @@ def stream(seed: int, name: str, device: str = 'cpu') -> torch.Generator:
 def terminal(response: list[int], horizon: int, eos: int) -> bool:
     """Only sampled EOS/global horizon, not a chunk boundary, terminates (§5.2)."""
     return len(response) >= horizon or eos in response
+
+
+def last_logits_only(model: nn.Module) -> dict[str,int]:
+    """Ask HF causal LMs for last-position logits only: a prefill otherwise builds [rows, width, vocab]
+    FP32 logits (57 GiB for 64 Qwen3 states at H=512) of which sampling reads one position."""
+    try:
+        parameters = inspect.signature(model.forward).parameters
+    except (TypeError,ValueError):
+        return {}
+    for name in ('logits_to_keep','num_logits_to_keep'):
+        if name in parameters:
+            return {name:1}
+    return {}
 
 
 @torch.no_grad()
@@ -44,8 +59,9 @@ def generate_batch(model: nn.Module, prefixes: list[list[int]], remaining: list[
         mask[i,width-len(prefix):] = 1
     positions = (mask.cumsum(-1)-1).clamp(min=0)
     step_ids, step_positions, past = ids, positions, None
+    extra = last_logits_only(model)
     while True:
-        out = model(step_ids,attention_mask=mask,position_ids=step_positions,past_key_values=past,use_cache=True)
+        out = model(step_ids,attention_mask=mask,position_ids=step_positions,past_key_values=past,use_cache=True,**extra)
         logits = out.logits[:,-1].float()
         past = getattr(out,'past_key_values',None)
         tokens = []

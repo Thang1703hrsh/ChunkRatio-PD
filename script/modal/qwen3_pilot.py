@@ -8,7 +8,7 @@ Stages (idempotent; outputs and Hugging Face cache live on the Modal Volume name
 Each phase is a separate function call so each stays inside Modal's 24 h limit. GPUs are attached
 only to the stages that need them; orchestrators use a quarter CPU. A finished stage writes a
 marker and is skipped on re-run; CRPD stages resume from their own shards. Every chunkratio
-command appends wall time, CPU cores, peak RAM and GPU memory/utilization to resources.jsonl.
+command writes its wall time, CPU cores, peak RAM and GPU memory/utilization to resources/*.json.
 
 Environment (read at deploy and at start; baked into the image):
   CRPD_SCALE=smoke  small data (256 Deita rows, 512 UltraFeedback pairs, 8/4/4 pilot prompts, crpd_main,
@@ -127,10 +127,10 @@ def crpd(revision: str, *args: str) -> dict:
                  'gpu_util_mean':round(sum(u for _,u in samples)/len(samples),1) if samples else None,
                  'gpu':os.environ.get('MODAL_GPU_TYPE') or None}
         print(json.dumps({'resource':usage}),flush=True)
-        log = work/ROOT/'resources.jsonl'
+        # One file per command: parallel containers committing one shared file overwrite each other.
+        log = work/ROOT/'resources'/f'{time.time_ns()}-{os.getpid()}-{args[0]}.json'
         log.parent.mkdir(parents=True,exist_ok=True)
-        with open(log,'a',encoding='utf-8') as handle:
-            handle.write(json.dumps(usage)+'\n')
+        log.write_text(json.dumps(usage),encoding='utf-8')
     return usage
 
 
@@ -163,7 +163,9 @@ def head_lines(source: Path, destination: Path, rows: int) -> None:
             out.write(line)
 
 
-@app.function(cpu=4.0,memory=16384,**common)
+# CPU and RAM below follow the smoke measurements (every stage used about 1 core; peak RSS in
+# parentheses) with headroom; Modal bills the reserved amount.
+@app.function(cpu=2.0,memory=12288,**common)  # (3.7 GB smoke)
 def prepare(revision: str) -> None:
     """Pin revisions, download Deita and UltraFeedback, build canonical data and the pilot subset (CPU)."""
     volume.reload()
@@ -226,7 +228,7 @@ def _revisions() -> dict:
     return json.loads((workdir()/DATA/'revisions.json').read_text(encoding='utf-8'))
 
 
-@app.function(gpu='A100-80GB',cpu=4.0,memory=32768,retries=0,**sft_limits)
+@app.function(gpu='A100-80GB',cpu=2.0,memory=24576,retries=0,**sft_limits)  # (13.3 GB; GPU 44.6/80)
 def sft_teacher(revision: str) -> None:
     """T0: SFT of Qwen3-1.7B-Base on Deita (full fine-tuning, FP32 weights, bf16 autocast)."""
     volume.reload()
@@ -234,7 +236,7 @@ def sft_teacher(revision: str) -> None:
                      SFT_DATA,f'{CHECKPOINTS}/teacher_base')
 
 
-@app.function(gpu='L40S',cpu=4.0,memory=16384,retries=0,**sft_limits)
+@app.function(gpu='L40S',cpu=2.0,memory=12288,retries=0,**sft_limits)  # (7.4 GB; GPU 25.8/48)
 def sft_student(revision: str) -> None:
     """rho: SFT of Qwen3-0.6B-Base on the same Deita data (L40S is enough for 0.6B)."""
     volume.reload()
@@ -242,7 +244,7 @@ def sft_student(revision: str) -> None:
                      SFT_DATA,f'{CHECKPOINTS}/student_ref')
 
 
-@app.function(gpu='A100-80GB',cpu=4.0,memory=32768,retries=0,**dpo_limits)
+@app.function(gpu='A100-80GB',cpu=2.0,memory=24576,retries=0,**dpo_limits)  # (10.2 GB; GPU 57.5/80)
 def dpo_teacher(revision: str) -> None:
     """T+: DPO of T0 on UltraFeedback train_prefs; the frozen DPO reference is exactly T0."""
     volume.reload()
@@ -273,11 +275,12 @@ def write_pilot_configs() -> dict[str,str]:
     return paths
 
 
-@app.function(gpu='L40S',cpu=4.0,memory=24576,**common)
+@app.function(gpu='L40S',cpu=2.0,memory=32768,**common)  # (19.5 GB)
 def diagnose(revision: str) -> None:
     """Displacement diagnostic on 100 pilot train prompts before any student training."""
     volume.reload()
-    out = f'{ROOT}/diagnostic'
+    # Output of the batched-sampling diagnostic; an earlier per-state run's directory is left as is.
+    out = f'{ROOT}/diagnostic-batched'
     if done(f'{out}/displacement.json'):
         print('skip diagnose',flush=True)
         return
@@ -288,7 +291,8 @@ def diagnose(revision: str) -> None:
     volume.commit()
 
 
-@app.function(gpu='A100-80GB',cpu=8.0,memory=65536,retries=1,**common)
+# 64 GB RAM: the FP32 8B selection RM passes through host memory while loading.
+@app.function(gpu='A100-80GB',cpu=4.0,memory=65536,retries=1,**common)
 def train_variants(revision: str) -> None:
     """crpd_main, crpd_raw, crpd_anchor (seed 0) sharing one cache_root; each resumes from its shards.
 
@@ -356,7 +360,8 @@ def push_hf(revision: str, folder: str, role: str, extras: str | None = None) ->
 def push_finished(revision: str) -> list:
     """Spawn pushes for every finished checkpoint and student (already-pushed ones are skipped)."""
     calls = []
-    for role in ('teacher_base','student_ref','teacher_plus'):
+    # Smoke pushes only the small 0.6B models; the 7 GB smoke teachers use the same upload path.
+    for role in (('student_ref',) if SMOKE else ('teacher_base','student_ref','teacher_plus')):
         if done(f'{CHECKPOINTS}/{role}/preparation_manifest.json'):
             calls.append(push_hf.spawn(revision,f'{CHECKPOINTS}/{role}',role))
     for variant in VARIANTS:

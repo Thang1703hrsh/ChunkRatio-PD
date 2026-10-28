@@ -35,44 +35,81 @@ def gap_statistics(values: list[float], seed: int, name: str, bootstrap: int = 2
             'rare_tail_warning':share > .5}
 
 
-def rollout_returns(models: dict[str,nn.Module], prefix: list[int], remaining: int, eos: int,
-                    seed: int, name: str, replicates: int) -> tuple[list[float],list[int]]:
-    """R complete rho continuations (collection sampling) scored by teacher forcing under T+ and T0."""
-    rngs = [stream(seed,f'displacement/{name}/{r}') for r in range(replicates)]
-    suffixes = generate_batch(models['student_ref'],[prefix]*replicates,[remaining]*replicates,eos,rngs)
+def generate_rows(model: nn.Module, rows: list[tuple[list[int],int,str]], eos: int, seed: int,
+                  batch_rows: int, chunk_length: int | None = None) -> list[list[int]]:
+    """(prefix, remaining, stream name) rows sampled in batches; each row draws only from its own
+    named stream, so the tokens do not depend on how rows are grouped (§5.3)."""
+    out: list[list[int]] = []
+    for start in range(0,len(rows),batch_rows):
+        group = rows[start:start+batch_rows]
+        out += generate_batch(model,[p for p,_,_ in group],[r for _,r,_ in group],eos,
+                              [stream(seed,name) for _,_,name in group],chunk_length)
+    return out
+
+
+def rollout_returns_many(models: dict[str,nn.Module], jobs: list[tuple[list[int],int,str]], eos: int,
+                         seed: int, replicates: int, batch_rows: int) -> list[tuple[list[float],list[int]]]:
+    """For each (prefix, remaining, name) job: R complete rho continuations scored under T+ and T0."""
+    rows = [(prefix,remaining,f'displacement/{name}/{r}') for prefix,remaining,name in jobs for r in range(replicates)]
+    suffixes = generate_rows(models['student_ref'],rows,eos,seed,batch_rows)
     values = []
-    for suffix in suffixes:
+    for (prefix,_,_),suffix in zip(rows,suffixes):
         plus = continuation_increments(models['teacher_plus'],prefix,suffix,eos).cpu().double()
         base = continuation_increments(models['teacher_base'],prefix,suffix,eos).cpu().double()
         values.append(float((plus-base).sum()))
-    return values,[len(s) for s in suffixes]
+    return [(values[j*replicates:(j+1)*replicates],[len(s) for s in suffixes[j*replicates:(j+1)*replicates]])
+            for j in range(len(jobs))]
+
+
+def state_reports(models: dict[str,nn.Module], states: list[dict[str,Any]], cfg: dict[str,Any], eos: int,
+                  replicates: int) -> list[dict[str,Any]]:
+    """Per state: statistics and the omega_s spread of gaps over its K=4 sibling endpoints.
+
+    Sampling is batched across states (one row per stream), which keeps the GPU busy without
+    changing any token: a per-state loop of R-row batches left it about 60% idle.
+    """
+    seed, horizon = collection_seed(cfg), cfg['horizon']
+    batch_rows = cfg.get('generation_batch_size') or 16
+    chunks = {source:generate_rows(models[source],
+                                   [(s['prefix_ids'],horizon-s['n'],f"displacement-candidate/{s['id']}/{source}/{i}")
+                                    for s in states for i in range(2)],eos,seed,batch_rows,cfg['chunk_length'])
+              for source in ('student_ref','teacher_plus')}
+    siblings: list[dict[tuple[int,...],dict[str,Any]]] = []
+    jobs = []
+    for index,state in enumerate(states):
+        found: dict[tuple[int,...],dict[str,Any]] = {}
+        for source in ('student_ref','teacher_plus'):
+            for chunk in chunks[source][2*index:2*index+2]:
+                found.setdefault(tuple(chunk),{'tokens':chunk,'sources':[]})['sources'].append(source)
+        siblings.append(found)
+        jobs.append((state['prefix_ids'],horizon-state['n'],state['id']))
+        for chunk in found:
+            if not terminal(state['response_ids']+list(chunk),horizon,eos):
+                jobs.append((state['prefix_ids']+list(chunk),horizon-state['n']-len(chunk),digest([state['id'],list(chunk)])))
+    results = iter(rollout_returns_many(models,jobs,eos,seed,replicates,batch_rows))
+    reports = []
+    for state,found in zip(states,siblings):
+        values,lengths = next(results)
+        report = {'state_id':state['id'],'prompt_id':state['prompt_id'],'n':state['n'],
+                  'mean_suffix_length':sum(lengths)/len(lengths),**gap_statistics(values,seed,state['id'])}
+        endpoints = []
+        for chunk,row in found.items():
+            if terminal(state['response_ids']+list(chunk),horizon,eos):
+                endpoints.append({**row,'terminal':True,'jensen_gap':0.})
+                continue
+            d,_ = next(results)
+            endpoints.append({**row,'terminal':False,**gap_statistics(d,seed,digest([state['id'],list(chunk)]))})
+        gaps = [e['jensen_gap'] for e in endpoints]
+        report['sibling_endpoints'] = endpoints
+        report['omega_s'] = max(gaps)-min(gaps) if len(gaps) > 1 else None
+        reports.append(report)
+    return reports
 
 
 def state_report(models: dict[str,nn.Module], state: dict[str,Any], cfg: dict[str,Any], eos: int,
                  replicates: int) -> dict[str,Any]:
     """Statistics at one state and the omega_s spread of gaps over its K=4 sibling endpoints."""
-    seed, horizon = collection_seed(cfg), cfg['horizon']
-    values,lengths = rollout_returns(models,state['prefix_ids'],horizon-state['n'],eos,seed,state['id'],replicates)
-    report = {'state_id':state['id'],'prompt_id':state['prompt_id'],'n':state['n'],
-              'mean_suffix_length':sum(lengths)/len(lengths),**gap_statistics(values,seed,state['id'])}
-    siblings: dict[tuple[int,...],dict[str,Any]] = {}
-    for source in ('student_ref','teacher_plus'):
-        rngs = [stream(seed,f"displacement-candidate/{state['id']}/{source}/{i}") for i in range(2)]
-        chunks = generate_batch(models[source],[state['prefix_ids']]*2,[horizon-state['n']]*2,eos,rngs,cfg['chunk_length'])
-        for chunk in chunks:
-            siblings.setdefault(tuple(chunk),{'tokens':chunk,'sources':[]})['sources'].append(source)
-    endpoints = []
-    for chunk,row in siblings.items():
-        if terminal(state['response_ids']+list(chunk),horizon,eos):
-            endpoints.append({**row,'terminal':True,'jensen_gap':0.})
-            continue
-        name = digest([state['id'],list(chunk)])
-        d,_ = rollout_returns(models,state['prefix_ids']+list(chunk),horizon-state['n']-len(chunk),eos,seed,name,replicates)
-        endpoints.append({**row,'terminal':False,**gap_statistics(d,seed,name)})
-    gaps = [e['jensen_gap'] for e in endpoints]
-    report['sibling_endpoints'] = endpoints
-    report['omega_s'] = max(gaps)-min(gaps) if len(gaps) > 1 else None
-    return report
+    return state_reports(models,[state],cfg,eos,replicates)[0]
 
 
 def diagnose(cfg: dict[str,Any], n_prompts: int, replicates: int, output: Path) -> dict[str,Any]:
@@ -88,7 +125,7 @@ def diagnose(cfg: dict[str,Any], n_prompts: int, replicates: int, output: Path) 
                                           'chunk_length':cfg['chunk_length'],'states_per_prompt':cfg.get('states_per_prompt')})
     states = collect_prefixes(chosen,models['student_ref'],{**cfg,'variant':'crpd_main'},info['eos'],store)
     states = [s for s in states if s['prompt_id'] in {p['id'] for p in chosen}]
-    reports = [state_report(models,state,cfg,info['eos'],replicates) for state in states]
+    reports = state_reports(models,states,cfg,info['eos'],replicates)
     summary = {'label':'DIAGNOSTIC ONLY: displacement/Jensen-gap estimates, not a result',
                'prompts':len(chosen),'states':len(reports),'replicates':replicates,
                'ineligible_prompts':ineligible,'collection_seed':collection_seed(cfg),

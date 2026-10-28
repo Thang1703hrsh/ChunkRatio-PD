@@ -84,6 +84,19 @@ def test_estimates_converge_to_exact_tree_values() -> None:
     print('diagnostic convergence',errors)
 
 
+def test_batched_state_reports_equal_per_state_reports() -> None:
+    """Batching rollouts across states and endpoints changes no token and no statistic."""
+    from chunkratio.diagnostics import state_reports
+    ref = reference()
+    T0,Tp,rho = ref.make_world(random.Random(7),.5,.5)
+    models = {'teacher_plus':TreeLM(Tp),'teacher_base':TreeLM(T0),'student_ref':TreeLM(rho)}
+    states = [{'id':'root','prompt_id':'p','prefix_ids':[PROMPT],'response_ids':[],'n':0},
+              {'id':'one','prompt_id':'p','prefix_ids':[PROMPT,1],'response_ids':[1],'n':1},
+              {'id':'zero','prompt_id':'q','prefix_ids':[PROMPT,0],'response_ids':[0],'n':1}]
+    cfg = {'horizon':ref.H,'chunk_length':2,'collection_seed':0,'generation_batch_size':5}
+    assert state_reports(models,states,cfg,ref.EOS,6) == [state_report(models,s,cfg,ref.EOS,6) for s in states]
+
+
 def test_rare_tail_flag_and_interval() -> None:
     """One dominant exponential weight triggers the warning; the bootstrap interval covers the gap."""
     flagged = gap_statistics([0.,0.,0.,6.],0,'tail')

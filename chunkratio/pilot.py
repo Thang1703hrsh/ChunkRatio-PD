@@ -43,7 +43,8 @@ PILOT_ASSUMPTIONS = {
 # One tokenizer (and chat template) serves every role of a pair; the SFT/DPO checkpoints save it.
 PAIRS = {
     PAIR:{'teacher':TEACHER_BASE_MODEL,'student':STUDENT_BASE_MODEL,'tokenizer':STUDENT_BASE_MODEL,
-          'eos':EOS_TOKEN,'chat_template_kwargs':{'enable_thinking':False},'gated':False,'generation_batch_size':64},
+          # 32 rows: FP32 KV caches of ~1.5k-token Qwen3 prefixes take ~229 KB/token (64 states x 2 rows OOMed).
+          'eos':EOS_TOKEN,'chat_template_kwargs':{'enable_thinking':False},'gated':False,'generation_batch_size':32},
     'qwen3_8b_to_1p7b':{'teacher':'Qwen/Qwen3-8B-Base','student':'Qwen/Qwen3-1.7B-Base','tokenizer':'Qwen/Qwen3-1.7B-Base',
                         'eos':EOS_TOKEN,'chat_template_kwargs':{'enable_thinking':False},'gated':False,
                         'generation_batch_size':16},

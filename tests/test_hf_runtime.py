@@ -195,6 +195,31 @@ def test_hf_batched_cached_sampling_and_throughput_log(tmp_path: Path) -> None:
     print('sampler throughput',log)
 
 
+def test_last_position_logits_sample_the_same_tokens(tmp_path: Path) -> None:
+    """logits_to_keep=1 skips the [rows, width, vocab] prefill logits without changing any draw."""
+    from chunkratio.sampling import generate_batch, last_logits_only, stream
+    from chunkratio.tiny import TinyLM
+    paths = checkpoints(tmp_path)
+    model = transformers.LlamaForCausalLM.from_pretrained(paths['student_ref']).eval()
+    assert last_logits_only(model) == {'logits_to_keep':1} and last_logits_only(TinyLM()) == {}
+
+    class FullLogits(torch.nn.Module):
+        """The same model called without logits_to_keep (every position's logits)."""
+        def __init__(self, inner: torch.nn.Module) -> None:
+            """Wrap the model."""
+            super().__init__()
+            self.inner = inner
+        def forward(self, input_ids, attention_mask=None, position_ids=None, past_key_values=None, use_cache=None):
+            """Forward without the last-position shortcut."""
+            return self.inner(input_ids,attention_mask=attention_mask,position_ids=position_ids,
+                              past_key_values=past_key_values,use_cache=use_cache)
+
+    prefixes = [[1,2+i%10,3,4][:2+i%3] for i in range(8)]
+    rngs = lambda: [stream(3,f'keep/{i}') for i in range(8)]
+    # Unequal prefix lengths exercise left padding, so EOS (the pad id) must be in the tiny vocabulary.
+    assert generate_batch(model,prefixes,[12]*8,0,rngs()) == generate_batch(FullLogits(model),prefixes,[12]*8,0,rngs())
+
+
 def qwen_config(tmp_path: Path) -> tuple[dict,dict]:
     """Tiny Qwen3-style checkpoints with the NARVAL EOS/template conventions (§5.1)."""
     from chunkratio.tiny import build_tiny_qwen3
