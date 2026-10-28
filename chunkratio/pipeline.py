@@ -129,6 +129,13 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
     write_json(output/'target_index.json',{'path':str(target_path/'targets.json'),'head_hash':head_meta['hash']})
     if until == 'build-targets':
         return {'pairs':len(targets['pairs']),'head':head_meta,'route':route}
+    # Targets are built, so the frozen teachers are idle from here on: park them in host memory to
+    # free GPU room (two FP32 1.7B teachers = 13.6 GB) for the selection RM and the student optimizer.
+    # Their fingerprints are still checked after training.
+    for role in ('teacher_plus','teacher_base'):
+        models[role].to('cpu')
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     selector,selection_cost = (None,{}) if cfg.get('synthetic',False) else reward_selector(cfg,prompts,tokenizers[2])
     trainer = ChunkRatioTrainer(student,models['student_ref'],targets,prompts,cfg,eos,selector)
     policy_deps = {'code_revision':revision,'targets':digest(targets),
