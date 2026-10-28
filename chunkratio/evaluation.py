@@ -112,7 +112,8 @@ def reward_selector(cfg: dict[str,Any], prompts: list[dict[str,Any]], tokenizer:
         raise ValueError('select split required for reward checkpoint selection')
     name = 'sfairXC/FsfairX-LLaMA3-RM-v0.1'
     rm = AutoModelForSequenceClassification.from_pretrained(name,revision=selection['reward_model_revision'],torch_dtype=torch.float32)
-    rm = rm.to(cfg['device']).eval().requires_grad_(False)
+    # The FP32 8B RM (32 GB) waits in host memory and visits the GPU only while it scores.
+    rm = rm.eval().requires_grad_(False)
     rm_tok = AutoTokenizer.from_pretrained(name,revision=selection['reward_model_revision'])
     decode = selection['decoding']
     cost = {'generated_tokens':0,'rm_scored_input_tokens':0,'selection_calls':0}
@@ -122,6 +123,17 @@ def reward_selector(cfg: dict[str,Any], prompts: list[dict[str,Any]], tokenizer:
         """Mean independent reward of generated responses on fixed select prompts (§11.1)."""
         scores = []
         cost['selection_calls'] += 1
+        rm.to(cfg['device'])
+        try:
+            score_rows(student,scores)
+        finally:
+            rm.to('cpu')
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        return statistics.mean(scores)
+
+    def score_rows(student: Any, scores: list[float]) -> None:
+        """Generate and RM-score every select prompt into `scores`."""
         for row in rows:
             ids = torch.tensor([row['prompt_ids']],device=cfg['device'])
             # Reset stream per prompt/checkpoint so selection noise is controlled.
@@ -140,7 +152,6 @@ def reward_selector(cfg: dict[str,Any], prompts: list[dict[str,Any]], tokenizer:
             if logits.numel() != 1:
                 raise ValueError('reward model must return one scalar')
             scores.append(float(logits.item()))
-        return statistics.mean(scores)
     return select,cost
 
 

@@ -74,11 +74,20 @@ def score_tokens(logits: Tensor, ids: Tensor, attention: Tensor, prompt_lengths:
     eos_hits = (ids[:,1:] == eos) & response
     seen_before = eos_hits.cumsum(-1)-eos_hits.long()
     mask = response & (seen_before == 0)
-    raw = logits[:,:-1,:]
+    # Normalise only the scored positions: gathering them first gives the same log-probs without
+    # a [rows, width, vocab] FP32 log-softmax over prompt and prefix positions (and the copy
+    # autograd keeps of it), which ran an A100-80GB out of memory at H=512.
+    counts = mask.sum(-1)
+    span = max(int(counts.max()),1)
+    offsets = torch.arange(span,device=ids.device)[None,:]
+    index = (prompt_lengths[:,None]-1+offsets).clamp(max=ids.shape[1]-2)
+    picked = (offsets < counts[:,None]) & mask.gather(1,index)
+    raw = logits[:,:-1,:].gather(1,index[:,:,None].expand(-1,-1,logits.shape[-1]))
     raw = raw if raw.dtype == torch.float64 else raw.float()
     assert torch.isfinite(raw).all(), 'nonfinite prediction logits'
-    logps = raw.log_softmax(-1).gather(-1,ids[:,1:,None]).squeeze(-1)
-    values = logps.masked_fill(~mask,0)
+    logps = raw.log_softmax(-1).gather(-1,ids[:,1:].gather(1,index)[:,:,None]).squeeze(-1)
+    # scatter_add: clamped duplicate indices only carry zeros, so they cannot overwrite a score.
+    values = torch.zeros(mask.shape,dtype=logps.dtype,device=logps.device).scatter_add(1,index,logps.masked_fill(~picked,0))
     assert torch.isfinite(values).all()
     return values,mask
 

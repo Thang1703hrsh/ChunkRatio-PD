@@ -8,6 +8,25 @@ from chunkratio.scoring import (continuation_increments, fingerprint, score_batc
 from chunkratio.tiny import TinyLM
 
 
+def test_scored_positions_only_match_full_log_softmax() -> None:
+    """Gathering response positions before the log-softmax equals normalising every position."""
+    gen = torch.Generator().manual_seed(5)
+    rows,width,vocab,eos = 5,12,9,0
+    logits = torch.randn(rows,width,vocab,generator=gen,dtype=torch.float64,requires_grad=True)
+    ids = torch.randint(1,vocab,(rows,width),generator=gen)
+    prompt_lengths = torch.tensor([1,3,2,5,11])
+    sequence_lengths = torch.tensor([12,9,12,7,12])
+    ids[2,6] = eos
+    attention = (torch.arange(width)[None,:] < sequence_lengths[:,None]).long()
+    values,mask = score_tokens(logits,ids,attention,prompt_lengths,sequence_lengths,eos)
+    full = logits[:,:-1].log_softmax(-1).gather(-1,ids[:,1:,None]).squeeze(-1).masked_fill(~mask,0)
+    torch.testing.assert_close(values,full,atol=0,rtol=0)
+    assert mask[2].tolist().index(True) == 1 and not mask[2,6:].any()
+    grad, = torch.autograd.grad(values.sum(),logits)
+    expected, = torch.autograd.grad(full.sum(),logits)
+    torch.testing.assert_close(grad,expected,atol=1e-12,rtol=0)
+
+
 def test_fingerprint_bytes_unchanged_and_fast() -> None:
     """Same digest as hashing each tensor's storage bytes; a 64 MB layer hashes in well under a second (§4.1)."""
     import hashlib
