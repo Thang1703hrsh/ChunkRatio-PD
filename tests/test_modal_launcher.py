@@ -46,6 +46,10 @@ def test_smoke_scale_and_hf_push_switches(monkeypatch) -> None:
     assert hub.APP_NAME == 'crpd-qwen3-pilot-hub' and hub.VARIANTS == ('crpd_main','crpd_raw')
     assert hub.ROOT == 'output/narval/qwen3_1p7b_to_0p6b_hub/pilot' and hub.SFT_DATA.endswith('ultrachat_sft_fit2048.jsonl')
     assert hub.SIZES['states_per_prompt'] == 2 and hasattr(hub,'verify_teachers')
+    stability = load('stability','1')
+    assert stability.APP_NAME == 'crpd-qwen3-pilot-hub-stability' and stability.VARIANTS == ('crpd_main',)
+    assert (stability.SIZES['steps'],stability.SIZES['selection_interval'],stability.SIZES['states_per_prompt']) == (150,50,2)
+    assert stability.HF_PREFIX.endswith('-hub-stability')
     monkeypatch.setenv('CRPD_TEACHERS','pretrained')
     with pytest.raises(SystemExit,match='CRPD_TEACHERS'):
         load('full','0')

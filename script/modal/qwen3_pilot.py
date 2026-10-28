@@ -38,9 +38,12 @@ from pathlib import Path
 import modal
 
 SCALE = os.environ.get('CRPD_SCALE','full')
-if SCALE not in ('full','smoke'):
-    raise SystemExit('CRPD_SCALE must be full or smoke')
+if SCALE not in ('full','smoke','stability'):
+    raise SystemExit('CRPD_SCALE must be full, smoke or stability')
+# smoke: plumbing and per-stage timing; stability: enough steps and RM checkpoints to see whether
+# policy training moves the right way. Both are small runs in their own app and volume.
 SMOKE = SCALE == 'smoke'
+SMALL = SCALE != 'full'
 HF_PUSH = os.environ.get('CRPD_HF_PUSH','0') == '1'
 # CRPD_TEACHERS=hub takes T0/T+ from pinned published checkpoints (chunkratio.pilot.HUB_TEACHERS),
 # checks T+ = T0 + LoRA from the weights, and trains only rho (UltraChat SFT of Qwen3-0.6B-Base).
@@ -48,7 +51,7 @@ TEACHERS = os.environ.get('CRPD_TEACHERS','train')
 if TEACHERS not in ('train','hub'):
     raise SystemExit('CRPD_TEACHERS must be train or hub')
 HUB = TEACHERS == 'hub'
-APP_NAME = 'crpd-qwen3-pilot'+('-hub' if HUB else '')+('-smoke' if SMOKE else '')
+APP_NAME = 'crpd-qwen3-pilot'+('-hub' if HUB else '')+(f'-{SCALE}' if SMALL else '')
 REMOTE_REPO = '/root/repo'
 # Inside a container this file is /root/qwen3_pilot.py, so the repo root only exists locally.
 REPO = Path(__file__).resolve().parents[2] if modal.is_local() else Path(REMOTE_REPO)
@@ -60,7 +63,7 @@ ROOT = f'output/narval/{RUN_PAIR}/pilot'
 CHECKPOINTS = f'{ROOT}/checkpoints'
 # Turn-fitted SFT data (Deita: 98.8% of conversations kept at 2048 tokens instead of 5.4%).
 SFT_DATA = f"{DATA}/{'ultrachat' if HUB else 'deita'}_sft_fit2048.jsonl"
-VARIANTS = ('crpd_main',) if SMOKE else ('crpd_main','crpd_raw') if HUB else ('crpd_main','crpd_raw','crpd_anchor')
+VARIANTS = ('crpd_main',) if SMALL else ('crpd_main','crpd_raw') if HUB else ('crpd_main','crpd_raw','crpd_anchor')
 # Smoke sizes keep the real horizon and chunking so per-prompt and per-pair rates extrapolate.
 SMOKE_SIZES = {'deita_rows':256,'ultrachat_rows':256,'uf_train_rows':512,'uf_test_rows':64,
                'subset':{'train':8,'head_val':4,'select':4},'states_per_prompt':4,
@@ -68,8 +71,13 @@ SMOKE_SIZES = {'deita_rows':256,'ultrachat_rows':256,'uf_train_rows':512,'uf_tes
 # Reduced hub pilot, fixed before any collection (DECISIONS): fewer prompts, 2 states per prompt.
 HUB_SIZES = {'ultrachat_rows':10000,'subset':{'train':1000,'head_val':100,'select':64},'states_per_prompt':2,
              'steps':300,'batch_size':64,'selection_interval':150,'diagnostic_prompts':32,'diagnostic_replicates':8}
-SIZES = SMOKE_SIZES if SMOKE else HUB_SIZES if HUB else None
-HF_PREFIX = 'crpd-qwen3-1p7b-to-0p6b'+('-hub' if HUB else '')+('-smoke' if SMOKE else '')
+# Stability check: 150 steps x 32 pairs over 64 prompts x 2 states (~768 pairs, ~6 passes), RM
+# selection at steps 50/100/150; rho is SFT'd on 2,000 conversations so its rollouts are usable.
+STABILITY_SIZES = {'deita_rows':2000,'ultrachat_rows':2000,'uf_train_rows':2048,'uf_test_rows':64,
+                   'subset':{'train':64,'head_val':16,'select':16},'states_per_prompt':2,
+                   'steps':150,'batch_size':32,'selection_interval':50,'diagnostic_prompts':8,'diagnostic_replicates':4}
+SIZES = {'smoke':SMOKE_SIZES,'stability':STABILITY_SIZES}.get(SCALE) or (HUB_SIZES if HUB else None)
+HF_PREFIX = 'crpd-qwen3-1p7b-to-0p6b'+('-hub' if HUB else '')+(f'-{SCALE}' if SMALL else '')
 
 app = modal.App(APP_NAME)
 volume = modal.Volume.from_name(APP_NAME,create_if_missing=True)
@@ -236,10 +244,10 @@ def prepare(revision: str) -> None:
                                                                             for m in row['messages']]},ensure_ascii=False)+'\n')
     sources = {'deita':'ultrachat_sharegpt.jsonl' if HUB else 'deita.jsonl','uf_train':'uf_train_prefs.jsonl',
                'uf_test':'uf_test_prefs.jsonl'}
-    if SMOKE:
+    if SMALL:
         for key,name in sources.items():
-            head_lines(raw/name,raw/f'smoke_{name}',SMOKE_SIZES[f'{key}_rows'])
-        sources = {key:f'smoke_{name}' for key,name in sources.items()}
+            head_lines(raw/name,raw/f'{SCALE}_{name}',SIZES[f'{key}_rows'])
+        sources = {key:f'{SCALE}_{name}' for key,name in sources.items()}
     template = json.dumps({'enable_thinking':False})
     # Hub teachers: their own tokenizer and plain ChatML template format every role's data.
     tokenizer = ['--tokenizer',HUB_TEACHERS['teacher_base']['repo'] if HUB else STUDENT_BASE_MODEL,
@@ -384,7 +392,7 @@ def train_variants(revision: str) -> None:
             print('skip',variant,flush=True)
         else:
             stages = (('validate-config','collect-prefixes','collect-candidates','collect-correction','fit-head',
-                       'build-targets','train-policy','evaluate') if SMOKE else ('evaluate',))
+                       'build-targets','train-policy','evaluate') if SMALL else ('evaluate',))
             for stage in stages:
                 crpd(revision,stage,'--config',configs[variant])
                 volume.commit()
@@ -416,7 +424,7 @@ def push_hf(revision: str, folder: str, role: str, extras: str | None = None) ->
         '- HuggingFaceH4/ultrafeedback_binarized',
         'tags:','- chunkratio-pd','- preference-distillation','---','',
         f'# {HF_PREFIX}-{role}','',
-        f"ChunkRatio-PD {'SMOKE TEST (tiny data, not a usable model)' if SMOKE else 'pilot'} artifact, role `{role}`, "
+        f"ChunkRatio-PD {f'{SCALE.upper()} TEST (small data, not a usable model)' if SMALL else 'pilot'} artifact, role `{role}`, "
         'pair Qwen3-1.7B -> Qwen3-0.6B. Pilot settings are assumptions, not NARVAL\'s; see `pilot_assumptions` '
         'in the bundled config. No benchmark result is claimed.','',
         f'- code revision: `{revision}`',f"- data revisions: `{json.dumps(prepared['revisions'])}`",
@@ -440,7 +448,7 @@ def push_finished(revision: str) -> list:
     calls = []
     # Smoke pushes only the small 0.6B models (the 7 GB smoke teachers use the same upload path);
     # hub teachers are already public.
-    for role in (('student_ref',) if SMOKE or HUB else ('teacher_base','student_ref','teacher_plus')):
+    for role in (('student_ref',) if SMALL or HUB else ('teacher_base','student_ref','teacher_plus')):
         if done(f'{CHECKPOINTS}/{role}/preparation_manifest.json'):
             calls.append(push_hf.spawn(revision,f'{CHECKPOINTS}/{role}',role))
     for variant in VARIANTS:
