@@ -119,3 +119,25 @@ def test_launcher_imports_inside_container(tmp_path,monkeypatch) -> None:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     assert module.REPO == Path(module.REMOTE_REPO)
+
+
+def test_finished_needs_same_config_and_same_code(tmp_path, monkeypatch) -> None:
+    """A run of the same config but older code is not finished; another config's results are an error."""
+    import json
+    from chunkratio.artifacts import code_revision
+    spec = importlib.util.spec_from_file_location('qwen3_pilot_finished',Path('script/modal/qwen3_pilot.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module,'workdir',lambda: tmp_path)
+    config = {'output':'out/run','alpha':.3}
+    out = tmp_path/'out'/'run'
+    out.mkdir(parents=True)
+    assert not module.finished(config,'diagnostics.json','abc')
+    (out/'diagnostics.json').write_text('{}',encoding='utf-8')
+    (out/'resolved_config.json').write_text(json.dumps(config),encoding='utf-8')
+    (out/'manifest.json').write_text(json.dumps({'code_revision':'abc+src.0000000000000000'}),encoding='utf-8')
+    assert not module.finished(config,'diagnostics.json','abc')
+    (out/'manifest.json').write_text(json.dumps({'code_revision':code_revision('abc')}),encoding='utf-8')
+    assert module.finished(config,'diagnostics.json','abc') and not module.finished(config,'diagnostics.json','def')
+    with pytest.raises(ValueError,match='different config'):
+        module.finished({**config,'alpha':.1},'diagnostics.json','abc')

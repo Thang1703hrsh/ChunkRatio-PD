@@ -163,7 +163,7 @@ def preparation_config(stage: str, model: str, revision: str, data: str, output:
 
 def pilot_config(protocol: dict[str,Any], variant: str, checkpoints: dict[str,dict[str,str]],
                  revisions: dict[str,str], split_manifest_sha256: str, reference_verified: bool,
-                 pair: str = PAIR) -> dict[str,Any]:
+                 pair: str = PAIR, reference_assumption: dict[str,Any] | None = None) -> dict[str,Any]:
     """Resolved pilot config from config/crpd/narval/<pair>.json (relative paths only)."""
     spec = PAIRS[pair]
     cfg = copy.deepcopy(protocol)
@@ -179,6 +179,9 @@ def pilot_config(protocol: dict[str,Any], variant: str, checkpoints: dict[str,di
                eos_token=spec['eos'],chat_template_kwargs=copy.deepcopy(spec['chat_template_kwargs']),**POLICY_TUNING,
                models={role:{'path':value['path'],'revision':value['revision']} for role,value in checkpoints.items()},
                pilot_assumptions=pilot_assumptions(pair),pilot_deviations=[deviation])
+    if reference_assumption is not None:
+        # Unverified T0-as-reference: recorded with its evidence so every result of this run carries it.
+        cfg['teacher_dpo_reference_assumption'] = copy.deepcopy(reference_assumption)
     cfg['selection']['reward_model_revision'] = revisions['reward_model']
     narval = cfg['narval']
     narval['base_checkpoints'] = {'teacher':f"{spec['teacher']}@{revisions['teacher_base_model']}",

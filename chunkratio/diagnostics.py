@@ -166,11 +166,17 @@ def _source(candidate: dict[str,Any]) -> str:
 
 
 def _corr_r2(predictions: list[float], labels: list[float]) -> dict[str,float | None]:
-    """Pearson correlation and R^2 of already-centred values (None when either side is constant)."""
-    spp,syy = sum(p*p for p in predictions),sum(y*y for y in labels)
-    if not predictions or spp == 0 or syy == 0:
+    """Pearson correlation around this set's own means, and R^2 of the given predictions (no refit) against
+    the labels' own mean; None when either side is constant. Per-state centring of the whole sample does not
+    centre a subset (one endpoint source, a bootstrap draw), so the means are always recomputed here."""
+    if len(predictions) < 2:
         return {'corr':None,'r2':None}
-    spy = sum(p*y for p,y in zip(predictions,labels))
+    mp,my = sum(predictions)/len(predictions),sum(labels)/len(labels)
+    spp = sum((p-mp)**2 for p in predictions)
+    syy = sum((y-my)**2 for y in labels)
+    if spp == 0 or syy == 0:
+        return {'corr':None,'r2':None}
+    spy = sum((p-mp)*(y-my) for p,y in zip(predictions,labels))
     return {'corr':spy/math.sqrt(spp*syy),'r2':1-sum((p-y)**2 for p,y in zip(predictions,labels))/syy}
 
 

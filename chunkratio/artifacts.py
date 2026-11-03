@@ -4,12 +4,34 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
 SCHEMA = 1
+
+
+def source_digest(package: Path | None = None) -> str:
+    """sha256 of the package's .py sources with LF line endings (Windows checkouts and containers agree)."""
+    package = package or Path(__file__).resolve().parent
+    h = hashlib.sha256()
+    for path in sorted(package.rglob('*.py')):
+        h.update(path.relative_to(package).as_posix().encode()+b'\0')
+        h.update(path.read_bytes().replace(b'\r\n',b'\n')+b'\0')
+    return h.hexdigest()
+
+
+def code_revision(commit: str | None = None) -> str:
+    """Commit plus a hash of the chunkratio sources, so two uncommitted versions never share a revision
+    (and therefore never share cache keys). Containers without .git (Modal) pass the commit computed where
+    the code was uploaded (CRPD_CODE_REVISION); the source hash is taken from the code that actually runs.
+    Launchers pass `commit` to predict the revision a run of this code will record."""
+    root = Path(__file__).resolve().parents[1]
+    commit = commit or os.environ.get('CRPD_CODE_REVISION') or subprocess.check_output(
+        ['git','rev-parse','HEAD'],cwd=root,text=True).strip()
+    return f'{commit}+src.{source_digest()[:16]}'
 
 
 def digest(value: Any) -> str:

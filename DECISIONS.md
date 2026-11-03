@@ -352,3 +352,24 @@ distillation stage (`scripts/run_narval.py`); it has no SFT or teacher-DPO code 
 72. **bf16 rho rescoring kept.** Caching rho scores per pair in bf16 was not adopted: under autocast a score
     depends on the microbatch it is computed in, so a cache would break the exact zero margin at student = rho
     that item 51 restored. The rescoring forward is now tail-only (item 71), which removes most of its cost.
+
+## Second review of 2775bc1 (user request, 3 November 2026)
+
+73. **hda reference is an assumption, not a verification (corrects item 62).** The weight check shows T+ is
+    0.00044 (relative L2) from T0 against 0.0085 from Qwen3-1.7B-Base and 0.054 from Qwen3-1.7B, which supports
+    T0 as T+'s DPO reference but does not prove it. The hda launcher now writes `teacher_reference_evidence.json`
+    (`supported`, never `verified`), keeps `teacher_dpo_reference_verified: false`, and records
+    `teacher_dpo_reference_assumption` (status `assumed`, claim, evidence, reason) in every config, so the
+    manifest of every hda run carries it. `validate` accepts an unverified reference only for a pilot with that
+    block and non-empty evidence; non-pilot runs still need verification.
+74. **Launcher completion also checks code (amends item 67).** `finished()` in both launchers also requires the
+    run's `manifest.json` to record the revision this code would record (`artifacts.code_revision(commit)`,
+    now shared by pipeline and launchers). Results of other code are not finished: the run repeats, and its
+    stage cache keys keep old shards out.
+75. **Per-source sibling correlation (corrects item 70).** Centring by state does not centre one endpoint source
+    or a bootstrap draw, so `_corr_r2` now takes Pearson correlation around the subset's own means; R^2 compares
+    the given predictions with the labels around the subset's label mean. A case with Pearson -1 per source and
+    +0.8 pooled is a test.
+76. **Fallback metadata (amends item 69).** `selection_score` is always the score of the exported model and
+    `best_checkpoint_score` that of the best trained checkpoint; with the fallback enabled the rule is named
+    `select_mean_reward_with_reference_fallback`, and an exported rho reports rho's select score.

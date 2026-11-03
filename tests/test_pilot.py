@@ -101,8 +101,16 @@ def test_hda_trio_configs_load_every_role_from_the_hub() -> None:
     protocol = json.loads(Path('config/crpd/narval/qwen3_1p7b_to_0p6b.json').read_text(encoding='utf-8'))
     checkpoints = {role:{'path':source['repo'],'revision':source['revision']} for role,source in HDA_CHECKPOINTS.items()}
     revisions = {k:'sha' for k in ('reward_model','teacher_base_model','student_base_model','sft_dataset','preference_dataset')}
-    cfg = pilot_config(protocol,'crpd_raw',checkpoints,revisions,'splitsha',True,HDA_PAIR)
+    assumption = {'status':'assumed','claim':"T0 is T+'s actual DPO reference",
+                  'evidence':{'relative_l2_distance':{'reference':4e-4,'qwen3_1p7b_base':8e-3}}}
+    cfg = pilot_config(protocol,'crpd_raw',checkpoints,revisions,'splitsha',False,HDA_PAIR,assumption)
     validate(cfg)
+    # An assumption is recorded as such, never as verification; without evidence or outside a pilot it fails.
+    assert cfg['teacher_dpo_reference_verified'] is False and cfg['teacher_dpo_reference_assumption'] == assumption
+    with pytest.raises(ValueError,match='must be verified'):
+        validate({**cfg,'teacher_dpo_reference_assumption':{**assumption,'evidence':{}}})
+    with pytest.raises(ValueError):
+        validate({**cfg,'pilot':False})
     assert cfg['output'].startswith('output/narval/qwen3_1p7b_to_0p6b_hda/pilot/') and cfg['eos_token'] == '<|im_end|>'
     assert {role:entry['path'] for role,entry in cfg['models'].items()} == {r:s['repo'] for r,s in HDA_CHECKPOINTS.items()}
     assumptions = pilot_assumptions(HDA_PAIR)

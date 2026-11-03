@@ -204,13 +204,17 @@ class ChunkRatioTrainer:
         assert all(p.grad is None for p in self.rho.parameters())
         assert best_state is not None
         self.student.load_state_dict(best_state)
-        result = {'optimizer_steps':cfg['steps'],'selection_score':best,'history':self.history,
-                  'selection_rule':'synthetic_negative_pair_bce' if self.selector is None else 'select_mean_reward',
-                  **self.against_reference(best)}
-        if cfg.get('selection_fallback_to_reference') and result['improved_over_reference'] is False:
+        fallback = bool(cfg.get('selection_fallback_to_reference'))
+        rule = ('synthetic_negative_pair_bce' if self.selector is None else
+                'select_mean_reward_with_reference_fallback' if fallback else 'select_mean_reward')
+        # selection_score is always the score of the exported model; best_checkpoint_score that of the best
+        # trained checkpoint, which differ only when the fallback exports rho.
+        result = {'optimizer_steps':cfg['steps'],'selection_score':best,'best_checkpoint_score':best,
+                  'history':self.history,'selection_rule':rule,**self.against_reference(best)}
+        if fallback and result['improved_over_reference'] is False:
             # Opt-in rule: no checkpoint beat rho on select, so rho itself is exported and reported as such.
             self.student.load_state_dict(self.rho.state_dict())
-            result['selected'] = 'reference'
+            result.update(selected='reference',selection_score=result['reference_selection_score'])
         return result
 
     def select(self) -> tuple[float,list[float] | None]:

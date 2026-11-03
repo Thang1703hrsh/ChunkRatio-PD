@@ -171,6 +171,9 @@ def test_selection_reports_paired_gain_and_optional_fallback(tmp_path: object) -
     result = trainer.train(tmp_path/'fallback.pt')
     assert result['improved_over_reference'] is False and result['selected'] == 'reference'
     assert fingerprint(trainer.student) == fingerprint(rho)
+    # The reported score is the exported model's (rho, 5.0), not the best trained checkpoint's (1.5).
+    assert result['selection_score'] == 5. and result['best_checkpoint_score'] == 1.5
+    assert result['selection_rule'] == 'select_mean_reward_with_reference_fallback'
     trainer,_,_ = margin_trainer({**settings,'selection_baseline':False,'selection_fallback_to_reference':True})
     trainer.selector = PromptSelector([[1.]])
     with pytest.raises(ValueError,match='needs selection_baseline'):

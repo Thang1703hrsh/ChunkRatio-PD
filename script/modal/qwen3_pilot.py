@@ -201,16 +201,20 @@ def done(path: str) -> bool:
     return (workdir()/path).exists()
 
 
-def finished(config: dict, marker: str) -> bool:
-    """A CRPD run is finished only if its marker exists and it ran exactly this config; an output folder
-    holding another config's results is an error, not a skip (the code revision is checked by the cache
-    keys of every stage, so a changed code reruns through its own keys)."""
+def finished(config: dict, marker: str, revision: str) -> bool:
+    """A CRPD run is finished only if its marker exists, it ran exactly this config, and its manifest
+    records the code revision this code would record. Another config's results in the output folder
+    are an error; results of other code are not finished, so the run repeats (each stage's cache key
+    contains the revision, so nothing of the old code is reused)."""
     if not done(f"{config['output']}/{marker}"):
         return False
     resolved = workdir()/config['output']/'resolved_config.json'
     if not resolved.exists() or json.loads(resolved.read_text(encoding='utf-8')) != config:
         raise ValueError(f"{config['output']} holds results of a different config; use another output to rerun")
-    return True
+    sys.path.insert(0,str(workdir()))
+    from chunkratio.artifacts import code_revision
+    manifest = workdir()/config['output']/'manifest.json'
+    return manifest.exists() and json.loads(manifest.read_text(encoding='utf-8')).get('code_revision') == code_revision(revision)
 
 
 def train_checkpoint(revision: str, stage: str, model: str, model_revision: str, data: str, out: str,
@@ -407,9 +411,15 @@ def write_pilot_configs() -> dict[str,str]:
     work = workdir()
     sys.path.insert(0,str(work))
     from chunkratio.pilot import HDA_CHECKPOINTS, HUB_TEACHERS, pilot_config
+    assumption = None
     if HDA:
-        # Every role loads from its pinned commit; the weight check above is the reference evidence.
-        verified = json.loads((work/ROOT/'teacher_verification.json').read_text(encoding='utf-8'))['verified']
+        # Every role loads from its pinned commit. The weight check supports T0 as T+'s DPO reference but
+        # does not verify it, so the configs carry it as an explicit assumption with its evidence.
+        evidence = json.loads((work/ROOT/'teacher_reference_evidence.json').read_text(encoding='utf-8'))
+        verified = False
+        assumption = {'status':'assumed','claim':"T0 is T+'s actual DPO reference",
+                      'evidence':{'relative_l2_distance':evidence['relative_l2_distance'],'rule':evidence['rule']},
+                      'not_verified_because':'T+ publishes no adapter, reference model name or training config'}
         checkpoints = {role:{'path':source['repo'],'revision':source['revision']} for role,source in HDA_CHECKPOINTS.items()}
     elif HUB:
         # Hub teachers load from their pinned commits; verification is the weight check above.
@@ -430,7 +440,7 @@ def write_pilot_configs() -> dict[str,str]:
     for variant in VARIANTS:
         path = work/f'{ROOT}/configs/{variant}.json'
         path.parent.mkdir(parents=True,exist_ok=True)
-        cfg = pilot_config(protocol,variant,checkpoints,_revisions(),split,verified,RUN_PAIR)
+        cfg = pilot_config(protocol,variant,checkpoints,_revisions(),split,verified,RUN_PAIR,assumption)
         if SIZES:
             cfg.update({k:SIZES[k] for k in ('steps','batch_size','selection_interval','states_per_prompt',
                                              'policy_microbatch_size','selection_baseline','max_prompt_tokens') if k in SIZES})
@@ -457,10 +467,11 @@ def write_pilot_configs() -> dict[str,str]:
 @app.function(cpu=4.0,memory=49152,timeout=2*3600,**{k:v for k,v in common.items() if k != 'timeout'})
 def verify_hda_teachers(revision: str) -> dict:
     """hda trio: T+ has no published LoRA, so check from the weights that T0 is nearer to T+ than the
-    Base checkpoint it was trained from and the official Qwen3-1.7B (CPU). Evidence, not proof."""
+    Base checkpoint it was trained from and the official Qwen3-1.7B (CPU). This supports, but does not
+    verify, that T0 was T+'s DPO reference: runs record it as an assumption, never as verified."""
     volume.reload()
-    out = workdir()/ROOT/'teacher_verification.json'
-    if out.exists() and json.loads(out.read_text(encoding='utf-8'))['verified']:
+    out = workdir()/ROOT/'teacher_reference_evidence.json'
+    if out.exists() and json.loads(out.read_text(encoding='utf-8'))['supported']:
         print('skip verify_hda_teachers',flush=True)
         return json.loads(out.read_text(encoding='utf-8'))
     sys.path.insert(0,str(workdir()))
@@ -474,10 +485,10 @@ def verify_hda_teachers(revision: str) -> dict:
                                folder(HDA_CHECKPOINTS['teacher_base']['repo'],HDA_CHECKPOINTS['teacher_base']['revision']),
                                {'qwen3_1p7b_base':folder(TEACHER_BASE_MODEL,revisions['qwen3_1p7b_base']),
                                 'qwen3_1p7b':folder('Qwen/Qwen3-1.7B',revisions['qwen3_1p7b'])})
-    report = {**report,'verified':report['nearest'],'sources':HDA_CHECKPOINTS,'code_revision':revision}
-    print(json.dumps({'teacher_verification':{k:v for k,v in report.items() if k != 'sources'}}),flush=True)
-    if not report['verified']:
-        write_json(out.with_name('teacher_verification.failed.json'),report)
+    report = {**report,'supported':report['nearest'],'verified':False,'sources':HDA_CHECKPOINTS,'code_revision':revision}
+    print(json.dumps({'teacher_reference_evidence':{k:v for k,v in report.items() if k != 'sources'}}),flush=True)
+    if not report['supported']:
+        write_json(out.with_name('teacher_reference_evidence.failed.json'),report)
         volume.commit()
         raise ValueError('T0 is not the nearest candidate to T+; refusing to use the hda teacher pair')
     write_json(out,report)
@@ -514,7 +525,7 @@ def train_variants(revision: str) -> None:
     runs = [(variant,run_name(variant,alpha)) for variant in VARIANTS for alpha in ALPHAS] or [(v,v) for v in VARIANTS]
     for variant,name in runs:
         config = json.loads((workdir()/configs[name]).read_text(encoding='utf-8'))
-        if finished(config,'diagnostics.json') or (SWEEP_LITE and finished(config,'student/config.json')):
+        if finished(config,'diagnostics.json',revision) or (SWEEP_LITE and finished(config,'student/config.json',revision)):
             print('skip',name,flush=True)
         else:
             stages = (('validate-config','collect-prefixes','collect-candidates','collect-correction','fit-head',

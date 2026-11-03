@@ -85,7 +85,12 @@ def validate(cfg: dict[str,Any]) -> None:
             if not model.get('path') or not model.get('revision'):
                 raise ValueError(f'exact path and revision required for {role}')
         if not cfg.get('teacher_dpo_reference_verified',False):
-            raise ValueError('actual teacher DPO reference must be verified')
+            # A pilot may run on an explicitly recorded assumption instead (published T+ whose DPO reference is
+            # undocumented); it is never reported as verified.
+            assumption = cfg.get('teacher_dpo_reference_assumption') or {}
+            if not (cfg.get('pilot') and assumption.get('status') == 'assumed' and assumption.get('evidence')):
+                raise ValueError('actual teacher DPO reference must be verified (a pilot may instead record '
+                                 'teacher_dpo_reference_assumption with status "assumed" and its evidence)')
         if not cfg.get('selection',{}).get('reward_model_revision'):
             raise ValueError('pin selection reward model revision')
 

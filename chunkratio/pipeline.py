@@ -12,7 +12,7 @@ from typing import Any
 
 import torch
 
-from .artifacts import ShardStore, digest, read_jsonl, stage_key, write_json
+from .artifacts import ShardStore, code_revision, digest, read_jsonl, source_digest, stage_key, write_json
 from .config import collection_seed
 from .collection import (collect_candidates, collect_correction, collect_prefixes, correction_features,
                          prepare_prompts)
@@ -26,25 +26,6 @@ from .scoring import fingerprint, score_batch
 from .targets import build_targets
 from .training import ChunkRatioTrainer
 from .value_head import fit_head, save_tensor
-
-
-def source_digest(package: Path | None = None) -> str:
-    """sha256 of the package's .py sources with LF line endings (Windows checkouts and containers agree)."""
-    package = package or Path(__file__).resolve().parent
-    h = hashlib.sha256()
-    for path in sorted(package.rglob('*.py')):
-        h.update(path.relative_to(package).as_posix().encode()+b'\0')
-        h.update(path.read_bytes().replace(b'\r\n',b'\n')+b'\0')
-    return h.hexdigest()
-
-
-def code_revision() -> str:
-    """Commit plus a hash of the chunkratio sources, so two uncommitted versions never share a revision
-    (and therefore never share cache keys). Containers without .git (Modal) pass the commit computed
-    where the code was uploaded; the source hash is taken from the code that actually runs."""
-    root = Path(__file__).resolve().parents[1]
-    commit = os.environ.get('CRPD_CODE_REVISION') or subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip()
-    return f'{commit}+src.{source_digest()[:16]}'
 
 
 def eligible_prompts(cfg: dict[str,Any], models: dict[str,Any], tokenizers: list[Any]) -> tuple[list[dict[str,Any]],list[str]]:

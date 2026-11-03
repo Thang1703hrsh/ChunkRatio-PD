@@ -97,15 +97,19 @@ def done(path: str) -> bool:
     return (workdir()/path).exists()
 
 
-def finished(config: dict, marker: str) -> bool:
-    """A CRPD run is finished only if its marker exists and it ran exactly this config; an output folder
-    holding another config's results is an error, not a skip."""
+def finished(config: dict, marker: str, revision: str) -> bool:
+    """A CRPD run is finished only if its marker exists, it ran exactly this config, and its manifest
+    records the code revision this code would record. Another config's results are an error; results
+    of other code are not finished, so the run repeats through its own cache keys."""
     if not done(f"{config['output']}/{marker}"):
         return False
     resolved = workdir()/config['output']/'resolved_config.json'
     if not resolved.exists() or json.loads(resolved.read_text(encoding='utf-8')) != config:
         raise ValueError(f"{config['output']} holds results of a different config; use another output to rerun")
-    return True
+    sys.path.insert(0,str(workdir()))
+    from chunkratio.artifacts import code_revision
+    manifest = workdir()/config['output']/'manifest.json'
+    return manifest.exists() and json.loads(manifest.read_text(encoding='utf-8')).get('code_revision') == code_revision(revision)
 
 
 def _revisions() -> dict:
@@ -245,7 +249,7 @@ def train_variants(revision: str) -> None:
     configs = write_pilot_configs()
     for variant in VARIANTS:
         config = json.loads((workdir()/configs[variant]).read_text(encoding='utf-8'))
-        if finished(config,'diagnostics.json'):
+        if finished(config,'diagnostics.json',revision):
             print('skip',variant,flush=True)
             continue
         crpd(revision,'evaluate','--config',configs[variant])

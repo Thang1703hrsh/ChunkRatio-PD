@@ -185,3 +185,13 @@ def test_correction_audit_reads_sibling_differences() -> None:
     assert endpoints['states'] == 1 and endpoints['endpoints'] == 3
     assert abs(endpoints['all']['corr']-1) < 1e-12 and abs(endpoints['all']['r2']-1) < 1e-12
     assert endpoints['rho']['n'] == 2 and endpoints['teacher']['n'] == 1
+    # Centred over the state, each source's subset is not centred: here both sources are perfectly
+    # anti-correlated (Pearson -1) while the pooled sample is +0.8; an uncentred product reported +0.8 for both.
+    rows = [{'seed':state,'labels':[0.],'budgets':[1.],'value':0.}]
+    for i,(mu,label,source) in enumerate(((1.,2.,'student_ref'),(2.,1.,'student_ref'),
+                                          (-1.,-2.,'teacher_plus'),(-2.,-1.,'teacher_plus'))):
+        rows.append({'seed':{**state,'id':f'f{i}','prefix_ids':[1,2,7+i],'seed_source':[source]},
+                     'labels':[label],'budgets':[.5],'value':mu})
+    split = correction_audit(pairs,rows,FirstFeature(),features,0)['endpoints']
+    assert abs(split['all']['corr']-.8) < 1e-12
+    assert abs(split['rho']['corr']+1) < 1e-12 and abs(split['teacher']['corr']+1) < 1e-12
