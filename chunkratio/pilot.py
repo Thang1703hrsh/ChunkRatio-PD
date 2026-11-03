@@ -24,7 +24,8 @@ SUBSET = {'train':2000,'head_val':200,'select':64}
 SFT_RECIPE = {'epochs':3,'learning_rate':2e-5,'batch_size':128}
 DPO_RECIPE = {'epochs':2,'learning_rate':5e-7,'batch_size':128,'beta':.05}
 # Tuned policy settings (not NARVAL's): peak lr 1e-6 with 10% warmup and cosine decay averages
-# about 5.5e-7, close to the NARVAL launcher's 5e-7; bf16 autocast and microbatches change speed only.
+# about 5.5e-7, close to the NARVAL launcher's 5e-7; microbatches change speed only, and bf16 autocast
+# also rounds the policy forwards (student and rho alike, so the margin still starts at zero).
 POLICY_TUNING = {'learning_rate':1e-6,'lr_schedule':'cosine','warmup_ratio':.1,
                  'policy_autocast_dtype':'bfloat16','policy_microbatch_size':8}
 PILOT_ASSUMPTIONS = {
@@ -34,7 +35,8 @@ PILOT_ASSUMPTIONS = {
     'teacher_dpo_recipe':'beta 0.05, lr 5e-7, 2 epochs, effective batch 128, max_length 2048, all UltraFeedback train_prefs',
     'sft_data':('Deita-10K-V0 ShareGPT rows; latest assistant turn whose conversation fits 2048 tokens supervised '
                 '(earlier turns as context, no response cut); first answer per prompt kept'),
-    'precision':'SFT/DPO and student forwards under bf16 autocast with FP32 weights/optimizer; frozen scoring FP32',
+    'precision':('SFT/DPO and policy forwards (student and rho) under bf16 autocast with FP32 weights/optimizer; '
+                 'collection and target scoring FP32'),
     'policy_tuning':'lr 1e-6 peak, 10% linear warmup, cosine decay, policy microbatch 8; alpha 0.3 unchanged',
     'pilot_subset':f'{SUBSET} prompts per split, ranked by sha256([seed, pilot, group_id])',
     'selection':'FsfairX RM on 64 select prompts every 250 steps (greedy, 1024 new tokens)',
@@ -87,12 +89,43 @@ HUB_ASSUMPTIONS = {
 }
 
 
+# NARVAL-matching published trio (pinned revisions, 3 November 2026): Deita SFT of Qwen3-1.7B-Base (T0),
+# its UltraFeedback DPO (T+) and a Deita SFT of Qwen3-0.6B-Base (rho). All three share one tokenizer and
+# a plain ChatML template whose assistant turns end with <|im_end|>; the tokenizers declare <|endoftext|>,
+# so <|im_end|> is set as EOS when loading. On Winogrande and TruthfulQA-MC2 the 1.7B pair reproduces the
+# NARVAL Table 1 teacher rows within 0.6 points (script/modal/benchmark_eval.py).
+HDA_CHECKPOINTS = {
+    'teacher_base':{'repo':'hoangducanh1865/qwen3-1.7b-deita-sft-student','revision':'52f7c14ea4893128252ada7a365c957813820070'},
+    'teacher_plus':{'repo':'hoangducanh1865/qwen3-1.7b-ultrafeedback-dpo-teacher','revision':'97a6de251a5e3f78494c6892fb4fbdf9b53c9f04'},
+    'student_ref':{'repo':'hoangducanh1865/qwen3-0.6b-deita-sft-student','revision':'fc0f225cb63e5db6e84a7e5705c997891ec85d65'},
+}
+HDA_PAIR = PAIR+'_hda'
+PAIRS[HDA_PAIR] = {'teacher':HDA_CHECKPOINTS['teacher_base']['repo'],'student':HDA_CHECKPOINTS['student_ref']['repo'],
+                   'tokenizer':HDA_CHECKPOINTS['teacher_base']['repo'],'eos':EOS_TOKEN,
+                   'chat_template_kwargs':{'enable_thinking':False},'gated':False,'generation_batch_size':32}
+HDA_ASSUMPTIONS = {
+    **{k:v for k,v in PILOT_ASSUMPTIONS.items() if k not in ('teacher_pair','teacher_dpo_recipe','sft_data','sft_recipe',
+                                                             'base_checkpoints')},
+    'base_checkpoints':'all three roles are published checkpoints; nothing is trained before CRPD',
+    'teacher_pair':('T0 = hoangducanh1865/qwen3-1.7b-deita-sft-student (Deita-10k SFT of Qwen3-1.7B-Base, 1 epoch, '
+                    'lr 3e-5, per its model card); T+ = hoangducanh1865/qwen3-1.7b-ultrafeedback-dpo-teacher (1 epoch '
+                    'DPO on 57,673 UltraFeedback pairs per its trainer_state; no model card). That T0 was T+\'s DPO '
+                    'reference is not documented: the launcher only checks that T0 is the nearest candidate to T+ '
+                    'in weight space'),
+    'sft_data':'rho: hoangducanh1865/qwen3-0.6b-deita-sft-student (Deita SFT of Qwen3-0.6B-Base), not trained here',
+    'sft_recipe':'not applicable (published rho)',
+    'eos':'<|im_end|> for every role (end of each assistant turn in the shared template; tokenizers declare <|endoftext|>)',
+}
+
+
 def pilot_assumptions(pair: str = PAIR) -> dict[str,str]:
     """Unverified settings of one pair's pilot (the default pair keeps PILOT_ASSUMPTIONS exactly)."""
     if pair == PAIR:
         return PILOT_ASSUMPTIONS
     if pair == HUB_PAIR:
         return HUB_ASSUMPTIONS
+    if pair == HDA_PAIR:
+        return HDA_ASSUMPTIONS
     spec = PAIRS[pair]
     return {**PILOT_ASSUMPTIONS,
             'base_checkpoints':f"{spec['teacher']} and {spec['student']} (Base vs post-trained is an open NARVAL input)",
@@ -137,6 +170,8 @@ def pilot_config(protocol: dict[str,Any], variant: str, checkpoints: dict[str,di
     root = f'output/narval/{pair}/pilot'
     deviation = ('teacher pair trained directly from Qwen3-1.7B-Base, not taken from the 8B->1.7B protocol' if pair == PAIR
                  else 'published teacher pair (T+ = T0 + LoRA, checked from weights), not NARVAL\'s checkpoints' if pair == HUB_PAIR
+                 else ('published T0/T+/rho trio matching NARVAL Table 1 on two benchmarks; T+\'s DPO reference is '
+                       'checked only as the nearest candidate in weight space') if pair == HDA_PAIR
                  else f"teacher pair trained from {spec['teacher']} with the assumed recipe, not NARVAL's checkpoints")
     cfg.update(pilot=True,variant=variant,output=f'{root}/{variant}/seed0',cache_root=f'{root}/cache',
                prompts=f'data/narval/{pair}/ultrafeedback_train_pilot.jsonl',selection_interval=250,

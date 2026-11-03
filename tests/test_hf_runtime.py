@@ -76,6 +76,20 @@ def test_hf_llama_scoring_padding_and_features(tmp_path: Path) -> None:
     torch.testing.assert_close(padded[0],state_features(model,[[1,2,3]])[0],atol=1e-5,rtol=0)
 
 
+def test_hf_batched_correction_scoring(tmp_path: Path) -> None:
+    """Left padding with position ids and tail-only logits match per-trajectory Llama scoring (§§6.2,7.3)."""
+    from chunkratio.scoring import continuation_increments, continuation_increments_batch, trajectory_features_batch
+    paths = checkpoints(tmp_path)
+    model = transformers.LlamaForCausalLM.from_pretrained(paths['student_ref']).eval()
+    prefixes, suffixes = [[1,2,3],[1,4],[2,3,4,5,6]], [[5,6,0],[7],[8,9,10,11]]
+    for budget in (6,8192):
+        increments = continuation_increments_batch(model,prefixes,suffixes,0,budget)
+        features = trajectory_features_batch(model,prefixes,suffixes,budget)
+        for prefix,suffix,got,feature in zip(prefixes,suffixes,increments,features):
+            torch.testing.assert_close(got,continuation_increments(model,prefix,suffix,0),atol=1e-5,rtol=0)
+            torch.testing.assert_close(feature,trajectory_features(model,prefix,suffix),atol=1e-5,rtol=0)
+
+
 def test_hf_pipeline_routes_through_targets(tmp_path: Path) -> None:
     """Non-synthetic load, preflight, routing and stages to frozen targets on real HF classes (§§4.1,10)."""
     paths = checkpoints(tmp_path)
@@ -249,6 +263,20 @@ def test_qwen3_preflight_eos_padded_vocab_and_sampling(tmp_path: Path) -> None:
     padded = transformers.Qwen3ForCausalLM(transformers.Qwen3Config(**{**student.config.to_dict(),'vocab_size':32}))
     with pytest.raises(ValueError,match='padded output vocabulary'):
         preflight(tokenizers,roles[:3]+[padded],'<|im_end|>')
+
+
+def test_declared_eos_replaces_tokenizer_eos(tmp_path: Path) -> None:
+    """Published Qwen3 SFTs declare <|endoftext|> but end turns with <|im_end|>: the config's eos_token wins."""
+    from chunkratio.models import load_models
+    cfg,paths = qwen_config(tmp_path)
+    for path in paths.values():
+        tok = transformers.AutoTokenizer.from_pretrained(path)
+        tok.eos_token = '<|endoftext|>'
+        tok.save_pretrained(path)
+    _,_,tokenizers,info = load_models(cfg)
+    assert info['eos'] == tokenizers[0].get_vocab()['<|im_end|>'] and all(t.eos_token == '<|im_end|>' for t in tokenizers)
+    with pytest.raises(ValueError,match='not in the'):
+        load_models({**cfg,'eos_token':'<|not_a_token|>'})
 
 
 def test_prepare_ultrafeedback_qwen3_template(tmp_path: Path) -> None:

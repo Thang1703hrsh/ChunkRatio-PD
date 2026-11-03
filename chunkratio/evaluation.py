@@ -1,6 +1,7 @@
 """Measured CRPD diagnostics, reward selection and research tables (§§8,11)."""
 from __future__ import annotations
 
+import json
 import math
 import random
 import statistics
@@ -15,6 +16,7 @@ METRICS = ('rm','mt_bench','ae_vs_adpa','ae2_lc','ae2_wr','arena_hard',
            'arc','hellaswag','truthfulqa','mmlu','winogrande','gsm8k')
 REFERENCE_ROWS = ('teacher_dpo','teacher_sft','student_sft','student_dpo')
 BASELINES = ('simpo','dpkd','dckd','adpa','tvkd','tbpo_q','tbpo_a')
+TRACKS = ('DPO-MIX-7K','HelpSteer2')
 
 
 def paired_interval(left: dict[str,float], right: dict[str,float], seed: int = 0,
@@ -42,7 +44,7 @@ def report_tables(rows: list[dict[str,Any]], allow_incomplete: bool = False) -> 
             raise ValueError('synthetic diagnostics cannot populate research tables')
         if row.get('split') != 'test':
             raise ValueError('main table requires held-out test outcomes')
-        if row['dataset'] not in ('DPO-MIX-7K','HelpSteer2'):
+        if row['dataset'] not in TRACKS:
             raise ValueError('unexpected preference track')
         for metric,value in row['metrics'].items():
             if metric not in METRICS or not math.isfinite(value):
@@ -60,7 +62,11 @@ def report_tables(rows: list[dict[str,Any]], allow_incomplete: bool = False) -> 
     missing_methods = sorted(required_methods-set(methods))
     if missing_methods and not allow_incomplete:
         raise ValueError('required reference/baseline rows missing: '+', '.join(missing_methods))
-    lines = ['# '+('Partial measured CRPD results' if allow_incomplete else 'Measured CRPD results'),'',
+    present = {(r['method'],r['dataset']) for r in normalized}
+    missing_tracks = [f'{m} / {d}' for m in methods for d in TRACKS if (m,d) not in present]
+    if missing_tracks and not allow_incomplete:
+        raise ValueError('method/track rows missing: '+', '.join(missing_tracks))
+    lines =['# '+('Partial measured CRPD results' if allow_incomplete else 'Measured CRPD results'),'',
              'Training seeds remain separate from prompt-bootstrap uncertainty. Missing values are not estimates.','',
              '| Method | DPO-MIX-7K: RM / MT / AE-vs-ADPA / AE2-LC / OLL | HelpSteer2: RM / MT / AE-vs-ADPA / AE2-LC / OLL | GPU-h |',
              '|---|---|---|---|']
@@ -68,7 +74,7 @@ def report_tables(rows: list[dict[str,Any]], allow_incomplete: bool = False) -> 
                  '|---|---|---|---|---|---|---|---|---|']
     for method in methods:
         cells, costs = [],[]
-        for dataset in ('DPO-MIX-7K','HelpSteer2'):
+        for dataset in TRACKS:
             subset = [r for r in normalized if r['method'] == method and r['dataset'] == dataset]
             if not subset:
                 cells.append('missing')
@@ -90,7 +96,7 @@ def report_tables(rows: list[dict[str,Any]], allow_incomplete: bool = False) -> 
     seed_variation = ['','| Method / track | Metric | Training seeds | Mean | Between-seed sample SD |',
                       '|---|---|---|---|---|']
     for method in methods:
-        for dataset in ('DPO-MIX-7K','HelpSteer2'):
+        for dataset in TRACKS:
             subset = [r for r in normalized if r['method'] == method and r['dataset'] == dataset]
             for metric in METRICS:
                 values = [r['metrics'][metric] for r in subset if metric in r['metrics']]
@@ -130,6 +136,8 @@ def reward_selector(cfg: dict[str,Any], prompts: list[dict[str,Any]], tokenizer:
             rm.to('cpu')
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+        # Per-prompt rewards in select-row order, for paired comparisons between checkpoints and rho.
+        select.last_scores = list(scores)
         return statistics.mean(scores)
 
     def score_rows(student: Any, scores: list[float]) -> None:
@@ -227,6 +235,24 @@ def report_narval(measured: list[dict[str,Any]], reported: list[dict[str,Any]], 
             raise ValueError('unknown or nonfinite NARVAL metric')
     if not measured and not allow_incomplete:
         raise ValueError('no measured rows; use --allow-incomplete for a reported-only layout check')
+    # One row per (method, pair, seed); a repeated seed would weigh twice in the mean.
+    keys = [(r['method'],r['pair'],r.get('seed')) for r in measured]
+    if any(seed is None for _,_,seed in keys):
+        raise ValueError('measured NARVAL rows need a training seed')
+    if len(set(keys)) != len(keys):
+        raise ValueError('duplicate measured NARVAL row for one method, pair and seed')
+    if len({json.dumps(r.get('protocol'),sort_keys=True) for r in measured}) > 1:
+        raise ValueError('measured NARVAL rows use incomparable evaluation protocols')
+    if not allow_incomplete:
+        required = {m for m,_ in NARVAL_OPEN_LLM}|{m for m,_ in NARVAL_TABLE2}
+        partial = sorted({f'{m}/{p}/seed {s}' for (m,p,s),r in zip(keys,measured) if set(r['metrics']) != required})
+        if partial:
+            raise ValueError('every NARVAL metric is required; use --allow-incomplete for a labelled partial report: '
+                             +', '.join(partial))
+        seeds = {(m,p):{s for mm,pp,s in keys if (mm,pp) == (m,p)} for m,p,_ in keys}
+        few = sorted(f'{m}/{p}' for (m,p),s in seeds.items() if m in ('crpd_main','crpd_raw') and len(s) < 3)
+        if few:
+            raise ValueError('at least three training seeds required for '+', '.join(few))
     lines = ['# NARVAL-comparable results'+('' if measured and not allow_incomplete else ' (incomplete)'),'',
              'Disclosure: crpd_main uses prompts only (labels come from the teacher pair); label-using baselines '
              'see human pairs, and crpd_anchor is the like-for-like comparison.',

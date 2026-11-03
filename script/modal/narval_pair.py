@@ -97,6 +97,17 @@ def done(path: str) -> bool:
     return (workdir()/path).exists()
 
 
+def finished(config: dict, marker: str) -> bool:
+    """A CRPD run is finished only if its marker exists and it ran exactly this config; an output folder
+    holding another config's results is an error, not a skip."""
+    if not done(f"{config['output']}/{marker}"):
+        return False
+    resolved = workdir()/config['output']/'resolved_config.json'
+    if not resolved.exists() or json.loads(resolved.read_text(encoding='utf-8')) != config:
+        raise ValueError(f"{config['output']} holds results of a different config; use another output to rerun")
+    return True
+
+
 def _revisions() -> dict:
     """Revisions pinned by prepare()."""
     return json.loads((workdir()/DATA/'revisions.json').read_text(encoding='utf-8'))
@@ -234,7 +245,7 @@ def train_variants(revision: str) -> None:
     configs = write_pilot_configs()
     for variant in VARIANTS:
         config = json.loads((workdir()/configs[variant]).read_text(encoding='utf-8'))
-        if done(f"{config['output']}/diagnostics.json"):
+        if finished(config,'diagnostics.json'):
             print('skip',variant,flush=True)
             continue
         crpd(revision,'evaluate','--config',configs[variant])

@@ -12,11 +12,11 @@ from typing import Any
 import torch
 from torch import nn
 
-from .artifacts import ShardStore, atomic_bytes, digest, write_json
+from .artifacts import ShardStore, atomic_bytes, digest, stage_key, write_json
 from .collection import collect_prefixes
 from .config import collection_seed
 from .sampling import generate_batch, stream, terminal
-from .scoring import continuation_increments
+from .scoring import continuation_increments, fingerprint
 
 
 def gap_statistics(values: list[float], seed: int, name: str, bootstrap: int = 200) -> dict[str,Any]:
@@ -115,20 +115,27 @@ def state_report(models: dict[str,nn.Module], state: dict[str,Any], cfg: dict[st
 def diagnose(cfg: dict[str,Any], n_prompts: int, replicates: int, output: Path) -> dict[str,Any]:
     """Run on the first N eligible train prompts (sorted ids) and their pre-registered states."""
     from .models import load_models
-    from .pipeline import eligible_prompts
+    from .pipeline import code_revision, eligible_prompts
     if n_prompts <= 0 or replicates < 2:
         raise ValueError('need at least one prompt and two replicates')
     models,_,tokenizers,info = load_models(cfg)
     prompts,ineligible = eligible_prompts(cfg,models,tokenizers)
     chosen = [p for p in prompts if p['split'] == 'train'][:n_prompts]
-    store = ShardStore(output/'prefixes',{'collection_seed':collection_seed(cfg),'horizon':cfg['horizon'],
-                                          'chunk_length':cfg['chunk_length'],'states_per_prompt':cfg.get('states_per_prompt')})
+    identities = {role:fingerprint(model) for role,model in models.items()}
+    revision = code_revision()
+    # Same identity as the pipeline's stage keys (§10): a changed rho, tokenizer, prompt set or code
+    # collects afresh next to the old shards instead of resuming prefixes it did not generate.
+    metadata = {'models':identities,'tokenizer':info,'split_hash':digest(prompts),'code_revision':revision,
+                'collection_seed':collection_seed(cfg),'horizon':cfg['horizon'],
+                'chunk_length':cfg['chunk_length'],'states_per_prompt':cfg.get('states_per_prompt')}
+    store = ShardStore(output/stage_key('prefixes',metadata),metadata)
     states = collect_prefixes(chosen,models['student_ref'],{**cfg,'variant':'crpd_main'},info['eos'],store)
     states = [s for s in states if s['prompt_id'] in {p['id'] for p in chosen}]
     reports = state_reports(models,states,cfg,info['eos'],replicates)
     summary = {'label':'DIAGNOSTIC ONLY: displacement/Jensen-gap estimates, not a result',
                'prompts':len(chosen),'states':len(reports),'replicates':replicates,
                'ineligible_prompts':ineligible,'collection_seed':collection_seed(cfg),
+               'models':identities,'tokenizer':info,'code_revision':revision,
                'mean_abs_d_mean':sum(abs(r['mean']) for r in reports)/len(reports),
                'mean_jensen_gap':sum(r['jensen_gap'] for r in reports)/len(reports),
                'mean_omega_s':_mean([r['omega_s'] for r in reports if r['omega_s'] is not None]),
@@ -150,3 +157,104 @@ def diagnose(cfg: dict[str,Any], n_prompts: int, replicates: int, output: Path) 
 def _mean(values: list[float]) -> float | None:
     """Mean or None for an empty list."""
     return sum(values)/len(values) if values else None
+
+
+def _source(candidate: dict[str,Any]) -> str:
+    """rho, teacher or both, from the roles that proposed a candidate or endpoint."""
+    sources = set(candidate['sources'] if 'sources' in candidate else candidate['seed_source'])
+    return 'both' if len(sources) > 1 else 'rho' if sources == {'student_ref'} else 'teacher'
+
+
+def _corr_r2(predictions: list[float], labels: list[float]) -> dict[str,float | None]:
+    """Pearson correlation and R^2 of already-centred values (None when either side is constant)."""
+    spp,syy = sum(p*p for p in predictions),sum(y*y for y in labels)
+    if not predictions or spp == 0 or syy == 0:
+        return {'corr':None,'r2':None}
+    spy = sum(p*y for p,y in zip(predictions,labels))
+    return {'corr':spy/math.sqrt(spp*syy),'r2':1-sum((p-y)**2 for p,y in zip(predictions,labels))/syy}
+
+
+def correction_audit(pairs: list[dict[str,Any]], corrections: list[dict[str,Any]], head: nn.Module | None,
+                     features: Any, seed: int, bootstrap: int = 200) -> dict[str,Any]:
+    """Sibling view of the endpoint correction mu_hat; a diagnostic only (head objective and selection unchanged).
+
+    Pair targets use t_c - t_d, so what matters is mu_hat(sc) - mu_hat(sd), not the level of mu_hat. Pairs:
+    spread of mu_hat differences against delta_T differences and the measure-weighted share of pairs whose
+    preferred side mu_hat flips, by proposing sources. head_val corrections: endpoints extending the same
+    state, centred per state, compare mu_hat with their single-rollout returns (correlation, R^2) by endpoint
+    source, with prompt-bootstrap 95% intervals. One rollout per endpoint makes these lower bounds.
+    """
+    def spread(values: list[float]) -> float | None:
+        """Population standard deviation."""
+        if not values:
+            return None
+        mean = sum(values)/len(values)
+        return math.sqrt(sum((v-mean)**2 for v in values)/len(values))
+    groups: dict[str,list[tuple[float,float,float]]] = {}
+    for pair in pairs:
+        delta = [pair[s]['logp_teacher_plus']-pair[s]['logp_teacher_base'] for s in ('c','d')]
+        mu = [pair[s].get('endpoint_mu',0.) for s in ('c','d')]
+        kind = '+'.join(sorted(_source(pair[s]) for s in ('c','d')))
+        for key in ('all',kind):
+            groups.setdefault(key,[]).append((delta[0]-delta[1],mu[0]-mu[1],pair['weight']))
+    report: dict[str,Any] = {'pairs':{}}
+    for key,rows in sorted(groups.items()):
+        weight = sum(w for *_,w in rows)
+        flipped = sum(w for d,m,w in rows if d*(d+m) < 0)
+        report['pairs'][key] = {'n':len(rows),'sd_delta_difference':spread([d for d,_,_ in rows]),
+                                'sd_mu_difference':spread([m for _,m,_ in rows]),
+                                'flip_share':flipped/weight if weight else None}
+    if head is None:
+        report['endpoints'] = None
+        return report
+    # Endpoint -> parent state: the longest prefix seed of the same prompt whose ids start the endpoint's.
+    prefixes: dict[str,list[dict[str,Any]]] = {}
+    for row in corrections:
+        if row['seed'].get('seed_source') == 'prefix':
+            prefixes.setdefault(row['seed']['prompt_id'],[]).append(row['seed'])
+    siblings: dict[str,list[tuple[str,str,float,float]]] = {}
+    with torch.no_grad():
+        for row in corrections:
+            seed_row = row['seed']
+            if seed_row.get('seed_source') == 'prefix' or not row['labels']:
+                continue
+            ids = seed_row['prefix_ids']
+            parents = [s for s in prefixes.get(seed_row['prompt_id'],[]) if len(s['prefix_ids']) < len(ids)
+                       and ids[:len(s['prefix_ids'])] == s['prefix_ids']]
+            if not parents:
+                continue
+            parent = max(parents,key=lambda s:len(s['prefix_ids']))
+            first = features(row)[:1].float()
+            device = next(head.parameters()).device
+            mu = float(head(first.to(device),torch.tensor(row['budgets'][:1],device=device)))
+            siblings.setdefault(parent['id'],[]).append((seed_row['prompt_id'],_source(seed_row),mu,row['labels'][0]))
+    centred = []
+    for members in siblings.values():
+        if len(members) < 2:
+            continue
+        mean_mu = sum(m for *_,m,_ in members)/len(members)
+        mean_y = sum(y for *_,y in members)/len(members)
+        centred += [(prompt,source,mu-mean_mu,y-mean_y) for prompt,source,mu,y in members]
+    rng = torch.Generator().manual_seed(seed+919)
+    prompts = sorted({p for p,*_ in centred})
+    report['endpoints'] = {'states':sum(len(m) >= 2 for m in siblings.values()),'endpoints':len(centred),
+                           'note':'single rollout per endpoint: correlations understate how well mu_hat tracks the true value'}
+    for key in ('all','rho','teacher','both'):
+        rows = [r for r in centred if key == 'all' or r[1] == key]
+        stats = {'n':len(rows),**_corr_r2([r[2] for r in rows],[r[3] for r in rows])}
+        by_prompt: dict[str,list[tuple[str,str,float,float]]] = {}
+        for r in rows:
+            by_prompt.setdefault(r[0],[]).append(r)
+        if stats['corr'] is not None and len(prompts) > 1:
+            draws = []
+            for _ in range(bootstrap):
+                sample = [prompts[i] for i in torch.randint(len(prompts),(len(prompts),),generator=rng).tolist()]
+                chosen = [r for p in sample for r in by_prompt.get(p,[])]
+                value = _corr_r2([r[2] for r in chosen],[r[3] for r in chosen])['corr']
+                if value is not None:
+                    draws.append(value)
+            draws.sort()
+            if draws:
+                stats['corr_95'] = [draws[int(.025*(len(draws)-1))],draws[int(.975*(len(draws)-1))]]
+        report['endpoints'][key] = stats
+    return report

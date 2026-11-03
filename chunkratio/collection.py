@@ -14,7 +14,7 @@ from .artifacts import ShardStore, digest, read_jsonl
 from .config import collection_seed
 from .math import suffix_returns
 from .sampling import generate_batch, stream, terminal
-from .scoring import continuation_increments, score_batch, trajectory_features
+from .scoring import continuation_increments_batch, score_batch, trajectory_features_batch
 
 
 @contextlib.contextmanager
@@ -27,24 +27,44 @@ def record_errors(kind: str, record_id: str) -> Iterator[None]:
 
 
 def prepare_prompts(records: list[dict[str,Any]], seed: int) -> list[dict[str,Any]]:
-    """Group duplicate canonical token prompts before generation; reject split leakage (§7.1)."""
-    groups: dict[str,dict[str,Any]] = {}
-    for original in records:
-        row = copy.deepcopy(original)
+    """Group duplicate canonical token prompts before generation; reject split leakage (§7.1).
+
+    Rows that share token ids or a group_id belong to one duplicate group, transitively over the whole
+    input (union-find): prompt X in groups A and B links A and B, so B's other prompts must share X's
+    split. Every alias stays in the group before any row is deduplicated.
+    """
+    rows = [copy.deepcopy(original) for original in records]
+    parent: dict[tuple[str,str],tuple[str,str]] = {}
+    def find(node: tuple[str,str]) -> tuple[str,str]:
+        """Root of a node, halving the path as it goes."""
+        parent.setdefault(node,node)
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+    for row in rows:
         assert row['prompt_ids'] and all(isinstance(i,int) and i >= 0 for i in row['prompt_ids'])
-        key = digest(row['prompt_ids'])
+        row['id'] = digest(row['prompt_ids'])
         # Explicit duplicate-group IDs can link differently serialized equivalent prompts.
-        group = row.get('group_id',key)
+        row['group_id'] = row.get('group_id',row['id'])
+        parent[find(('prompt',row['id']))] = find(('group',row['group_id']))
+    aliases: dict[tuple[str,str],set[str]] = {}
+    for row in rows:
+        aliases.setdefault(find(('prompt',row['id'])),set()).add(row['group_id'])
+    splits: dict[tuple[str,str],str] = {}
+    for row in rows:
+        root = find(('prompt',row['id']))
         if 'split' not in row:
-            bucket = int(digest([seed,group])[:8],16)/2**32
+            # One hash per duplicate group (its smallest alias; the row's own id when it has no duplicates).
+            bucket = int(digest([seed,min(aliases[root])])[:8],16)/2**32
             row['split'] = 'train' if bucket < .8 else ('head_val' if bucket < .9 else 'select')
         if row['split'] not in ('train','head_val','select','test'):
             raise ValueError('invalid split')
-        for existing in groups.values():
-            if (existing['group_id'] == group or existing['prompt_ids'] == row['prompt_ids']) and existing['split'] != row['split']:
-                raise ValueError('duplicate prompt group crosses splits')
-        row['group_id'] = group
-        row['id'] = key
+        if splits.setdefault(root,row['split']) != row['split']:
+            raise ValueError('duplicate prompt group crosses splits')
+    groups: dict[str,dict[str,Any]] = {}
+    for row in rows:
+        key = row['id']
         if key in groups:
             if row.get('chosen_ids') != groups[key].get('chosen_ids') or row.get('rejected_ids') != groups[key].get('rejected_ids'):
                 raise ValueError('duplicate prompt with conflicting anchor pair')
@@ -165,21 +185,25 @@ def collect_correction(candidates: list[dict[str,Any]], models: dict[str,nn.Modu
     numerator = 'student_ref' if teacher_direction else 'teacher_plus'
     jobs = [(seed,digest([seed['id'],replica,source])) for seed in correction_seeds(candidates,cfg)
             for replica in range(cfg['correction_replicates'])]
-    pending = [(seed,job_id) for seed,job_id in jobs if store.get(job_id) is None]
+    # Similar prefix lengths share a generation batch (less left padding); every job's tokens come
+    # from its own stream, so the grouping does not change them.
+    pending = sorted((job for job in jobs if store.get(job[1]) is None),key=lambda job:(len(job[0]['prefix_ids']),job[1]))
+    budget = cfg.get('score_tokens_per_batch',8192)
     for group in batches(pending,cfg):
         with record_errors('correction job',','.join(job_id for _,job_id in group)):
             rngs = [stream(collection_seed(cfg),'correction/'+job_id) for _,job_id in group]
             befores = [rng.get_state().tolist() for rng in rngs]
-            suffixes = generate_batch(models[source],[seed['prefix_ids'] for seed,_ in group],
-                                      [cfg['horizon']-seed['n'] for seed,_ in group],eos,rngs)
-        for (seed,job_id),tokens,rng,before in zip(group,suffixes,rngs,befores):
+            prefixes = [seed['prefix_ids'] for seed,_ in group]
+            suffixes = generate_batch(models[source],prefixes,[cfg['horizon']-seed['n'] for seed,_ in group],eos,rngs)
+            # Teacher returns and rho features for the whole group in length-sorted microbatches.
+            numerators = continuation_increments_batch(models[numerator],prefixes,suffixes,eos,budget)
+            bases = continuation_increments_batch(models['teacher_base'],prefixes,suffixes,eos,budget)
+            trajectories = trajectory_features_batch(models['student_ref'],prefixes,suffixes,budget)
+        for (seed,job_id),tokens,rng,before,a,b,features in zip(group,suffixes,rngs,befores,numerators,bases,trajectories):
             with record_errors('correction job',job_id):
-                a = continuation_increments(models[numerator],seed['prefix_ids'],tokens,eos)
-                b = continuation_increments(models['teacher_base'],seed['prefix_ids'],tokens,eos)
                 increments = a.cpu()-b.cpu()
                 labels = suffix_returns(increments)
                 # Binary attachment written first; the JSON commit records its content hash.
-                features = trajectory_features(models['student_ref'],seed['prefix_ids'],tokens)
                 features_sha256 = store.put_tensor(job_id,'features',features)
                 budgets = [(cfg['horizon']-seed['n']-t)/cfg['horizon'] for t in range(len(tokens))]
                 store.put(job_id,{'id':job_id,'seed':seed,'tokens':tokens,'features_sha256':features_sha256,

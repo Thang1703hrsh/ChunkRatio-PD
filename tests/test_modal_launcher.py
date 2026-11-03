@@ -50,6 +50,12 @@ def test_smoke_scale_and_hf_push_switches(monkeypatch) -> None:
     assert stability.APP_NAME == 'crpd-qwen3-pilot-hub-stability' and stability.VARIANTS == ('crpd_main',)
     assert (stability.SIZES['steps'],stability.SIZES['selection_interval'],stability.SIZES['states_per_prompt']) == (150,50,2)
     assert stability.HF_PREFIX.endswith('-hub-stability') and stability.GPU_TAG == ''
+    assert stability.SIZES['policy_microbatch_size'] == hub.SIZES['policy_microbatch_size'] == 4
+    assert stability.SIZES['selection_baseline'] and 'policy_microbatch_size' not in stability.SMOKE_SIZES
+    x10 = load('x10','0')
+    assert x10.APP_NAME == 'crpd-qwen3-pilot-hub-x10' and x10.VARIANTS == ('crpd_main',)
+    assert x10.SIZES['subset'] == {'train':640,'head_val':160,'select':64} and x10.SIZES['max_prompt_tokens'] == 2048
+    assert x10.SIZES['policy_microbatch_size'] == 4 and x10.SIZES['uf_train_rows'] == 10*stability.SIZES['uf_train_rows']
     monkeypatch.setenv('CRPD_GPU','L40S')
     l40s = load('smoke','0')
     assert l40s.GPU_TAG == '-l40s' and l40s.CRPD_GPU == 'L40S'
@@ -59,6 +65,23 @@ def test_smoke_scale_and_hf_push_switches(monkeypatch) -> None:
     with pytest.raises(SystemExit,match='CRPD_TEACHERS'):
         load('full','0')
     monkeypatch.delenv('CRPD_TEACHERS')
+    assert full.ALPHAS == ()
+    monkeypatch.setenv('CRPD_ALPHAS','0.03,0.1')
+    sweep = load('stability','0')
+    assert sweep.ALPHAS == (.03,.1) and sweep.run_name('crpd_main',.03) == 'crpd_main-alpha0p03'
+    assert sweep.APP_NAME == 'crpd-qwen3-pilot-stability'
+    assert "'CRPD_ALPHAS':ALPHA_TEXT" in Path('script/modal/qwen3_pilot.py').read_text(encoding='utf-8')
+    monkeypatch.setenv('CRPD_ALPHAS','0,0.1')
+    with pytest.raises(SystemExit,match='CRPD_ALPHAS'):
+        load('stability','0')
+    monkeypatch.delenv('CRPD_ALPHAS')
+    assert not sweep.SWEEP_LITE
+    monkeypatch.setenv('CRPD_SWEEP_LITE','1')
+    assert load('x10','0').SWEEP_LITE
+    monkeypatch.delenv('CRPD_SWEEP_LITE')
+    monkeypatch.setenv('CRPD_VARIANTS','crpd_raw')
+    assert load('x10','0').VARIANTS == ('crpd_raw',)
+    monkeypatch.delenv('CRPD_VARIANTS')
 
 
 @pytest.mark.parametrize('pair',['qwen3_8b_to_1p7b','llama31_8b_to_llama32_1b'])

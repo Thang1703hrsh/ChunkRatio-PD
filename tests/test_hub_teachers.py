@@ -75,3 +75,24 @@ def test_unsupported_adapter_rejected(tmp_path: Path) -> None:
     (lora/'adapter_config.json').write_text(json.dumps({**config,'use_dora':True}),encoding='utf-8')
     with pytest.raises(ValueError,match='plain LoRA'):
         lora_deltas(lora)
+
+
+def test_nearest_reference_from_weights(tmp_path: Path) -> None:
+    """Without a published LoRA, T0 must be strictly the nearest candidate to T+ (and not T+ itself)."""
+    from chunkratio.hub_teachers import nearest_reference
+    gen = torch.Generator().manual_seed(1)
+    base = {'w':torch.randn(8,8,generator=gen),'lm_head.weight':torch.randn(4,8,generator=gen)}
+    t0 = {k:v+torch.randn(v.shape,generator=gen)*.3 for k,v in base.items()}
+    tplus = {'w':t0['w']+torch.randn(8,8,generator=gen)*.01}  # tied output embedding not stored
+    folders = {}
+    for name,tensors in (('base',base),('t0',t0),('tplus',tplus),('same',tplus)):
+        folders[name] = tmp_path/name
+        folders[name].mkdir()
+        save_file(tensors,str(folders[name]/'model.safetensors'))
+    report = nearest_reference(folders['tplus'],folders['t0'],{'base':folders['base']})
+    assert report['nearest'] and report['relative_l2_distance']['reference'] < report['relative_l2_distance']['base']
+    assert not nearest_reference(folders['tplus'],folders['base'],{'t0':folders['t0']})['nearest']
+    assert not nearest_reference(folders['tplus'],folders['same'],{'base':folders['base']})['nearest']
+    save_file({'other':torch.zeros(2)},str(folders['base']/'model.safetensors'))
+    with pytest.raises(ValueError,match='different tensors'):
+        nearest_reference(folders['tplus'],folders['t0'],{'base':folders['base']})

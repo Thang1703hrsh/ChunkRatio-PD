@@ -65,3 +65,113 @@ def test_student_autocast_keeps_fp32_weights_scores_and_grads() -> None:
     with student_precision({'device':'cpu'}):
         exact = score_batch(model,[[1,2],[3]],[[4,5,6],[2,6]],6,frozen=False)
     assert torch.allclose(scores.detach(),exact.detach(),atol=.1)
+
+
+def margin_trainer(cfg: dict) -> tuple:
+    """Student = exact rho copy, one pair whose cached rho scores are FP32 as collection writes them."""
+    import copy
+    torch = pytest.importorskip('torch')
+    from chunkratio.scoring import score_batch
+    from chunkratio.tiny import TinyLM
+    from chunkratio.training import ChunkRatioTrainer
+    torch.manual_seed(3)
+    rho = TinyLM(vocab_size=7,hidden_size=8)
+    prefix,chunks = [1,2,3],{'c':[4,5,1,2],'d':[2,6]}
+    pair = {'state':{'prefix_ids':prefix,'prompt_id':'p','id':'s'},'weight':1.}
+    for side,tokens in chunks.items():
+        pair[side] = {'tokens':tokens,'target_score':0.,'logp_student_ref':score_batch(rho,[prefix],[tokens],6).item()}
+    prompts = [{'split':'train','prompt_ids':prefix,'chosen_ids':chunks['c'],'rejected_ids':chunks['d']}]
+    trainer = ChunkRatioTrainer(copy.deepcopy(rho),rho,{'route':'reference_mean','pairs':[pair]},prompts,
+                                {'seed':0,'alpha':.3,'device':'cpu','anchor_beta':.05,**cfg},6)
+    return trainer,pair,rho
+
+
+def recorded_margin(trainer: object, pair: dict, monkeypatch: pytest.MonkeyPatch) -> object:
+    """The student margin batch_loss hands to the loss."""
+    import chunkratio.training as training
+    margins = []
+    original = training.pair_loss
+    def spy(*args: object) -> tuple:
+        """Record the margin of the real pair loss."""
+        result = original(*args)
+        margins.append(result[1])
+        return result
+    monkeypatch.setattr(training,'pair_loss',spy)
+    trainer.batch_loss([pair])
+    return margins[0]
+
+
+def test_margin_is_exactly_zero_at_initialization_under_autocast(monkeypatch: pytest.MonkeyPatch) -> None:
+    """a_theta = 0 at student = rho: autocast scores rho the same way instead of comparing with FP32."""
+    trainer,pair,_ = margin_trainer({'policy_autocast_dtype':'bfloat16'})
+    assert (recorded_margin(trainer,pair,monkeypatch) == 0).all()
+
+
+def test_autocast_anchor_is_log2_at_initialization() -> None:
+    """The anchor's rho delta shares the student's precision, so its margin also starts at zero."""
+    import math
+    trainer,_,_ = margin_trainer({'policy_autocast_dtype':'bfloat16','anchor_lambda':.1})
+    assert trainer.anchor_loss().item() == pytest.approx(math.log(2),abs=1e-7)
+
+
+def test_selection_baseline_records_rho_without_competing(tmp_path: object) -> None:
+    """Step 0 holds rho's score; a higher rho score still cannot become the exported checkpoint."""
+    settings = {'steps':2,'optimizer':'AdamW','learning_rate':1e-3,'variant':'crpd_main','batch_size':1,'selection_interval':1}
+    scores = iter([5.,1.,2.])
+    trainer,_,_ = margin_trainer({**settings,'selection_baseline':True})
+    trainer.selector = lambda student: next(scores)
+    result = trainer.train(tmp_path/'with.pt')
+    assert [h['step'] for h in result['history']] == [0,1,2] and result['history'][0]['selection_score'] == 5.
+    assert result['selection_score'] == 2.
+    scores = iter([1.,2.])
+    trainer,_,_ = margin_trainer(settings)
+    trainer.selector = lambda student: next(scores)
+    assert [h['step'] for h in trainer.train(tmp_path/'without.pt')['history']] == [1,2]
+
+
+def test_fp32_policy_keeps_cached_rho_scores(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without autocast the primary path stays as it was: no extra rho forward, cached scores used."""
+    from chunkratio.cost import ForwardMeter
+    trainer,pair,rho = margin_trainer({})
+    meter = ForwardMeter({'rho':rho})
+    margin = recorded_margin(trainer,pair,monkeypatch)
+    meter.close()
+    assert meter.counts['rho']['forward_calls'] == 0
+    assert margin.abs().max() < 1e-5
+
+
+class PromptSelector:
+    """Selector returning preset per-prompt rewards in order, recording them like reward_selector does."""
+
+    def __init__(self, rounds: list[list[float]]) -> None:
+        """Rewards per call."""
+        self.rounds = iter(rounds)
+        self.last_scores: list[float] | None = None
+
+    def __call__(self, student: object) -> float:
+        """Mean of this call's rewards."""
+        self.last_scores = next(self.rounds)
+        return sum(self.last_scores)/len(self.last_scores)
+
+
+def test_selection_reports_paired_gain_and_optional_fallback(tmp_path: object) -> None:
+    """Per-prompt rewards give a paired comparison with rho; the opt-in fallback exports rho when nothing beats it."""
+    from chunkratio.scoring import fingerprint
+    settings = {'steps':2,'optimizer':'AdamW','learning_rate':1e-3,'variant':'crpd_main','batch_size':1,
+                'selection_interval':1,'selection_baseline':True}
+    trainer,_,rho = margin_trainer(settings)
+    trainer.selector = PromptSelector([[1.,1.,1.],[2.,0.,1.],[3.,2.,1.]])
+    result = trainer.train(tmp_path/'gain.pt')
+    assert result['improved_over_reference'] and result['selected'] == 'checkpoint'
+    paired = result['paired_vs_reference']
+    assert paired['step'] == 2 and paired['mean_difference'] == 1. and (paired['wins'],paired['losses']) == (2,0)
+    assert result['history'][0]['selection_prompt_scores'] == [1.,1.,1.]
+    trainer,_,rho = margin_trainer({**settings,'selection_fallback_to_reference':True})
+    trainer.selector = PromptSelector([[5.,5.],[1.,2.],[2.,1.]])
+    result = trainer.train(tmp_path/'fallback.pt')
+    assert result['improved_over_reference'] is False and result['selected'] == 'reference'
+    assert fingerprint(trainer.student) == fingerprint(rho)
+    trainer,_,_ = margin_trainer({**settings,'selection_baseline':False,'selection_fallback_to_reference':True})
+    trainer.selector = PromptSelector([[1.]])
+    with pytest.raises(ValueError,match='needs selection_baseline'):
+        trainer.train(tmp_path/'invalid.pt')

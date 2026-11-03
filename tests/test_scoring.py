@@ -3,8 +3,8 @@ import pytest
 
 torch = pytest.importorskip('torch',reason='PyTorch unavailable for active interpreter')
 from chunkratio.sampling import generate, stream
-from chunkratio.scoring import (continuation_increments, fingerprint, score_batch, score_tokens, state_features,
-                                trajectory_features)
+from chunkratio.scoring import (continuation_increments, continuation_increments_batch, fingerprint, score_batch,
+                                score_tokens, state_features, trajectory_features, trajectory_features_batch)
 from chunkratio.tiny import TinyLM
 
 
@@ -107,5 +107,38 @@ def test_frozen_roles_always_run_under_no_grad() -> None:
     assert not trajectory_features(probe,[1,2],[3,4]).requires_grad
     assert not score_batch(probe,[[1]],[[2]],0,frozen=True).requires_grad
     assert len(probe.modes) == len(tokens)+4 and not any(probe.modes)
+    assert not continuation_increments_batch(probe,[[1,2]],[[3,4]],0)[0].requires_grad
+    assert not trajectory_features_batch(probe,[[1,2]],[[3,4]])[0].requires_grad
+    assert len(probe.modes) == len(tokens)+6 and not any(probe.modes)
     score_batch(probe,[[1]],[[2]],0,frozen=False)
     assert probe.modes[-1]
+
+
+def test_batched_correction_scoring_matches_single_rows() -> None:
+    """Length-grouped, left-padded batches give each trajectory its own increments and features (§§6.2,7.3)."""
+    torch.manual_seed(9)
+    model = TinyLM(vocab_size=7,hidden_size=8)
+    prefixes = [[1,2],[3],[1,4,5,6],[2,2,2],[5]]
+    suffixes = [[3,0],[4,4,6,1],[2],[6,5,0],[]]
+    # A budget of 4 tokens puts every row in its own forward; 8192 puts them all in one.
+    for budget in (4,8192):
+        increments = continuation_increments_batch(model,prefixes,suffixes,0,budget)
+        for prefix,suffix,got in zip(prefixes,suffixes,increments):
+            torch.testing.assert_close(got,continuation_increments(model,prefix,suffix,0))
+        rows = [i for i,suffix in enumerate(suffixes) if suffix]
+        features = trajectory_features_batch(model,[prefixes[i] for i in rows],[suffixes[i] for i in rows],budget)
+        for i,got in zip(rows,features):
+            torch.testing.assert_close(got,trajectory_features(model,prefixes[i],suffixes[i]))
+    # Generated suffixes end at their first EOS; anything after it is a caller error.
+    with pytest.raises(AssertionError):
+        continuation_increments_batch(model,[[1]],[[0,3]],0)
+
+
+def test_tail_scoring_counts_first_eos_once_and_ignores_later_tokens() -> None:
+    """score_batch scores the chunk only: the first EOS once, nothing after it (§6.1)."""
+    torch.manual_seed(13)
+    model = TinyLM(vocab_size=7,hidden_size=8)
+    with_tail = score_batch(model,[[1,2]],[[3,0,4,5]],0)
+    torch.testing.assert_close(with_tail,score_batch(model,[[1,2]],[[3,0]],0))
+    assert not torch.allclose(score_batch(model,[[1,2]],[[3,0]],0),score_batch(model,[[1,2]],[[3]],0))
+    torch.testing.assert_close(score_batch(model,[[1,2]],[[]],0),torch.zeros(1))

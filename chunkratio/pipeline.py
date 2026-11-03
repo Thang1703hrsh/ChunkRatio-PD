@@ -17,6 +17,7 @@ from .config import collection_seed
 from .collection import (collect_candidates, collect_correction, collect_prefixes, correction_features,
                          prepare_prompts)
 from .cost import ForwardMeter
+from .diagnostics import correction_audit
 from .evaluation import reward_selector
 from .math import diagnostics, routing
 from .models import load_models
@@ -25,6 +26,25 @@ from .scoring import fingerprint, score_batch
 from .targets import build_targets
 from .training import ChunkRatioTrainer
 from .value_head import fit_head, save_tensor
+
+
+def source_digest(package: Path | None = None) -> str:
+    """sha256 of the package's .py sources with LF line endings (Windows checkouts and containers agree)."""
+    package = package or Path(__file__).resolve().parent
+    h = hashlib.sha256()
+    for path in sorted(package.rglob('*.py')):
+        h.update(path.relative_to(package).as_posix().encode()+b'\0')
+        h.update(path.read_bytes().replace(b'\r\n',b'\n')+b'\0')
+    return h.hexdigest()
+
+
+def code_revision() -> str:
+    """Commit plus a hash of the chunkratio sources, so two uncommitted versions never share a revision
+    (and therefore never share cache keys). Containers without .git (Modal) pass the commit computed
+    where the code was uploaded; the source hash is taken from the code that actually runs."""
+    root = Path(__file__).resolve().parents[1]
+    commit = os.environ.get('CRPD_CODE_REVISION') or subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip()
+    return f'{commit}+src.{source_digest()[:16]}'
 
 
 def eligible_prompts(cfg: dict[str,Any], models: dict[str,Any], tokenizers: list[Any]) -> tuple[list[dict[str,Any]],list[str]]:
@@ -38,7 +58,10 @@ def eligible_prompts(cfg: dict[str,Any], models: dict[str,Any], tokenizers: list
         if max(prompt['prompt_ids']) >= len(tokenizers[0]):
             raise ValueError('canonical prompt token outside shared vocabulary')
     # Pre-generation eligibility rule (§5.2): prompt + H must fit every model; never truncate later.
-    ineligible = sorted(p['id'] for p in prompts if len(p['prompt_ids'])+cfg['horizon'] > min(contexts))
+    # An opt-in max_prompt_tokens also drops rare very long prompts: right padding gives every row of
+    # a batch the longest width, so they set peak GPU memory. The rule never reads an outcome.
+    limit = cfg.get('max_prompt_tokens') or float('inf')
+    ineligible = sorted(p['id'] for p in prompts if len(p['prompt_ids'])+cfg['horizon'] > min(contexts) or len(p['prompt_ids']) > limit)
     prompts = [p for p in prompts if p['id'] not in set(ineligible)]
     if not prompts:
         raise ValueError('no prompt fits prompt length + H within every model context')
@@ -61,12 +84,12 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
     root = Path(__file__).resolve().parents[1]
     documents = {str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest()
                  for p in sorted((root/'reference').glob('*')) if p.suffix in ('.md','.py','.json')}
-    # Containers without .git (Modal) pass the revision computed where the code was uploaded.
-    revision = os.environ.get('CRPD_CODE_REVISION') or subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip()
+    revision = code_revision()
     manifest = {'schema':1,'method_version':'1.1','spec_revision':2,'code_revision':revision,
                 'python':platform.python_version(),'torch':torch.__version__,'documents':documents,
                 'config':cfg,'models':identities,'tokenizer':info,'split_hash':digest(prompts),
-                'ineligible_prompts':{'rule':'len(prompt_ids)+H > min model context','ids':ineligible},
+                'ineligible_prompts':{'rule':'len(prompt_ids)+H > min model context or len(prompt_ids) > max_prompt_tokens',
+                                      'max_prompt_tokens':cfg.get('max_prompt_tokens'),'ids':ineligible},
                 'route':route,'precision':str(next(student.parameters()).dtype),'feature_dtype':'float32',
                 'terminal_convention':'sampled EOS included once; H after prompt; no forced EOS',
                 'seed_streams':['split','prefix','candidate/student_ref','candidate/teacher_plus',
@@ -154,12 +177,19 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
     save_tensor(output/'student.pt',{'state_dict':student.state_dict(),'synthetic':cfg.get('synthetic',False)})
     if until == 'train-policy':
         return policy
+    # Measure-weighted pair diagnostics in microbatches (each pair keeps its hierarchical weight).
     weighted = {'excess_bce':0.,'logit_error':0.,'saturation':0.}
+    size = cfg.get('diagnostic_batch_size',32)
     with torch.no_grad():
-        for pair in targets['pairs']:
-            _,diag = trainer.batch_loss([pair])
-            for key,value in diag.items():
-                weighted[key] += value*pair['weight']
+        for offset in range(0,len(targets['pairs']),size):
+            chunk = targets['pairs'][offset:offset+size]
+            _,metrics = trainer.pair_terms(chunk)
+            weights = torch.tensor([p['weight'] for p in chunk],dtype=torch.float64)
+            for key in weighted:
+                weighted[key] += float((metrics[key].detach().double().cpu()*weights).sum())
+    sibling_audit = correction_audit(targets['pairs'],[r for r in corrections if r['seed']['split'] == 'head_val'],head,
+                                     correction_features(correction_store) if head is not None else None,
+                                     collection_seed(cfg))
     observed_mass = []
     for record in targets['records']:
         cs = record['candidates']
@@ -174,7 +204,7 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
             for role,count in record.get(field,{}).items():
                 destination[role] = destination.get(role,0)+count
     result = {'synthetic':cfg.get('synthetic',False),'route':route,'variant':cfg['variant'],'policy':policy,
-              'head':head_meta,'pair_diagnostics':weighted,'candidate_coverage':observed_mass,
+              'head':head_meta,'pair_diagnostics':weighted,'correction_audit':sibling_audit,'candidate_coverage':observed_mass,
               'audit':targets['audits'],'counts':{'states':len(states),'pairs':len(targets['pairs']),
                                                 'correction_trajectories':len(corrections)},
               'cost':{'collection_generated_tokens':generated_counts,'collection_scored_tokens':scored_counts,

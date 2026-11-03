@@ -54,16 +54,23 @@ def build_targets(records: list[dict[str,Any]], head: MeanHead | None, models: d
             continue
         state = record['state']
         candidates = []
+        # Endpoints that need mu_hat share one batched rho forward per state.
+        corrected = []
+        for row in record['candidates']:
+            bypass = route != 'reference_mean' or cfg['variant'] in ('crpd_raw','crpd_suffix') or row['terminal']
+            if not bypass:
+                corrected.append(row)
+        mus: dict[str,float] = {}
+        if corrected:
+            assert head is not None and not any(p.requires_grad for p in head.parameters())
+            f = state_features(models['student_ref'],[state['prefix_ids']+c['tokens'] for c in corrected])
+            budget = torch.tensor([(cfg['horizon']-state['n']-len(c['tokens']))/cfg['horizon'] for c in corrected],
+                                  device=f.device)
+            with torch.no_grad():
+                mus = dict(zip((c['id'] for c in corrected),head(f,budget).tolist()))
         for original in record['candidates']:
             row = dict(original)
-            bypass = route != 'reference_mean' or cfg['variant'] in ('crpd_raw','crpd_suffix') or row['terminal']
-            mu = 0.
-            if not bypass:
-                assert head is not None and not any(p.requires_grad for p in head.parameters())
-                f = state_features(models['student_ref'],[state['prefix_ids']+row['tokens']])
-                budget = torch.tensor([(cfg['horizon']-state['n']-len(row['tokens']))/cfg['horizon']],device=f.device)
-                with torch.no_grad():
-                    mu = head(f,budget).item()
+            mu = mus.get(row['id'],0.)
             row['endpoint_mu'] = mu
             row['target_score'] = target_score(*(torch.tensor([row[k]],dtype=torch.float64) for k in
                                                  ('logp_teacher_plus','logp_teacher_base','endpoint_mu')),

@@ -38,8 +38,8 @@ from pathlib import Path
 import modal
 
 SCALE = os.environ.get('CRPD_SCALE','full')
-if SCALE not in ('full','smoke','stability'):
-    raise SystemExit('CRPD_SCALE must be full, smoke or stability')
+if SCALE not in ('full','smoke','stability','x10'):
+    raise SystemExit('CRPD_SCALE must be full, smoke, stability or x10')
 # smoke: plumbing and per-stage timing; stability: enough steps and RM checkpoints to see whether
 # policy training moves the right way. Both are small runs in their own app and volume.
 SMOKE = SCALE == 'smoke'
@@ -47,41 +47,76 @@ SMALL = SCALE != 'full'
 HF_PUSH = os.environ.get('CRPD_HF_PUSH','0') == '1'
 # CRPD_TEACHERS=hub takes T0/T+ from pinned published checkpoints (chunkratio.pilot.HUB_TEACHERS),
 # checks T+ = T0 + LoRA from the weights, and trains only rho (UltraChat SFT of Qwen3-0.6B-Base).
+# CRPD_TEACHERS=hda takes T0, T+ and rho from the pinned NARVAL-matching published trio
+# (chunkratio.pilot.HDA_CHECKPOINTS), checks that T0 is the nearest candidate to T+ in weight space,
+# and trains nothing before CRPD.
 TEACHERS = os.environ.get('CRPD_TEACHERS','train')
-if TEACHERS not in ('train','hub'):
-    raise SystemExit('CRPD_TEACHERS must be train or hub')
+if TEACHERS not in ('train','hub','hda'):
+    raise SystemExit('CRPD_TEACHERS must be train, hub or hda')
 HUB = TEACHERS == 'hub'
-APP_NAME = 'crpd-qwen3-pilot'+('-hub' if HUB else '')+(f'-{SCALE}' if SMALL else '')
+HDA = TEACHERS == 'hda'
+APP_NAME = 'crpd-qwen3-pilot'+('-hub' if HUB else '-hda' if HDA else '')+(f'-{SCALE}' if SMALL else '')
 REMOTE_REPO = '/root/repo'
 # Inside a container this file is /root/qwen3_pilot.py, so the repo root only exists locally.
 REPO = Path(__file__).resolve().parents[2] if modal.is_local() else Path(REMOTE_REPO)
 VOLUME_PATH = '/vol'
 PAIR = 'qwen3_1p7b_to_0p6b'
-RUN_PAIR = PAIR+('_hub' if HUB else '')
+RUN_PAIR = PAIR+('_hub' if HUB else '_hda' if HDA else '')
 DATA = f'data/narval/{RUN_PAIR}'
 ROOT = f'output/narval/{RUN_PAIR}/pilot'
 CHECKPOINTS = f'{ROOT}/checkpoints'
 # Turn-fitted SFT data (Deita: 98.8% of conversations kept at 2048 tokens instead of 5.4%).
 SFT_DATA = f"{DATA}/{'ultrachat' if HUB else 'deita'}_sft_fit2048.jsonl"
-VARIANTS = ('crpd_main',) if SMALL else ('crpd_main','crpd_raw') if HUB else ('crpd_main','crpd_raw','crpd_anchor')
+# The hda trio runs main against raw at every scale: whether the correction helps is its first question.
+VARIANTS = (('crpd_main','crpd_raw') if HDA else ('crpd_main',) if SMALL else ('crpd_main','crpd_raw') if HUB
+            else ('crpd_main','crpd_raw','crpd_anchor'))
+# CRPD_VARIANTS=crpd_raw runs only the named variants, for example on an existing small-scale cache.
+VARIANT_TEXT = os.environ.get('CRPD_VARIANTS','')
+VARIANTS = tuple(v for v in VARIANT_TEXT.split(',') if v) or VARIANTS
 # Smoke sizes keep the real horizon and chunking so per-prompt and per-pair rates extrapolate.
 SMOKE_SIZES = {'deita_rows':256,'ultrachat_rows':256,'uf_train_rows':512,'uf_test_rows':64,
                'subset':{'train':8,'head_val':4,'select':4},'states_per_prompt':4,
                'steps':10,'batch_size':16,'selection_interval':10,'diagnostic_prompts':8,'diagnostic_replicates':4}
 # Reduced hub pilot, fixed before any collection (DECISIONS): fewer prompts, 2 states per prompt.
+# Microbatch 4: one long UltraFeedback prompt (1224 tokens against a median of 87) pads every row of its
+# microbatch, and 8 rows x about 1600 positions ran an A100-80GB out of memory. The objective is unchanged.
 HUB_SIZES = {'ultrachat_rows':10000,'subset':{'train':1000,'head_val':100,'select':64},'states_per_prompt':2,
-             'steps':300,'batch_size':64,'selection_interval':150,'diagnostic_prompts':32,'diagnostic_replicates':8}
+             'steps':300,'batch_size':64,'selection_interval':150,'diagnostic_prompts':32,'diagnostic_replicates':8,
+             'policy_microbatch_size':4}
 # Stability check: 150 steps x 32 pairs over 64 prompts x 2 states (~768 pairs, ~6 passes), RM
 # selection at steps 50/100/150; rho is SFT'd on 2,000 conversations so its rollouts are usable.
 STABILITY_SIZES = {'deita_rows':2000,'ultrachat_rows':2000,'uf_train_rows':2048,'uf_test_rows':64,
                    'subset':{'train':64,'head_val':16,'select':16},'states_per_prompt':2,
-                   'steps':150,'batch_size':32,'selection_interval':50,'diagnostic_prompts':8,'diagnostic_replicates':4}
-SIZES = {'smoke':SMOKE_SIZES,'stability':STABILITY_SIZES}.get(SCALE) or (HUB_SIZES if HUB else None)
-HF_PREFIX = 'crpd-qwen3-1p7b-to-0p6b'+('-hub' if HUB else '')+(f'-{SCALE}' if SMALL else '')
+                   'steps':150,'batch_size':32,'selection_interval':50,'diagnostic_prompts':8,'diagnostic_replicates':4,
+                   'policy_microbatch_size':4,'selection_baseline':True}
+# Ten times the stability collection (640 + 160 prompts). Select stays at 64 because each RM selection
+# greedily generates up to 1024 tokens per prompt, one prompt at a time. Generation batch stays at 32:
+# collect-candidates already peaked at 53 GB there, and the 2048-token cap bounds the padded width.
+X10_SIZES = {'deita_rows':10000,'ultrachat_rows':10000,'uf_train_rows':20480,'uf_test_rows':64,
+             'subset':{'train':640,'head_val':160,'select':64},'states_per_prompt':2,
+             'steps':300,'batch_size':64,'selection_interval':150,'diagnostic_prompts':8,'diagnostic_replicates':4,
+             'policy_microbatch_size':4,'selection_baseline':True,'max_prompt_tokens':2048}
+SIZES = {'smoke':SMOKE_SIZES,'stability':STABILITY_SIZES,'x10':X10_SIZES}.get(SCALE) or (HUB_SIZES if HUB else None)
+HF_PREFIX = 'crpd-qwen3-1p7b-to-0p6b'+('-hub' if HUB else '-hda' if HDA else '')+(f'-{SCALE}' if SMALL else '')
 # GPU of the CRPD stage (collection, head, targets, policy). Another GPU writes its outputs and cache
 # under a GPU tag so a comparison run collects afresh instead of reusing the default GPU's shards.
 CRPD_GPU = os.environ.get('CRPD_GPU','A100-80GB')
 GPU_TAG = '' if CRPD_GPU == 'A100-80GB' else '-'+CRPD_GPU.lower().replace('-','')
+# CRPD_ALPHAS=0.03,0.1 trains each variant once per alpha instead of the protocol alpha. Collection,
+# head and target keys do not contain alpha, so the sweep reuses them while the code revision is the same.
+ALPHA_TEXT = os.environ.get('CRPD_ALPHAS','')
+ALPHAS = tuple(float(a) for a in ALPHA_TEXT.split(',') if a)
+# CRPD_SWEEP_LITE=1 trims a sweep to train-policy on the existing cache: rho is not rescored (it does not
+# depend on alpha) and evaluate is skipped. Selection scores stay in the policy result and the resume file.
+SWEEP_LITE = os.environ.get('CRPD_SWEEP_LITE','0') == '1'
+if not all(0 < a < float('inf') for a in ALPHAS):
+    raise SystemExit('CRPD_ALPHAS must be finite positive numbers')
+
+
+def run_name(variant: str, alpha: float) -> str:
+    """Config and output name of one sweep run, for example crpd_main-alpha0p03."""
+    return f"{variant}-alpha{str(alpha).replace('.','p')}"
+
 
 app = modal.App(APP_NAME)
 volume = modal.Volume.from_name(APP_NAME,create_if_missing=True)
@@ -91,7 +126,8 @@ image = (modal.Image.debian_slim(python_version='3.12')
          .env({'HF_HOME':f'{VOLUME_PATH}/hf','TOKENIZERS_PARALLELISM':'false','PYTHONUNBUFFERED':'1',
                'PYTORCH_CUDA_ALLOC_CONF':'expandable_segments:True',
                'CRPD_SCALE':SCALE,'CRPD_HF_PUSH':'1' if HF_PUSH else '0','CRPD_TEACHERS':TEACHERS,
-               'CRPD_GPU':CRPD_GPU})
+               'CRPD_GPU':CRPD_GPU,'CRPD_ALPHAS':ALPHA_TEXT,'CRPD_SWEEP_LITE':'1' if SWEEP_LITE else '0',
+               'CRPD_VARIANTS':VARIANT_TEXT})
          .add_local_dir(REPO,REMOTE_REPO,ignore=['output','data','.git','mtbench','winrate_eval','diversity_metrics',
                                                  'promt','prompts','env','reports','**/__pycache__','.pytest_cache']))
 common = {'image':image,'volumes':{VOLUME_PATH:volume},'timeout':24*3600}
@@ -165,6 +201,18 @@ def done(path: str) -> bool:
     return (workdir()/path).exists()
 
 
+def finished(config: dict, marker: str) -> bool:
+    """A CRPD run is finished only if its marker exists and it ran exactly this config; an output folder
+    holding another config's results is an error, not a skip (the code revision is checked by the cache
+    keys of every stage, so a changed code reruns through its own keys)."""
+    if not done(f"{config['output']}/{marker}"):
+        return False
+    resolved = workdir()/config['output']/'resolved_config.json'
+    if not resolved.exists() or json.loads(resolved.read_text(encoding='utf-8')) != config:
+        raise ValueError(f"{config['output']} holds results of a different config; use another output to rerun")
+    return True
+
+
 def train_checkpoint(revision: str, stage: str, model: str, model_revision: str, data: str, out: str,
                      tokenizer: tuple[str,str] | None = None) -> None:
     """SFT or teacher DPO with the assumed recipe; skipped when the checkpoint manifest exists."""
@@ -200,15 +248,17 @@ def prepare(revision: str) -> None:
     work = workdir()
     sys.path.insert(0,str(work))
     from chunkratio.artifacts import read_jsonl, write_json
-    from chunkratio.pilot import (HUB_TEACHERS, MAX_LENGTH, PREFERENCE_DATASET, REWARD_MODEL, SFT_DATASET,
-                                  STUDENT_BASE_MODEL, TEACHER_BASE_MODEL, pilot_subset)
-    if done(f'{DATA}/prepared.json') and done(SFT_DATA):
+    from chunkratio.pilot import (HDA_CHECKPOINTS, HUB_TEACHERS, MAX_LENGTH, PREFERENCE_DATASET, REWARD_MODEL,
+                                  SFT_DATASET, STUDENT_BASE_MODEL, TEACHER_BASE_MODEL, pilot_subset)
+    # The hda trio needs no SFT data: every role is a published checkpoint.
+    if done(f'{DATA}/prepared.json') and (HDA or done(SFT_DATA)):
         print('skip prepare',flush=True)
         return
     from datasets import load_dataset
     from huggingface_hub import HfApi
     api = HfApi()
-    sft_dataset = 'HuggingFaceH4/ultrachat_200k' if HUB else SFT_DATASET
+    # hda: the SFT data its model card names, pinned for provenance only (nothing is trained or downloaded).
+    sft_dataset = 'HuggingFaceH4/ultrachat_200k' if HUB else 'HuggingFaceH4/deita-10k-v0-sft' if HDA else SFT_DATASET
     revisions_path = work/DATA/'revisions.json'
     if revisions_path.exists():
         revisions = json.loads(revisions_path.read_text(encoding='utf-8'))
@@ -217,7 +267,19 @@ def prepare(revision: str) -> None:
                      'reward_model':api.model_info(REWARD_MODEL).sha,
                      'sft_dataset':api.dataset_info(sft_dataset).sha,
                      'preference_dataset':api.dataset_info(PREFERENCE_DATASET).sha}
-        if HUB:
+        if HDA:
+            # Pinned trio; the Hub must still serve exactly these commits. Base checkpoints are the
+            # alternatives of the weight-space reference check.
+            for source in HDA_CHECKPOINTS.values():
+                if api.model_info(source['repo'],revision=source['revision']).sha != source['revision']:
+                    raise ValueError(f"{source['repo']} does not serve revision {source['revision']}")
+            revisions.update(teacher_base_model=HDA_CHECKPOINTS['teacher_base']['revision'],
+                             teacher_plus_model=HDA_CHECKPOINTS['teacher_plus']['revision'],
+                             student_base_model=HDA_CHECKPOINTS['student_ref']['revision'],
+                             tokenizer=HDA_CHECKPOINTS['teacher_base']['revision'],
+                             qwen3_1p7b_base=api.model_info(TEACHER_BASE_MODEL).sha,
+                             qwen3_1p7b=api.model_info('Qwen/Qwen3-1.7B').sha)
+        elif HUB:
             # Pinned teacher revisions; the Hub must still serve exactly these commits.
             for role,source in HUB_TEACHERS.items():
                 if api.model_info(source['repo'],revision=source['revision']).sha != source['revision']:
@@ -232,9 +294,9 @@ def prepare(revision: str) -> None:
     raw = work/DATA/'raw'
     raw.mkdir(parents=True,exist_ok=True)
     sft_raw = 'ultrachat.jsonl' if HUB else 'deita.jsonl'
-    for name,dataset,split,key in ((sft_raw,sft_dataset,'train_sft' if HUB else 'train','sft_dataset'),
-                                   ('uf_train_prefs.jsonl',PREFERENCE_DATASET,'train_prefs','preference_dataset'),
-                                   ('uf_test_prefs.jsonl',PREFERENCE_DATASET,'test_prefs','preference_dataset')):
+    for name,dataset,split,key in ((() if HDA else ((sft_raw,sft_dataset,'train_sft' if HUB else 'train','sft_dataset'),))+
+                                   (('uf_train_prefs.jsonl',PREFERENCE_DATASET,'train_prefs','preference_dataset'),
+                                    ('uf_test_prefs.jsonl',PREFERENCE_DATASET,'test_prefs','preference_dataset'))):
         if not (raw/name).exists():
             load_dataset(dataset,split=split,revision=revisions[key]).to_json(str(raw/name),lines=True,force_ascii=False)
     if HUB and not (raw/'ultrachat_sharegpt.jsonl').exists():
@@ -249,17 +311,20 @@ def prepare(revision: str) -> None:
                                                                             for m in row['messages']]},ensure_ascii=False)+'\n')
     sources = {'deita':'ultrachat_sharegpt.jsonl' if HUB else 'deita.jsonl','uf_train':'uf_train_prefs.jsonl',
                'uf_test':'uf_test_prefs.jsonl'}
+    if HDA:
+        del sources['deita']
     if SMALL:
         for key,name in sources.items():
             head_lines(raw/name,raw/f'{SCALE}_{name}',SIZES[f'{key}_rows'])
         sources = {key:f'{SCALE}_{name}' for key,name in sources.items()}
     template = json.dumps({'enable_thinking':False})
     # Hub teachers: their own tokenizer and plain ChatML template format every role's data.
-    tokenizer = ['--tokenizer',HUB_TEACHERS['teacher_base']['repo'] if HUB else STUDENT_BASE_MODEL,
-                 '--revision',revisions['tokenizer'] if HUB else revisions['student_base_model'],
+    tokenizer = ['--tokenizer',HUB_TEACHERS['teacher_base']['repo'] if HUB else HDA_CHECKPOINTS['teacher_base']['repo']
+                 if HDA else STUDENT_BASE_MODEL,
+                 '--revision',revisions['tokenizer'] if HUB or HDA else revisions['student_base_model'],
                  '--eos-token','<|im_end|>','--chat-template-kwargs',template]
     # Each output is built once; a later code version can add a file without redoing the others.
-    if not done(SFT_DATA):
+    if not HDA and not done(SFT_DATA):
         crpd(revision,'prepare-data','--input',f"{DATA}/raw/{sources['deita']}",'--output',SFT_DATA,
              '--format','sharegpt','--assign-split','train','--fit-max-length',str(MAX_LENGTH),*tokenizer)
     if not done(f'{DATA}/ultrafeedback_train.jsonl'):
@@ -341,9 +406,12 @@ def write_pilot_configs() -> dict[str,str]:
     """Resolved pilot configs from the NARVAL protocol file; T+'s DPO reference must equal T0."""
     work = workdir()
     sys.path.insert(0,str(work))
-    from chunkratio.pilot import HUB_TEACHERS, pilot_config
-    rho = json.loads((work/CHECKPOINTS/'student_ref'/'preparation_manifest.json').read_text(encoding='utf-8'))
-    if HUB:
+    from chunkratio.pilot import HDA_CHECKPOINTS, HUB_TEACHERS, pilot_config
+    if HDA:
+        # Every role loads from its pinned commit; the weight check above is the reference evidence.
+        verified = json.loads((work/ROOT/'teacher_verification.json').read_text(encoding='utf-8'))['verified']
+        checkpoints = {role:{'path':source['repo'],'revision':source['revision']} for role,source in HDA_CHECKPOINTS.items()}
+    elif HUB:
         # Hub teachers load from their pinned commits; verification is the weight check above.
         verified = json.loads((work/ROOT/'teacher_verification.json').read_text(encoding='utf-8'))['verified']
         checkpoints = {role:{'path':HUB_TEACHERS[role]['repo'],'revision':HUB_TEACHERS[role]['revision']}
@@ -353,7 +421,9 @@ def write_pilot_configs() -> dict[str,str]:
                      for role in ('teacher_base','teacher_plus')}
         verified = manifests['teacher_plus']['teacher_dpo_reference_fingerprint'] == manifests['teacher_base']['model_fingerprint']
         checkpoints = {role:{'path':f'{CHECKPOINTS}/{role}','revision':manifests[role]['model_fingerprint']} for role in manifests}
-    checkpoints['student_ref'] = {'path':f'{CHECKPOINTS}/student_ref','revision':rho['model_fingerprint']}
+    if not HDA:
+        rho = json.loads((work/CHECKPOINTS/'student_ref'/'preparation_manifest.json').read_text(encoding='utf-8'))
+        checkpoints['student_ref'] = {'path':f'{CHECKPOINTS}/student_ref','revision':rho['model_fingerprint']}
     split = json.loads((work/DATA/'ultrafeedback_train.splits.json').read_text(encoding='utf-8'))['assignment_sha256']
     protocol = json.loads((work/'config/crpd/narval'/f'{PAIR}.json').read_text(encoding='utf-8'))
     paths = {}
@@ -362,12 +432,57 @@ def write_pilot_configs() -> dict[str,str]:
         path.parent.mkdir(parents=True,exist_ok=True)
         cfg = pilot_config(protocol,variant,checkpoints,_revisions(),split,verified,RUN_PAIR)
         if SIZES:
-            cfg.update({k:SIZES[k] for k in ('steps','batch_size','selection_interval','states_per_prompt')})
+            cfg.update({k:SIZES[k] for k in ('steps','batch_size','selection_interval','states_per_prompt',
+                                             'policy_microbatch_size','selection_baseline','max_prompt_tokens') if k in SIZES})
+            cfg['pilot_assumptions'] = {**cfg['pilot_assumptions'],'pilot_subset':f"{SIZES['subset']} prompts ({SCALE} scale)",
+                                        'states_per_prompt':str(SIZES['states_per_prompt']),
+                                        'policy_steps':f"{SIZES['steps']} steps x {SIZES['batch_size']} pairs; RM selection every {SIZES['selection_interval']} steps"}
         if GPU_TAG:
             cfg.update(output=f'{ROOT}/{variant}{GPU_TAG}/seed0',cache_root=f'{ROOT}/cache{GPU_TAG}')
+        if SWEEP_LITE:
+            cfg['selection_baseline'] = False
         path.write_text(json.dumps(cfg,indent=2),encoding='utf-8')
         paths[variant] = str(path.relative_to(work))
+        for alpha in ALPHAS:
+            name = run_name(variant,alpha)
+            sweep = {**cfg,'alpha':alpha,'output':f'{ROOT}/{name}{GPU_TAG}/seed0','selection_baseline':not SWEEP_LITE,
+                     'pilot_assumptions':{**cfg['pilot_assumptions'],
+                                          'alpha_sweep':f'{ALPHA_TEXT}; chosen on select-split RM only (DECISIONS 55)'}}
+            sweep_path = path.with_name(f'{name}.json')
+            sweep_path.write_text(json.dumps(sweep,indent=2),encoding='utf-8')
+            paths[name] = str(sweep_path.relative_to(work))
     return paths
+
+
+@app.function(cpu=4.0,memory=49152,timeout=2*3600,**{k:v for k,v in common.items() if k != 'timeout'})
+def verify_hda_teachers(revision: str) -> dict:
+    """hda trio: T+ has no published LoRA, so check from the weights that T0 is nearer to T+ than the
+    Base checkpoint it was trained from and the official Qwen3-1.7B (CPU). Evidence, not proof."""
+    volume.reload()
+    out = workdir()/ROOT/'teacher_verification.json'
+    if out.exists() and json.loads(out.read_text(encoding='utf-8'))['verified']:
+        print('skip verify_hda_teachers',flush=True)
+        return json.loads(out.read_text(encoding='utf-8'))
+    sys.path.insert(0,str(workdir()))
+    from huggingface_hub import snapshot_download
+    from chunkratio.artifacts import write_json
+    from chunkratio.hub_teachers import nearest_reference
+    from chunkratio.pilot import HDA_CHECKPOINTS, TEACHER_BASE_MODEL
+    revisions = _revisions()
+    folder = lambda repo,rev: Path(snapshot_download(repo,revision=rev,allow_patterns=['*.json','*.safetensors']))
+    report = nearest_reference(folder(HDA_CHECKPOINTS['teacher_plus']['repo'],HDA_CHECKPOINTS['teacher_plus']['revision']),
+                               folder(HDA_CHECKPOINTS['teacher_base']['repo'],HDA_CHECKPOINTS['teacher_base']['revision']),
+                               {'qwen3_1p7b_base':folder(TEACHER_BASE_MODEL,revisions['qwen3_1p7b_base']),
+                                'qwen3_1p7b':folder('Qwen/Qwen3-1.7B',revisions['qwen3_1p7b'])})
+    report = {**report,'verified':report['nearest'],'sources':HDA_CHECKPOINTS,'code_revision':revision}
+    print(json.dumps({'teacher_verification':{k:v for k,v in report.items() if k != 'sources'}}),flush=True)
+    if not report['verified']:
+        write_json(out.with_name('teacher_verification.failed.json'),report)
+        volume.commit()
+        raise ValueError('T0 is not the nearest candidate to T+; refusing to use the hda teacher pair')
+    write_json(out,report)
+    volume.commit()
+    return report
 
 
 @app.function(gpu='L40S',cpu=2.0,memory=32768,**common)  # (19.5 GB)
@@ -381,7 +496,7 @@ def diagnose(revision: str) -> None:
         return
     configs = write_pilot_configs()
     prompts,replicates = ((SIZES['diagnostic_prompts'],SIZES['diagnostic_replicates']) if SIZES else (100,16))
-    crpd(revision,'diagnose-displacement','--config',configs['crpd_main'],'--prompts',str(prompts),
+    crpd(revision,'diagnose-displacement','--config',configs[VARIANTS[0]],'--prompts',str(prompts),
          '--replicates',str(replicates),'--output',out)
     volume.commit()
 
@@ -396,18 +511,20 @@ def train_variants(revision: str) -> None:
     """
     volume.reload()
     configs = write_pilot_configs()
-    for variant in VARIANTS:
-        config = json.loads((workdir()/configs[variant]).read_text(encoding='utf-8'))
-        if done(f"{config['output']}/diagnostics.json"):
-            print('skip',variant,flush=True)
+    runs = [(variant,run_name(variant,alpha)) for variant in VARIANTS for alpha in ALPHAS] or [(v,v) for v in VARIANTS]
+    for variant,name in runs:
+        config = json.loads((workdir()/configs[name]).read_text(encoding='utf-8'))
+        if finished(config,'diagnostics.json') or (SWEEP_LITE and finished(config,'student/config.json')):
+            print('skip',name,flush=True)
         else:
             stages = (('validate-config','collect-prefixes','collect-candidates','collect-correction','fit-head',
                        'build-targets','train-policy','evaluate') if SMALL else ('evaluate',))
+            stages = ('train-policy',) if SWEEP_LITE else stages
             for stage in stages:
-                crpd(revision,stage,'--config',configs[variant])
+                crpd(revision,stage,'--config',configs[name])
                 volume.commit()
         if HF_PUSH:
-            push_hf.spawn(revision,f"{config['output']}/student",variant,config['output'])
+            push_hf.spawn(revision,f"{config['output']}/student",name,config['output'])
 
 
 @app.function(cpu=2.0,memory=8192,timeout=4*3600,retries=2,secrets=hf_secret,image=image,volumes={VOLUME_PATH:volume})
@@ -458,7 +575,7 @@ def push_finished(revision: str) -> list:
     calls = []
     # Smoke pushes only the small 0.6B models (the 7 GB smoke teachers use the same upload path);
     # hub teachers are already public.
-    for role in (('student_ref',) if SMALL or HUB else ('teacher_base','student_ref','teacher_plus')):
+    for role in (() if HDA else ('student_ref',) if SMALL or HUB else ('teacher_base','student_ref','teacher_plus')):
         if done(f'{CHECKPOINTS}/{role}/preparation_manifest.json'):
             calls.append(push_hf.spawn(revision,f'{CHECKPOINTS}/{role}',role))
     for variant in VARIANTS:
@@ -480,11 +597,12 @@ def run_pilot(revision: str) -> None:
     """Phase 1 orchestrator; spawns phase 2 so each phase has its own 24 h budget."""
     prepare.remote(revision)
     # Hub: verify the published teachers (CPU) while rho trains; no teacher SFT or DPO.
-    calls = ([verify_teachers.spawn(revision),sft_student.spawn(revision)] if HUB else
+    calls = ([verify_hda_teachers.spawn(revision)] if HDA else
+             [verify_teachers.spawn(revision),sft_student.spawn(revision)] if HUB else
              [sft_teacher.spawn(revision),sft_student.spawn(revision)])
     for call in calls:
         call.get()
-    if not HUB:
+    if not HUB and not HDA:
         dpo_teacher.remote(revision)
     if HF_PUSH:
         volume.reload()

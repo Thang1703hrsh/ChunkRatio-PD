@@ -20,12 +20,16 @@ class ForwardMeter:
     def _hook(self, role: str) -> Any:
         """Create a per-role counter that does not retain model references (§11.4)."""
         def count(module: nn.Module, args: tuple[Any,...], kwargs: dict[str,Any]) -> None:
-            """Count positional attention validity, never EOS token identity (§11.4)."""
+            """Count positional attention validity, never EOS token identity (§11.4).
+
+            With a KV cache the mask also covers the cached history; only its last positions are
+            this forward's input.
+            """
             ids = args[0] if args else kwargs.get('input_ids')
             if ids is None:
                 return
             attention = kwargs.get('attention_mask')
-            tokens = int(attention.sum()) if attention is not None else ids.numel()
+            tokens = int(attention[:,-ids.shape[1]:].sum()) if attention is not None else ids.numel()
             self.counts[role]['forward_calls'] += 1
             self.counts[role]['input_tokens'] += tokens
             if torch.is_grad_enabled():

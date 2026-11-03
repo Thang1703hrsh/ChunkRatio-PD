@@ -36,6 +36,12 @@ def load_models(cfg: dict[str,Any]) -> tuple[dict[str,nn.Module],nn.Module,list[
                                                              torch_dtype=getattr(torch,dtype)))
             tok = AutoTokenizer.from_pretrained(entry.get('tokenizer',entry['path']),
                                                 revision=entry.get('tokenizer_revision',entry['revision']))
+            # A declared end-of-turn token replaces the tokenizer's EOS for every role (published Qwen3
+            # SFTs declare <|endoftext|> but end assistant turns with <|im_end|>), as prepare-data and SFT do.
+            if cfg.get('eos_token') and tok.eos_token != cfg['eos_token']:
+                if cfg['eos_token'] not in tok.get_vocab():
+                    raise ValueError(f"{cfg['eos_token']} is not in the {role} tokenizer vocabulary")
+                tok.eos_token = cfg['eos_token']
             if tok.pad_token_id is None:
                 tok.pad_token = tok.eos_token
             toks.append(tok)

@@ -87,3 +87,28 @@ def verify_lora_merge(base: Path, merged: Path, adapter: Path) -> dict[str,Any]:
             'fraction_changed_by_dpo':changed/total,'fraction_exact_after_rounding':exact/total,
             'dtype':str(next(iter(tplus.values())).dtype),'max_ulp_allowed':MAX_ULP,
             'verified':not untouched_mismatch and changed > 0 and worst_ulp <= MAX_ULP}
+
+
+def nearest_reference(plus: Path, reference: Path, alternatives: dict[str,Path]) -> dict[str,Any]:
+    """When no LoRA is published: relative L2 distance from T+ to its claimed reference and to other
+    candidates (for example the Base checkpoint T0 was trained from).
+
+    `nearest` holds only if the claimed reference is strictly closer to T+ than every alternative and
+    T+ differs from it. One epoch of DPO moves weights far less than SFT does, so a DPO of T0 should
+    pass; this is evidence from the weights, not a proof that T0 was the DPO reference model.
+    """
+    tplus = _tensors(plus)
+    def distance(folder: Path) -> float:
+        """||T+ - other|| / ||T+|| over the tensors both checkpoints store."""
+        other = _tensors(folder)
+        # A tied output embedding may be stored in one checkpoint only; any other difference is an error.
+        if (set(other) ^ set(tplus))-{'lm_head.weight'}:
+            raise ValueError(f'{folder} and T+ hold different tensors')
+        keys = sorted(set(other) & set(tplus))
+        diff = sum(float((tplus[k].double()-other[k].double()).square().sum()) for k in keys)
+        norm = sum(float(tplus[k].double().square().sum()) for k in keys)
+        return (diff/norm)**.5
+    distances = {'reference':distance(reference),**{name:distance(folder) for name,folder in alternatives.items()}}
+    nearest = distances['reference'] > 0 and all(distances['reference'] < d for k,d in distances.items() if k != 'reference')
+    return {'relative_l2_distance':distances,'nearest':nearest,
+            'rule':'claimed reference strictly nearest to T+ in relative L2 over shared tensors, and not identical'}

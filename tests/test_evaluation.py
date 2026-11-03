@@ -32,6 +32,27 @@ def test_report_validation_and_main_table() -> None:
         report_tables(rows)
 
 
+def test_full_report_requires_every_method_on_both_tracks() -> None:
+    """A missing method x track fails before the seed check; only a labeled partial report allows it."""
+    from chunkratio.evaluation import BASELINES, REFERENCE_ROWS
+    methods = REFERENCE_ROWS+BASELINES+('crpd_main','crpd_raw')
+    rows = [dict(method=method,dataset=dataset,seed=seed,synthetic=False,split='test',
+                 metrics={m:1. for m in METRICS},protocols={m:'fixed' for m in METRICS},cost={'gpu_hours':1.})
+            for method in methods for dataset in ('DPO-MIX-7K','HelpSteer2') for seed in range(3)]
+    assert report_tables(rows).startswith('# Measured CRPD results')
+    one_track = [r for r in rows if r['dataset'] == 'DPO-MIX-7K']
+    with pytest.raises(ValueError,match='method/track rows missing: adpa / HelpSteer2'):
+        report_tables(one_track)
+    one_gap = [r for r in rows if (r['method'],r['dataset']) != ('crpd_raw','HelpSteer2')]
+    with pytest.raises(ValueError,match=r'method/track rows missing: crpd_raw / HelpSteer2$'):
+        report_tables(one_gap)
+    extra = [{**r,'method':'crpd_anchor'} for r in one_track]
+    with pytest.raises(ValueError,match=r'method/track rows missing: crpd_anchor / HelpSteer2$'):
+        report_tables(rows+extra)
+    partial = report_tables(one_track,allow_incomplete=True)
+    assert partial.startswith('# Partial measured CRPD results') and '| missing |' in partial
+
+
 def test_benchmark_plan_and_conditional_cost() -> None:
     """Official versus common-judge configurations and missing hardware are explicit (§11)."""
     plan = benchmark_plan('weights/student','crpd','gpt-4o-mini','outputs/adpa.json','output/eval')
@@ -51,7 +72,7 @@ def narval_row(method: str, value: float, **extra: object) -> dict:
 def test_narval_layout_separates_reported_rows() -> None:
     """Reported NARVAL numbers render in their own section, are labelled, and never mix with measured rows."""
     from chunkratio.evaluation import report_narval
-    measured = [narval_row('crpd_main',v,seed=s,synthetic=False,split='test') for s,v in ((0,50.),(1,52.))]
+    measured = [narval_row('crpd_main',v,seed=s,synthetic=False,split='test') for s,v in ((0,50.),(1,52.),(2,51.))]
     reported = [narval_row('narval',60.,source='NARVAL Table 1',reported=True)]
     text = report_narval(measured,reported)
     assert 'crpd_main uses prompts only' in text and 'excluded from every significance test' in text
@@ -66,6 +87,25 @@ def test_narval_layout_separates_reported_rows() -> None:
         report_narval(reported,[])
     with pytest.raises(ValueError,match='no measured rows'):
         report_narval([],reported)
+
+
+def test_narval_layout_rejects_partial_duplicate_and_mixed_rows() -> None:
+    """A single-seed Winogrande-only row is never rendered as complete; duplicates and mixed protocols fail."""
+    from chunkratio.evaluation import report_narval
+    full = [narval_row('crpd_main',50.,seed=s,synthetic=False,split='test') for s in range(3)]
+    wino = {**full[0],'metrics':{'winogrande':60.}}
+    with pytest.raises(ValueError,match='every NARVAL metric is required'):
+        report_narval([wino],[])
+    partial = report_narval([wino],[],allow_incomplete=True)
+    assert partial.startswith('# NARVAL-comparable results (incomplete)') and 'missing' in partial
+    with pytest.raises(ValueError,match='three training seeds'):
+        report_narval(full[:2],[])
+    with pytest.raises(ValueError,match='duplicate measured'):
+        report_narval(full+[full[0]],[],allow_incomplete=True)
+    with pytest.raises(ValueError,match='incomparable'):
+        report_narval([{**full[0],'protocol':{'lm_eval':'0.4.9.2'}},*full[1:]],[],allow_incomplete=True)
+    with pytest.raises(ValueError,match='training seed'):
+        report_narval([{k:v for k,v in full[0].items() if k != 'seed'}],[],allow_incomplete=True)
 
 
 def test_narval_plan_fails_closed_and_uses_config_fields() -> None:

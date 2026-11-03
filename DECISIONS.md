@@ -180,7 +180,7 @@ distillation stage (`scripts/run_narval.py`); it has no SFT or teacher-DPO code 
 39. **Mixed precision (pilot).** `autocast_dtype: bfloat16` (SFT/DPO) and `policy_autocast_dtype:
     bfloat16` (student forwards only) follow NARVAL's bf16 training while weights and AdamW stay FP32,
     so 5e-7 updates are not lost to bf16 rounding. `score_tokens` still log-softmaxes in FP32, and
-    frozen-model scoring (collection, targets, rho in the anchor term) runs without autocast.
+    frozen-model scoring in collection and targets runs without autocast (rho in the policy loss: item 51).
 40. **Policy schedule (pilot).** Opt-in `lr_schedule: cosine` with `warmup_ratio: 0.1` at peak lr
     1e-6 (mean about 5.5e-7, near NARVAL's 5e-7 cosine/10% warmup); `policy_microbatch_size: 8`
     changes speed, not the objective. Defaults stay constant lr and FP32, so primary configs are
@@ -236,3 +236,119 @@ distillation stage (`scripts/run_narval.py`); it has no SFT or teacher-DPO code 
     but a 255.75-ulp worst case: ulp had been taken of the result, and where T0 and the LoRA update
     nearly cancel, a bf16 sum's rounding (bounded by its operands) is many ulp of a near-zero result.
     The tolerance is now 2 ulp of max(|T0|, |LoRA update|, |result|); unrelated or tampered T+ still fail.
+
+## External code findings (user request, 1 November 2026)
+
+51. **Rho shares the student's precision under autocast (corrects item 39).** With
+    `policy_autocast_dtype`, the student ran in bf16 while `a = log pi - log rho` used rho scores
+    cached in FP32, so the margin at student = rho was not zero. Rho is now rescored under the same
+    autocast in `batch_loss` and in the anchor term, as teacher DPO already does in
+    `preparation.py`. Chosen over dropping autocast because FP32 student memory on the A100-80GB is
+    unmeasured. Cost: one extra no-grad rho forward per side and microbatch, not yet timed. Targets,
+    T+/T0 scoring and collection stay FP32; the default FP32 path still uses cached scores.
+52. **Diagnostic prefix cache identity.** `diagnose-displacement` keys its prefix shards by model
+    fingerprints, tokenizer, prompt hash and code revision in a `prefixes-<key>` folder, as the
+    pipeline does, and records the identities in `displacement.json`. Prefixes in an old
+    `<output>/prefixes` folder are not reused.
+53. **Forward token count.** `ForwardMeter.input_tokens` counts each forward's new non-padding input.
+    Rows already finished in a batch still count, because the model really processes them.
+    `forward_input_tokens_this_invocation` in earlier `diagnostics.json` files is inflated for
+    KV-cached sampling. Wall times and the collection generated/scored counts are not affected.
+54. **Full report completeness.** A report without `--allow-incomplete` needs every present or
+    required method on both tracks, checked before the seed count. Reference rows are included
+    because the specified main table has both track columns for each method.
+55. **Alpha sweep rule, fixed before its results.** `CRPD_ALPHAS` trains one run per alpha on the same
+    collection. The winner is the highest best-checkpoint FsfairX score on `select`, compared with
+    rho's score there (`selection_baseline`, recorded as step 0 and never a selection candidate).
+    Test prompts play no part. A stability run has only 16 select prompts, so a winner there is a
+    lead to confirm at larger scale, not a result.
+56. **Microbatch 4 for hub runs.** The first stability run ran out of memory on the A100-80GB at policy
+    step 3, twice with the same numbers. Its prompts reach 1224 tokens against a median of 87, and
+    right padding gives every row of a microbatch the longest width. Hub and stability scales now use
+    `policy_microbatch_size: 4`; the objective is the same weighted sum over the sampled batch.
+57. **x10 scale (user request, 1 November 2026), fixed before collection.** 640 train / 160 head_val /
+    64 select prompts from 20,480 UltraFeedback rows, 2 states per prompt, rho SFT on 10,000 UltraChat
+    conversations, 300 steps x 64 pairs, RM selection every 150 steps, alpha 0.3, generation batch 32.
+    Select is 4x rather than 10x because selection generates one prompt at a time. `max_prompt_tokens:
+    2048` drops longer prompts before generation (none of the 2,048 prepared rows, whose longest has
+    1,973 tokens); ids are recorded in the manifest. A rule on prompt length only, never on outcomes.
+58. **Alpha 0.1 at x10 scale, fixed before its result (user choice, 1 November 2026).** The stability sweep
+    on 16 select prompts favoured alpha 0.1 (best -4.397; 0.3: -4.671; 1.0: -4.434; rho: -5.282). That lead is
+    tested on the x10 collection by training alpha 0.1 after alpha 0.3 finishes, with the same seed, steps and
+    64 select prompts. Alpha 0.1 is confirmed only if its best select score exceeds alpha 0.3's and it stays
+    above rho at every checkpoint. Test prompts play no part, and the launcher code must not change between the runs.
+
+## Correction speed (user request, 3 November 2026)
+
+59. **Batched correction scoring.** `collect_correction` scores each generation group's suffixes with
+    `continuation_increments_batch` (T+ and T0) and `trajectory_features_batch` (rho) instead of one forward
+    per trajectory and role. Rows are sorted by length and cut so rows x longest row stays within
+    `score_tokens_per_batch` (default 8192, read with `cfg.get`, not part of any cache key). Rows are
+    left-padded with position ids, so every suffix ends at the last column: teachers return logits for the
+    last max-suffix + 1 positions only, and rho returns one position's logits plus its final hidden states.
+    Pending correction jobs are ordered by prefix length before grouping. Shard records keep their format.
+    Values match the per-trajectory functions to 1e-5 (tests on TinyLM and a tiny HF Llama), not bit for bit.
+60. **Sampler rows leave the batch when finished; GPU sampling declined.** `generate_batch` drops a row
+    and its KV-cache entries once it samples EOS or reaches its budget, and copies one softmax for the whole
+    batch to the CPU per step instead of one per row. Draws still use each row's CPU generator, so the saved
+    `rng_before/after` states stay portable and resume stays exact. Sampling on the GPU was not adopted:
+    CUDA generator states differ from the CPU streams, so every collected token would change and the stored
+    stream states could not be replayed on another machine. Item 53 changes accordingly: finished rows no
+    longer count in `ForwardMeter.input_tokens` because they are no longer forwarded.
+61. **Revision of uncommitted code (superseded by item 65).** Launch revisions were `git HEAD` plus `-dirty`,
+    which does not change when uncommitted code changes, so shards of different code could share a cache key.
+
+## hoangducanh trio and external review (user request, 3 November 2026)
+
+62. **Published NARVAL-matching trio (`CRPD_TEACHERS=hda`, pair `qwen3_1p7b_to_0p6b_hda`).** T0 =
+    hoangducanh1865/qwen3-1.7b-deita-sft-student, T+ = hoangducanh1865/qwen3-1.7b-ultrafeedback-dpo-teacher,
+    rho = hoangducanh1865/qwen3-0.6b-deita-sft-student, pinned to full commits in `chunkratio.pilot.HDA_CHECKPOINTS`.
+    Chosen because on Winogrande 5-shot and TruthfulQA-MC2 0-shot (lm-eval 0.4.9.2, bf16) the 1.7B pair is within
+    0.6 points of the NARVAL Table 1 teacher rows and rho within 1.4 points of its SFT row
+    (script/modal/benchmark_eval.py). Nothing is trained before CRPD. T+ has no model card: its trainer_state shows
+    1 epoch of DPO on 57,673 UltraFeedback pairs, with rewards near 0 at step 1, but does not name the reference.
+    Without a published LoRA, `hub_teachers.nearest_reference` checks only that T0 is strictly the nearest of
+    {T0, Qwen3-1.7B-Base, Qwen3-1.7B} to T+ in relative L2. That is evidence, not proof, and is recorded as such
+    in every config's assumptions; the run stops if it fails.
+63. **EOS of the trio.** The three tokenizers declare `<|endoftext|>`, but their shared ChatML template ends each
+    assistant turn with `<|im_end|>`, and greedy decoding of rho ends with `<|im_end|>` (checked on two prompts).
+    `<|im_end|>` is therefore the EOS of every role. `load_models` now sets a declared `eos_token` on every
+    tokenizer, as prepare-data and SFT already did; an `eos_token` outside the vocabulary fails.
+64. **Duplicate groups over the whole input.** `prepare_prompts` joins rows that share token ids or a group_id
+    transitively (union-find) before deduplication, so prompt X in groups A and B makes B's other prompts part of
+    X's group, and any split difference inside a group fails. Rows without a split take one hashed split per
+    group (its smallest alias), which equals the previous rule for prompts without duplicates.
+65. **Code identity.** `code_revision()` is the commit plus `+src.` and a hash of the chunkratio sources with LF
+    line endings. Two different uncommitted versions never share a revision, and therefore never share stage
+    cache keys. All earlier caches are keyed without it and are not reused.
+66. **Policy resume and the step budget.** With warmup or cosine the learning rate depends on `steps`, so for
+    those schedules `steps` is part of the policy checkpoint identity and a run cannot be extended on resume.
+    A constant schedule without warmup can still be extended. A checkpoint past the requested steps is refused
+    instead of being reported as the requested count.
+67. **Launcher completion.** `qwen3_pilot.py` and `narval_pair.py` skip a run only when its marker exists and
+    its `resolved_config.json` equals the config about to run. Another config's results in the same output
+    folder stop the launcher instead of being skipped.
+68. **NARVAL report completeness.** `report_narval` refuses rows without a seed, duplicate (method, pair, seed)
+    rows and mixed `protocol` fields. Without `--allow-incomplete` it also needs every Table 1/2 metric per row
+    and three seeds for crpd_main and crpd_raw, as `report_tables` already did.
+69. **Selection against rho (diagnostic, opt-in fallback).** The RM selector records per-prompt rewards; with
+    `selection_baseline` the policy result reports `improved_over_reference` and the paired per-prompt
+    difference of the best checkpoint from rho (mean, normal 95% interval, wins/losses). Opt-in
+    `selection_fallback_to_reference` exports rho when no checkpoint beats it and reports `selected: reference`.
+    It is a different selection rule from the primary protocol and must be named when used.
+70. **Sibling correction audit (diagnostic only).** `diagnostics.json` gains `correction_audit`: for the frozen
+    pairs, the spread of mu_hat differences against delta_T differences and the measure-weighted share of pairs
+    whose preferred side mu_hat flips, by proposing sources; for head_val endpoints of one state, the centred
+    correlation and R^2 of mu_hat with single-rollout returns by endpoint source, with prompt-bootstrap 95%
+    intervals. The head objective and its selection are unchanged; a head trained or selected for sibling
+    differences would be a separate variant.
+71. **Scoring compute.** `score_batch` (candidate scoring, policy training, anchor, coverage) left-pads with
+    position ids and asks the LM head only for the last longest-chunk + 1 positions (`tail_logprobs`, shared
+    with correction scoring), instead of [rows, width, vocab] logits with gradients. Masks are unchanged: prompt
+    and padding unscored, first EOS scored once, later tokens not. Pair diagnostics in evaluate run in
+    microbatches of `diagnostic_batch_size` (default 32) with the same hierarchical weights, and build_targets
+    computes the mu_hat features of a state's siblings in one forward. Values match the previous code to float
+    tolerance, not bit for bit. No A100 timing exists yet.
+72. **bf16 rho rescoring kept.** Caching rho scores per pair in bf16 was not adopted: under autocast a score
+    depends on the microbatch it is computed in, so a cache would break the exact zero margin at student = rho
+    that item 51 restored. The rescoring forward is now tail-only (item 71), which removes most of its cost.

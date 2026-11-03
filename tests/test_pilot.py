@@ -93,3 +93,18 @@ def test_default_pair_is_unchanged() -> None:
     from chunkratio.pilot import PAIR, pilot_assumptions
     assert pilot_assumptions() is PILOT_ASSUMPTIONS and pilot_assumptions(PAIR) is PILOT_ASSUMPTIONS
     assert 'tokenizer' not in preparation_config('train-sft','m','r','d','o')
+
+
+def test_hda_trio_configs_load_every_role_from_the_hub() -> None:
+    """The NARVAL-matching trio: all roles from pinned commits, <|im_end|> EOS, reference check named."""
+    from chunkratio.pilot import HDA_CHECKPOINTS, HDA_PAIR, pilot_assumptions
+    protocol = json.loads(Path('config/crpd/narval/qwen3_1p7b_to_0p6b.json').read_text(encoding='utf-8'))
+    checkpoints = {role:{'path':source['repo'],'revision':source['revision']} for role,source in HDA_CHECKPOINTS.items()}
+    revisions = {k:'sha' for k in ('reward_model','teacher_base_model','student_base_model','sft_dataset','preference_dataset')}
+    cfg = pilot_config(protocol,'crpd_raw',checkpoints,revisions,'splitsha',True,HDA_PAIR)
+    validate(cfg)
+    assert cfg['output'].startswith('output/narval/qwen3_1p7b_to_0p6b_hda/pilot/') and cfg['eos_token'] == '<|im_end|>'
+    assert {role:entry['path'] for role,entry in cfg['models'].items()} == {r:s['repo'] for r,s in HDA_CHECKPOINTS.items()}
+    assumptions = pilot_assumptions(HDA_PAIR)
+    assert cfg['pilot_assumptions'] == assumptions and 'nearest candidate' in assumptions['teacher_pair']
+    assert all(len(source['revision']) == 40 for source in HDA_CHECKPOINTS.values())

@@ -9,6 +9,7 @@ import torch
 from torch import Tensor, nn
 
 from .artifacts import digest
+from .sampling import logits_tail
 
 
 def freeze(model: nn.Module) -> nn.Module:
@@ -106,16 +107,15 @@ def padded(sequences: list[list[int]], device: torch.device, pad: int) -> tuple[
 
 def score_batch(model: nn.Module, prefixes: list[list[int]], chunks: list[list[int]],
                 eos: int, frozen: bool = True) -> Tensor:
-    """One authoritative chunk scorer for frozen roles and gradient-carrying student (§6.1)."""
+    """One authoritative chunk scorer for frozen roles and gradient-carrying student (§6.1).
+
+    The LM head runs only on the positions that predict chunk tokens (tail_logprobs); the student's
+    graph therefore holds [rows, longest chunk + 1, vocab] logits instead of the full sequence width.
+    """
     assert len(prefixes) == len(chunks) > 0 and all(prefixes)
-    device = next(model.parameters()).device
-    seqs = [p+c for p,c in zip(prefixes,chunks)]
-    ids,attention = padded(seqs,device,eos)
     model.eval()
     with torch.no_grad() if frozen else contextlib.nullcontext():
-        logits = model(ids,attention_mask=attention,use_cache=False).logits
-        values,_ = score_tokens(logits,ids,attention,torch.tensor(list(map(len,prefixes)),device=device),
-                              torch.tensor(list(map(len,seqs)),device=device),eos)
+        values,_ = tail_logprobs(model,prefixes,chunks,eos)
     return values.sum(-1)
 
 
@@ -138,6 +138,106 @@ def trajectory_features(model: nn.Module, prefix: list[int], tokens: list[int]) 
     ids = torch.tensor([prefix+tokens[:-1]],device=next(model.parameters()).device)
     hidden = model(ids,attention_mask=torch.ones_like(ids),output_hidden_states=True,use_cache=False).hidden_states[-1]
     return hidden[0,len(prefix)-1:].detach().float()
+
+
+def left_padded(sequences: list[list[int]], device: torch.device, pad: int) -> tuple[Tensor,Tensor,Tensor]:
+    """Left-pad so every sequence ends at the last column; positions count only valid tokens."""
+    assert sequences and all(sequences)
+    width = max(map(len,sequences))
+    ids = torch.full((len(sequences),width),pad,dtype=torch.long,device=device)
+    attention = torch.zeros_like(ids)
+    for i,seq in enumerate(sequences):
+        ids[i,width-len(seq):] = torch.tensor(seq,device=device)
+        attention[i,width-len(seq):] = 1
+    return ids,attention,(attention.cumsum(-1)-1).clamp(min=0)
+
+
+def length_groups(lengths: list[int], tokens_per_batch: int) -> list[list[int]]:
+    """Row indices sorted by length and cut so rows x longest row stays within the budget."""
+    assert tokens_per_batch > 0
+    groups: list[list[int]] = []
+    for i in sorted(range(len(lengths)),key=lambda i:lengths[i]):
+        if groups and (len(groups[-1])+1)*lengths[i] <= tokens_per_batch:
+            groups[-1].append(i)
+        else:
+            groups.append([i])
+    return groups
+
+
+def tail_logprobs(model: nn.Module, prefixes: list[list[int]], suffixes: list[list[int]],
+                  eos: int) -> tuple[Tensor,Tensor]:
+    """FP32 log-probs of each suffix token after its prefix, [rows, longest suffix], and the scored mask (§6.1).
+
+    Rows are left-padded with position ids, so every suffix ends at the last column and the LM head
+    runs only on the last longest-suffix + 1 positions; the backbone still reads each full context.
+    As in score_tokens, prompt and padding are never scored, the first EOS is scored once and later
+    tokens are not. Gradients flow unless the caller disables them.
+    """
+    device = next(model.parameters()).device
+    ids,attention,positions = left_padded([p+s for p,s in zip(prefixes,suffixes)],device,eos)
+    lengths = torch.tensor([len(s) for s in suffixes],device=device)
+    span = max(int(lengths.max()),1)
+    logits = model(ids,attention_mask=attention,position_ids=positions,use_cache=False,
+                   **logits_tail(model,span+1)).logits[:,-(span+1):]
+    # Column j of the tail predicts the token after it; suffix token t of a row with T tokens is
+    # predicted at column span-T+t.
+    offsets = torch.arange(span,device=device)[None,:]
+    valid = offsets < lengths[:,None]
+    index = (span-lengths[:,None]+offsets).clamp(max=span-1)
+    targets = torch.full((len(suffixes),span),eos,dtype=torch.long,device=device)
+    for r,suffix in enumerate(suffixes):
+        targets[r,:len(suffix)] = torch.tensor(suffix,device=device,dtype=torch.long)
+    eos_hits = (targets == eos) & valid
+    mask = valid & (eos_hits.cumsum(-1)-eos_hits.long() == 0)
+    raw = logits.gather(1,index[:,:,None].expand(-1,-1,logits.shape[-1]))
+    raw = raw if raw.dtype == torch.float64 else raw.float()
+    assert torch.isfinite(raw).all(), 'nonfinite prediction logits'
+    logps = raw.log_softmax(-1).gather(-1,targets[:,:,None]).squeeze(-1).masked_fill(~mask,0)
+    assert torch.isfinite(logps).all()
+    return logps,mask
+
+
+@torch.no_grad()
+def continuation_increments_batch(model: nn.Module, prefixes: list[list[int]], suffixes: list[list[int]],
+                                  eos: int, tokens_per_batch: int = 8192) -> list[Tensor]:
+    """continuation_increments for many trajectories at once (§7.3).
+
+    Rows of similar length share a forward of tail_logprobs (LM head on the suffix positions only).
+    """
+    assert len(prefixes) == len(suffixes) and all(prefixes)
+    assert all(eos not in s[:-1] for s in suffixes), 'suffix continues after its first EOS'
+    model.eval()
+    device = next(model.parameters()).device
+    results = [torch.empty(0,device=device) for _ in suffixes]
+    scored = [i for i,s in enumerate(suffixes) if s]
+    for group in length_groups([len(prefixes[i])+len(suffixes[i]) for i in scored],tokens_per_batch):
+        rows = [scored[g] for g in group]
+        logps,_ = tail_logprobs(model,[prefixes[i] for i in rows],[suffixes[i] for i in rows],eos)
+        for r,i in enumerate(rows):
+            results[i] = logps[r,:len(suffixes[i])]
+    return results
+
+
+@torch.no_grad()
+def trajectory_features_batch(model: nn.Module, prefixes: list[list[int]], suffixes: list[list[int]],
+                              tokens_per_batch: int = 8192) -> list[Tensor]:
+    """trajectory_features for many trajectories at once (§6.2).
+
+    Each row is prefix + suffix[:-1], left-padded, so a row's T states are its last T positions.
+    Only one position's logits are requested; the features are the final hidden states.
+    """
+    assert len(prefixes) == len(suffixes) and all(prefixes) and all(suffixes)
+    model.eval()
+    device = next(model.parameters()).device
+    results: list[Tensor] = [torch.empty(0)]*len(suffixes)
+    sequences = [p+s[:-1] for p,s in zip(prefixes,suffixes)]
+    for rows in length_groups(list(map(len,sequences)),tokens_per_batch):
+        ids,attention,positions = left_padded([sequences[i] for i in rows],device,0)
+        hidden = model(ids,attention_mask=attention,position_ids=positions,output_hidden_states=True,
+                       use_cache=False,**logits_tail(model,1)).hidden_states[-1]
+        for r,i in enumerate(rows):
+            results[i] = hidden[r,ids.shape[1]-len(suffixes[i]):].detach().float()
+    return results
 
 
 @torch.no_grad()

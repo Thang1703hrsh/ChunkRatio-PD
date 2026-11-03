@@ -43,6 +43,17 @@ def test_duplicate_split_preflight() -> None:
     """Token mapping mismatch and duplicate cross-split leakage fail before generation (§§5,7)."""
     with pytest.raises(ValueError,match='crosses splits'):
         prepare_prompts([{'prompt_ids':[1],'split':'train'},{'prompt_ids':[1],'split':'test'}],0)
+    # Prompt X carries groups A and B, so B's other prompt Y is X's duplicate group too, in either order.
+    linked = [{'prompt_ids':[1,2],'group_id':'A','split':'train'},{'prompt_ids':[1,2],'group_id':'B','split':'train'},
+              {'prompt_ids':[3],'group_id':'B','split':'test'}]
+    for rows in (linked,linked[::-1]):
+        with pytest.raises(ValueError,match='crosses splits'):
+            prepare_prompts(rows,0)
+    kept = prepare_prompts([{**row,'split':'train'} for row in linked],0)
+    assert sorted(r['prompt_ids'] for r in kept) == [[1,2],[3]]
+    # Unsplit rows of one duplicate group share one hashed split.
+    unsplit = prepare_prompts([{'prompt_ids':[4],'group_id':'C'},{'prompt_ids':[5],'group_id':'C'}],0)
+    assert len({r['split'] for r in unsplit}) == 1
     cfg = load_config('config/crpd/smoke.json')
     models,student,toks,_ = load_models(cfg)
     toks[-1].chat_template = 'different'
@@ -89,6 +100,17 @@ def test_collection_resume_and_gradient_routing(tmp_path: Path) -> None:
     continued_result = continued.train(tmp_path/'partial.pt')
     assert continued_result['history'] == result['history']
     assert fingerprint(continued_student) == fingerprint(student)
+    # A checkpoint past the requested budget is never reported as that budget.
+    with pytest.raises(ValueError,match='beyond steps=1'):
+        ChunkRatioTrainer(copy.deepcopy(models['student_ref']).requires_grad_(True),models['student_ref'],targets,
+                          prompts,short_cfg,info['eos']).train(tmp_path/'policy.pt')
+    # Warmup/cosine depend on the step budget, so a cosine run cannot be extended on resume.
+    cosine = {**cfg,'lr_schedule':'cosine','warmup_ratio':.5}
+    ChunkRatioTrainer(copy.deepcopy(models['student_ref']).requires_grad_(True),models['student_ref'],targets,prompts,
+                      {**cosine,'steps':1},info['eos']).train(tmp_path/'cosine.pt')
+    with pytest.raises(ValueError,match='incompatible policy checkpoint'):
+        ChunkRatioTrainer(copy.deepcopy(models['student_ref']).requires_grad_(True),models['student_ref'],targets,
+                          prompts,cosine,info['eos']).train(tmp_path/'cosine.pt')
 
 
 def test_no_alignment_update_and_exact_zero(tmp_path: Path) -> None:
@@ -153,3 +175,21 @@ def test_overlong_prompts_dropped_before_generation(tmp_path: Path) -> None:
     assert states > 0
     with pytest.raises(ValueError,match='no prompt fits'):
         pipeline({**cfg,'horizon':4096,'output':str(tmp_path/'none')},'validate-config')
+    capped = pipeline({**cfg,'max_prompt_tokens':100,'output':str(tmp_path/'capped')},'validate-config')['ineligible_prompts']
+    assert capped['max_prompt_tokens'] == 100 and set(capped['ids']) == {r['id'] for r in prepare_prompts(rows[1:],0)}
+
+
+def test_code_revision_follows_uncommitted_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Editing any package source changes the revision; line endings alone do not (§10)."""
+    from chunkratio.pipeline import code_revision, source_digest
+    package = tmp_path/'pkg'
+    (package/'sub').mkdir(parents=True)
+    (package/'a.py').write_bytes(b'x = 1\n')
+    (package/'sub'/'b.py').write_bytes(b'y = 2\n')
+    before = source_digest(package)
+    (package/'a.py').write_bytes(b'x = 1\r\n')
+    assert source_digest(package) == before
+    (package/'sub'/'b.py').write_bytes(b'y = 3\n')
+    assert source_digest(package) != before
+    monkeypatch.setenv('CRPD_CODE_REVISION','abc-dirty')
+    assert code_revision() == f'abc-dirty+src.{source_digest()[:16]}'
