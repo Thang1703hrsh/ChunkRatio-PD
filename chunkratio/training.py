@@ -123,6 +123,36 @@ class ChunkRatioTrainer:
                              column('c','target_score'),column('d','target_score'),self.cfg['alpha'])
         return losses,diagnostics(losses,m,u)
 
+    @torch.no_grad()
+    def candidate_logps(self, states: list[tuple[dict[str,Any],list[dict[str,Any]]]]) -> list[tuple[list[float],list[float]]]:
+        """Student and rho scores of each state's candidates, every candidate scored once (DECISIONS 88).
+
+        Same rule as pair_terms: student precision, end-token rule, one shared prefix pass per state with
+        shared_prefix_scoring (else score_batch rows), and rho read from the FP32 cache exactly when
+        pair_terms reads it. Values equal pair_terms' up to floating-point rounding of the grouping.
+        """
+        prefixes = [state['prefix_ids'] for state,_ in states]
+        chunk_lists = [[c['tokens'] for c in candidates] for _,candidates in states]
+        end = self.cfg.get('score_end_token',True)
+        def scores(model: nn.Module) -> list[list[float]]:
+            """Per state, its candidates' summed log-probs as Python floats."""
+            with student_precision(self.cfg):
+                if self.cfg.get('shared_prefix_scoring',False):
+                    return [s.tolist() for s in sibling_logprobs(model,prefixes,chunk_lists,self.eos,end)]
+                flat = score_batch(model,[p for p,cs in zip(prefixes,chunk_lists) for _ in cs],
+                                   [c for cs in chunk_lists for c in cs],self.eos,score_eos=end).tolist()
+            out,offset = [],0
+            for cs in chunk_lists:
+                out.append(flat[offset:offset+len(cs)])
+                offset += len(cs)
+            return out
+        student = scores(self.student)
+        if self.cfg.get('shared_prefix_scoring',False) or self.cfg.get('policy_autocast_dtype') is not None:
+            reference = scores(self.rho)
+        else:
+            reference = [[c['logp_student_ref'] for c in candidates] for _,candidates in states]
+        return list(zip(student,reference))
+
     def anchor_loss(self) -> torch.Tensor:
         """Only crpd_anchor adds fixed-lambda human-pair DPO (§9)."""
         rows = [p for p in self.prompts if 'chosen_ids' in p and 'rejected_ids' in p]

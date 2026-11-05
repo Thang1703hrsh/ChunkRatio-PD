@@ -1,6 +1,7 @@
 """Raw collection sampling and global response stopping (§§5,7)."""
 from __future__ import annotations
 
+import hashlib
 import inspect
 
 import torch
@@ -13,6 +14,15 @@ def stream(seed: int, name: str, device: str = 'cpu') -> torch.Generator:
     """Independent deterministic RNG by semantic source/job (§10)."""
     number = int(digest([seed,name])[:15],16)
     return torch.Generator(device=device).manual_seed(number)
+
+
+def rng_digest(generator: torch.Generator) -> str:
+    """sha256 of a generator's state bytes, the shard record of a draw stream (DECISIONS 88).
+
+    The state before a job is that of stream(seed, name) and the state after it follows by replaying the
+    job, so a digest identifies both; storing the ~5 KB state as JSON integers made the RNG about 98% of
+    every candidate shard (153 of 156 KB at x10)."""
+    return hashlib.sha256(generator.get_state().cpu().numpy().tobytes()).hexdigest()
 
 
 def terminal(response: list[int], horizon: int, eos: int) -> bool:

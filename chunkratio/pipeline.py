@@ -13,7 +13,7 @@ from typing import Any
 
 import torch
 
-from .artifacts import ShardStore, code_revision, digest, read_jsonl, source_digest, stage_key, write_json
+from .artifacts import ShardStore, cache_revision, code_revision, digest, read_jsonl, source_digest, stage_key, write_json
 from .config import collection_seed
 from .collection import (collect_candidates, collect_correction, collect_prefixes, correction_features,
                          prepare_prompts)
@@ -50,13 +50,66 @@ def eligible_prompts(cfg: dict[str,Any], models: dict[str,Any], tokenizers: list
     return prompts,ineligible
 
 
+def pair_diagnostics(trainer: ChunkRatioTrainer, pairs: list[dict[str,Any]], cfg: dict[str,Any]) -> dict[str,float]:
+    """Measure-weighted excess BCE, logit error and saturation of the trained student (DECISIONS 88).
+
+    Every state's candidates that appear in a pair are scored once per model (trainer.candidate_logps:
+    the training rule for precision, end token, shared prefix and cached rho), instead of twice per pair;
+    x10 has 7,108 pairs over 4,770 candidates. Each pair then gets pair_loss/diagnostics from those
+    scores with its hierarchical weight. Runs after training, so no gradient or target changes.
+    """
+    from .math import pair_loss
+    weighted = {'excess_bce':0.,'logit_error':0.,'saturation':0.}
+    if not pairs:
+        return weighted
+    states: dict[str,tuple[dict[str,Any],dict[str,dict[str,Any]]]] = {}
+    for pair in pairs:
+        entry = states.setdefault(pair['state']['id'],(pair['state'],{}))
+        for side in ('c','d'):
+            entry[1].setdefault(pair[side]['id'],pair[side])
+    items = [(state,list(candidates.values())) for state,candidates in states.values()]
+    most = max(len(candidates) for _,candidates in items)
+    widths = [len(state['prefix_ids'])+max(len(c['tokens']) for c in candidates) for state,candidates in items]
+    # Chunk rows per forward as in the former pair grouping (two rows per pair, twice the training budget,
+    # or diagnostic_batch_size pairs); the scores do not depend on the grouping beyond rounding.
+    budget = cfg.get('policy_tokens_per_microbatch')
+    if budget:
+        groups = length_groups(widths,max(1,4*budget//most))
+    else:
+        per = max(1,2*cfg.get('diagnostic_batch_size',32)//most)
+        groups = [list(range(i,min(i+per,len(items)))) for i in range(0,len(items),per)]
+    scores: dict[tuple[str,str],tuple[float,float]] = {}
+    for group in groups:
+        chunk = [items[i] for i in group]
+        for (state,candidates),(student,reference) in zip(chunk,trainer.candidate_logps(chunk)):
+            for candidate,s,r in zip(candidates,student,reference):
+                scores[(state['id'],candidate['id'])] = (s,r)
+    dtype = torch.float64 if next(trainer.student.parameters()).dtype == torch.float64 else torch.float32
+    column = lambda side,j: torch.tensor([scores[(p['state']['id'],p[side]['id'])][j] for p in pairs],dtype=dtype)
+    target = lambda side: torch.tensor([p[side]['target_score'] for p in pairs],dtype=dtype)
+    losses,margin,u = pair_loss(column('c',0),column('d',0),column('c',1),column('d',1),target('c'),target('d'),cfg['alpha'])
+    metrics = diagnostics(losses,margin,u)
+    weights = torch.tensor([p['weight'] for p in pairs],dtype=torch.float64)
+    return {key:float((metrics[key].double()*weights).sum()) for key in weighted}
+
+
 def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
     """Execute requested stage and prerequisites, reusing compatible completed shards (§10)."""
     started = time.perf_counter()
+    # Wall seconds per stage of this invocation (diagnostics cost.stage_seconds); timing only.
+    stage_seconds: dict[str,float] = {}
+    clock = [started]
+    def lap(name: str) -> None:
+        """Add the time since the previous lap to `name`."""
+        now = time.perf_counter()
+        stage_seconds[name] = stage_seconds.get(name,0.)+now-clock[0]
+        clock[0] = now
     models,student,tokenizers,info = load_models(cfg)
+    lap('load_models')
     meter = ForwardMeter({**models,'student':student})
     eos = info['eos']
     identities = {role:fingerprint(model) for role,model in models.items()}
+    lap('fingerprint')
     route = routing(identities['teacher_plus'],identities['teacher_base'],identities['student_ref'])
     prompts,ineligible = eligible_prompts(cfg,models,tokenizers)
     output = Path(cfg['output'])
@@ -87,8 +140,11 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
     write_json(output/'resolved_config.json',cfg)
     if until == 'validate-config':
         return manifest
+    # Collection, head and target keys carry the source/library identity, not the git commit (DECISIONS 87):
+    # a commit alone no longer forces a recollection; the manifest still records the full code revision.
     common = {'models':identities,'tokenizer':info,'horizon':cfg['horizon'],'precision':manifest['precision'],
-              'split_hash':manifest['split_hash'],'collection_seed':collection_seed(cfg),'schema':1,'code_revision':revision,
+              'split_hash':manifest['split_hash'],'collection_seed':collection_seed(cfg),'schema':1,
+              'cache_revision':cache_revision(),'rng_record':'sha256',
               'documents':documents,'feature_convention':'last-valid-token/final-layer/budget'}
     # The sampler decides which tokens are drawn, so every collection key carries it. The GPU rule enters
     # the keys only when set, so default runs keep their stage keys; batch grouping never enters them.
@@ -109,7 +165,9 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
         write_json(output/'diagnostics.json',result)
         return result
     prefix_store = store('prefixes',dependencies)
+    lap('setup')
     states = collect_prefixes(prompts,models['student_ref'],cfg,eos,prefix_store)
+    lap('collect_prefixes')
     if until == 'collect-prefixes':
         return {'states':len(states),'route':route}
     candidate_deps = {**dependencies,'candidate_rule':'suffix' if cfg['variant'] == 'crpd_suffix' else length,
@@ -120,6 +178,7 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
         candidate_deps['end_token'] = 'unscored'
     candidate_store = store('candidates',candidate_deps)
     records = collect_candidates(states,models,cfg,eos,candidate_store)
+    lap('collect_candidates')
     if until == 'collect-candidates':
         return {'states':len(records),'skipped':sum(r['skipped'] for r in records),'route':route}
     bypass_head = route == 'exact_zero_residual' or cfg['variant'] in ('crpd_raw','crpd_suffix')
@@ -141,6 +200,7 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
         head_path = cache/stage_key('head',head_deps)/'head.pt'
         head,head_meta = fit_head(corrections,cfg,head_path,correction_features(
             correction_store,cfg.get('head_feature_cache_mb',0)*1024**2))
+    lap('correction_and_head')
     if until in ('collect-correction','fit-head'):
         return {'head':head_meta,'route':route,'bypassed':bypass_head}
     targets = build_targets(records,head,models,cfg,eos,route)
@@ -162,41 +222,31 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
         models[role].to('cpu')
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    lap('build_targets')
     selector,selection_cost = (None,{}) if cfg.get('synthetic',False) else reward_selector(cfg,prompts,tokenizers[2])
     trainer = ChunkRatioTrainer(student,models['student_ref'],targets,prompts,cfg,eos,selector)
     policy_deps = {'code_revision':revision,'targets':digest(targets),
                    'config':{k:v for k,v in cfg.items() if k not in ('output','steps')}}
     policy_path = cache/stage_key('policy',policy_deps)/'resume.pt'
+    lap('setup')
     policy = trainer.train(policy_path)
+    lap('train_policy')
     write_json(output/'policy_index.json',{'path':str(policy_path),'code_revision':revision})
     frozen_after = {role:fingerprint(model) for role,model in models.items()}
     assert identities == frozen_after,'frozen model parameters changed'
     if head is not None:
         assert fingerprint(head) == head_meta['hash'] and all(p.grad is None for p in head.parameters())
+    lap('fingerprint')
     # Export only the student; pretrained models use their ordinary deployment format.
     if not cfg.get('synthetic',False):
         student.save_pretrained(output/'student')
         tokenizers[2].save_pretrained(output/'student')
     if cfg.get('save_student_state_dict',True) or cfg.get('synthetic',False):
         save_tensor(output/'student.pt',{'state_dict':student.state_dict(),'synthetic':cfg.get('synthetic',False)})
+    lap('export_student')
     if until == 'train-policy':
         return policy
-    # Measure-weighted pair diagnostics in microbatches (each pair keeps its hierarchical weight).
-    weighted = {'excess_bce':0.,'logit_error':0.,'saturation':0.}
-    size = cfg.get('diagnostic_batch_size',32)
-    pairs = targets['pairs']
-    # With a token budget the no-grad pass groups pairs by length like training does (twice the training
-    # budget: no activations are kept for backward); the weighted sums do not depend on the grouping.
-    budget = cfg.get('policy_tokens_per_microbatch')
-    widths = [len(p['state']['prefix_ids'])+max(len(p['c']['tokens']),len(p['d']['tokens'])) for p in pairs]
-    groups = ([[pairs[i] for i in g] for g in length_groups(widths,2*budget)] if budget else
-              [pairs[offset:offset+size] for offset in range(0,len(pairs),size)])
-    with torch.no_grad():
-        for chunk in groups:
-            _,metrics = trainer.pair_terms(chunk)
-            weights = torch.tensor([p['weight'] for p in chunk],dtype=torch.float64)
-            for key in weighted:
-                weighted[key] += float((metrics[key].detach().double().cpu()*weights).sum())
+    weighted = pair_diagnostics(trainer,targets['pairs'],cfg)
     # Endpoint -> state from the candidate records, so endpoint-only correction is audited as well.
     parents = {c['id']:r['state']['id'] for r in records for c in r['candidates']}
     sibling_audit = correction_audit(targets['pairs'],[r for r in corrections if r['seed']['split'] == 'head_val'],head,
@@ -239,7 +289,11 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
                               'reference_candidate_mass':sum(math.exp(v) for v in reference_logps[span]),
                               'end_token_scored':True})
     generated_counts,scored_counts = {},{}
-    all_cost_records = prefix_store.records()+records+corrections+targets['audits']
+    lap('post_training_diagnostics')
+    # Cost counts cover the configured splits only, like the states and candidates (DECISIONS 87).
+    splits = tuple(cfg.get('collection_splits',('train','head_val')))
+    prefix_records = [r for r in prefix_store.records() if r['prompt']['split'] in splits]
+    all_cost_records = prefix_records+records+corrections+targets['audits']
     for record in all_cost_records:
         for field,destination in (('generated_tokens',generated_counts),('scored_tokens',scored_counts)):
             for role,count in record.get(field,{}).items():
@@ -249,7 +303,7 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
               'audit':targets['audits'],'counts':{'states':len(states),'pairs':len(targets['pairs']),
                                                 'correction_trajectories':len(corrections)},
               'cost':{'collection_generated_tokens':generated_counts,'collection_scored_tokens':scored_counts,
-                      'wall_seconds_this_invocation':time.perf_counter()-started,
+                      'wall_seconds_this_invocation':time.perf_counter()-started,'stage_seconds':stage_seconds,
                       'peak_cuda_allocated_bytes':torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0,
                       'gpu_hours':None,'forward_input_tokens_this_invocation':meter.counts,
                       'selection_this_invocation':selection_cost,

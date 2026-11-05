@@ -34,6 +34,22 @@ def code_revision(commit: str | None = None) -> str:
     return f'{commit}+src.{source_digest()[:16]}'
 
 
+def cache_revision() -> str:
+    """Code identity of the collection, head and target caches: the hash of the chunkratio sources that run
+    plus the Python, torch and transformers versions that execute them. Unlike `code_revision` it carries no
+    git commit, so a commit, a launcher edit or a report change keeps the collection; any change to the
+    chunkratio sources or to those libraries still gives new keys. Manifests keep the full code_revision."""
+    import importlib.metadata
+    import platform
+    versions = []
+    for package in ('torch','transformers'):
+        try:
+            versions.append(f'{package}.{importlib.metadata.version(package)}')
+        except importlib.metadata.PackageNotFoundError:
+            versions.append(f'{package}.none')
+    return '+'.join([f'src.{source_digest()[:16]}',f"py.{'.'.join(platform.python_version_tuple()[:2])}",*versions])
+
+
 def digest(value: Any) -> str:
     """Canonical metadata/content identity (§10)."""
     return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
@@ -147,10 +163,12 @@ class ShardStore:
         """Read every completed shard deterministically (§10)."""
         result = []
         for path in sorted(self.path.glob('*.jsonl')):
+            # One read per shard with the same checks as get(): file name, job id and payload checksum.
             record = read_json(path)
-            payload = self.get(record['job_id'])
-            assert payload is not None
-            result.append(payload)
+            if (path.name != digest(record['job_id'])+'.jsonl' or
+                    digest(record['payload']) != record['sha256']):
+                raise ValueError(f'corrupt shard {path}')
+            result.append(record['payload'])
         return result
 
 

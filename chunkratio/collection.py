@@ -15,7 +15,7 @@ from torch import nn
 from .artifacts import ShardStore, digest, read_jsonl, write_json
 from .config import collection_seed
 from .math import suffix_returns
-from .sampling import generate_batch, stream, terminal
+from .sampling import generate_batch, rng_digest, stream, terminal
 from .scoring import continuation_increments_batch, length_groups, score_batch, trajectory_features_batch
 
 
@@ -138,12 +138,15 @@ def collect_prefixes(prompts: list[dict[str,Any]], rho: nn.Module, cfg: dict[str
     seed = collection_seed(cfg)
     # Similar prompt lengths share a batch (less left padding); every prompt has its own stream and the
     # store reads shards by id, so neither the order nor the group size changes any record.
-    pending = sorted((p for p in prompts if p['split'] in ('train','head_val') and store.get(p['id']) is None),
+    # crpd_raw and crpd_suffix use no head, so `collection_splits: ['train']` skips the head_val prompts. Each
+    # prompt has its own stream and shard, so the train records are the same either way (DECISIONS 87).
+    splits = tuple(cfg.get('collection_splits',('train','head_val')))
+    pending = sorted((p for p in prompts if p['split'] in splits and store.get(p['id']) is None),
                      key=lambda p:(len(p['prompt_ids']),p['id']))
     size = cfg.get('prefix_generation_batch_size') or cfg.get('generation_batch_size',8)
     for group in batches(pending,{**cfg,'generation_batch_size':size},lambda p:len(p['prompt_ids'])+cfg['horizon']):
         rngs = [stream(seed,'prefix/'+prompt['id']) for prompt in group]
-        befores = [rng.get_state().tolist() for rng in rngs]
+        befores = [rng_digest(rng) for rng in rngs]
         responses = generate_batch(rho,[p['prompt_ids'] for p in group],[cfg['horizon']]*len(group),eos,rngs,
                                    gpu_sampling=cfg.get('gpu_sampling',False))
         for prompt,response,rng,before in zip(group,responses,rngs,befores):
@@ -154,9 +157,10 @@ def collect_prefixes(prompts: list[dict[str,Any]], rho: nn.Module, cfg: dict[str
                        'response_ids':response[:n],'n':n} for n in selected]
             store.put(prompt['id'],{'prompt':prompt,'response':response,'states':states,
                                    'schedule_positions':positions,'selected_positions':selected,
-                                   'rng_before':before,'rng_after':rng.get_state().tolist(),
+                                   'rng_before':before,'rng_after':rng_digest(rng),
                                    'generated_tokens':{'student_ref':len(response)}})
-    return [s for record in store.records() for s in record['states']]
+    # Only the configured splits, so a shared store that also holds head_val shards gives the same states.
+    return [s for record in store.records() for s in record['states'] if s['split'] in splits]
 
 
 def collect_candidates(states: list[dict[str,Any]], models: dict[str,nn.Module], cfg: dict[str,Any],
@@ -178,12 +182,12 @@ def collect_candidates(states: list[dict[str,Any]], models: dict[str,nn.Module],
             for source in ('student_ref','teacher_plus'):
                 jobs = [(state,i) for state in group for i in range(per_source)]
                 rngs = [stream(seed,f"candidate/{state['id']}/{source}/{i}") for state,i in jobs]
-                befores = [rng.get_state().tolist() for rng in rngs]
+                befores = [rng_digest(rng) for rng in rngs]
                 with timed(totals,'generate_'+source):
                     tokens = generate_batch(models[source],[state['prefix_ids'] for state,_ in jobs],
                                             [cfg['horizon']-state['n'] for state,_ in jobs],eos,rngs,length,
                                             gpu_sampling=cfg.get('gpu_sampling',False))
-                draws[source] = [(t,{'before':b,'after':r.get_state().tolist()}) for t,b,r in zip(tokens,befores,rngs)]
+                draws[source] = [(t,{'before':b,'after':rng_digest(r)}) for t,b,r in zip(tokens,befores,rngs)]
         prepared = []
         for index,state in enumerate(group):
             with record_errors('candidate state',state['id']):
@@ -233,7 +237,9 @@ def collect_candidates(states: list[dict[str,Any]], models: dict[str,nn.Module],
                     for record in prepared:
                         store.put(record['state']['id'],record)
     report_timing(cfg,'collect-candidates',totals,len(pending))
-    return store.records()
+    # Only the requested states: a shared store may also hold other splits' shards (DECISIONS 87).
+    wanted = {s['id'] for s in states}
+    return [r for r in store.records() if r['state']['id'] in wanted]
 
 
 def correction_seeds(candidates: list[dict[str,Any]], cfg: dict[str,Any]) -> list[dict[str,Any]]:
@@ -278,7 +284,7 @@ def collect_correction(candidates: list[dict[str,Any]], models: dict[str,nn.Modu
     for group in batches(pending,{**cfg,'generation_batch_size':size},lambda job:len(job[0]['prefix_ids'])+cfg['horizon']-job[0]['n']):
         with record_errors('correction job',','.join(job_id for _,job_id in group)):
             rngs = [stream(collection_seed(cfg),'correction/'+job_id) for _,job_id in group]
-            befores = [rng.get_state().tolist() for rng in rngs]
+            befores = [rng_digest(rng) for rng in rngs]
             prefixes = [seed['prefix_ids'] for seed,_ in group]
             with timed(totals,'generate_'+source):
                 suffixes = generate_batch(models[source],prefixes,[cfg['horizon']-seed['n'] for seed,_ in group],eos,rngs,
@@ -301,7 +307,7 @@ def collect_correction(candidates: list[dict[str,Any]], models: dict[str,nn.Modu
                 store.put(job_id,{'id':job_id,'seed':seed,'tokens':tokens,'features_sha256':features_sha256,
                                   'features_shape':list(features.shape),'budgets':budgets,
                                   'increments':increments.cpu().tolist(),'labels':labels.cpu().tolist(),
-                                  'terminal_target':0.,'rng_before':before,'rng_after':rng.get_state().tolist(),
+                                  'terminal_target':0.,'rng_before':before,'rng_after':rng_digest(rng),
                                   'generated_tokens':{source:len(tokens)},
                                   'scored_tokens':{numerator:len(tokens),'teacher_base':len(tokens)}})
         # Labels, the features' copy to host and shard writes.

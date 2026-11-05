@@ -5,6 +5,7 @@ import json
 import math
 import random
 import statistics
+import time
 from collections.abc import Callable
 from collections import defaultdict
 from typing import Any
@@ -143,15 +144,22 @@ def reward_selector(cfg: dict[str,Any], prompts: list[dict[str,Any]], tokenizer:
     def select(student: Any) -> float:
         """Mean independent reward of generated responses on fixed select prompts (§11.1)."""
         cost['selection_calls'] += 1
+        started = time.perf_counter()
         responses = generate_rows(student)
+        generated = time.perf_counter()
         # The RM waits in host memory and visits the GPU only while it scores, after generation.
         rm = reward_model().to(cfg['device'])
+        loaded_rm = time.perf_counter()
         try:
             scores = [score_response(rm,row,response) for row,response in zip(rows,responses)]
         finally:
             rm.to('cpu')
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+        # Wall seconds (timing only): generation, RM load and transfer, RM scoring and offload.
+        for key,seconds in (('generate_seconds',generated-started),('rm_load_seconds',loaded_rm-generated),
+                            ('rm_score_seconds',time.perf_counter()-loaded_rm)):
+            cost[key] = cost.get(key,0.)+seconds
         # Per-prompt rewards in select-row order, for paired comparisons between checkpoints and rho;
         # the responses themselves serve diagnostics (length, EOS, repetition).
         select.last_scores = list(scores)

@@ -299,3 +299,154 @@ def test_code_revision_follows_uncommitted_sources(tmp_path: Path, monkeypatch: 
     assert source_digest(package) != before
     monkeypatch.setenv('CRPD_CODE_REVISION','abc-dirty')
     assert code_revision() == f'abc-dirty+src.{source_digest()[:16]}'
+
+
+def test_train_only_collection_keeps_raw_pairs_and_student(tmp_path: Path) -> None:
+    """crpd_raw with collection_splits ['train'] skips the head_val prompts, yet gives the same train
+    states, candidates, pairs, weights, targets and trained student as the default collection (DECISIONS 87)."""
+    import torch
+    from chunkratio.artifacts import read_json
+    from chunkratio.pipeline import pipeline
+    base = {**load_config('config/crpd/smoke.json'),'variant':'crpd_raw','steps':2}
+    a = pipeline({**base,'output':str(tmp_path/'all')},'evaluate')
+    b = pipeline({**base,'collection_splits':['train'],'output':str(tmp_path/'train')},'evaluate')
+    ta = read_json(Path(read_json(tmp_path/'all'/'target_index.json')['path']))
+    tb = read_json(Path(read_json(tmp_path/'train'/'target_index.json')['path']))
+    assert {r['state']['split'] for r in ta['records']} == {'train','head_val'}
+    assert {r['state']['split'] for r in tb['records']} == {'train'}
+    assert tb['pairs'] == ta['pairs']
+    assert b['counts']['pairs'] == a['counts']['pairs'] and b['counts']['states'] < a['counts']['states']
+    sa = torch.load(tmp_path/'all'/'student.pt',weights_only=True)['state_dict']
+    sb = torch.load(tmp_path/'train'/'student.pt',weights_only=True)['state_dict']
+    assert all(torch.equal(sa[k],sb[k]) for k in sa)
+
+
+def test_shared_store_gives_only_configured_splits(tmp_path: Path) -> None:
+    """A train-only run on a cache that already holds head_val shards returns the train states only, so its
+    pairs and counts do not depend on which runs filled the cache."""
+    from chunkratio.pipeline import pipeline
+    base = {**load_config('config/crpd/smoke.json'),'variant':'crpd_raw','output':str(tmp_path/'run')}
+    full = pipeline(base,'collect-prefixes')['states']
+    fresh = pipeline({**base,'collection_splits':['train'],'output':str(tmp_path/'fresh')},'collect-prefixes')['states']
+    shared = pipeline({**base,'collection_splits':['train']},'collect-prefixes')['states']
+    assert shared == fresh < full
+    # Candidates too: the shared store holds head_val shards after a full collection.
+    pipeline(base,'collect-candidates')
+    fresh_c = pipeline({**base,'collection_splits':['train'],'output':str(tmp_path/'fresh')},'collect-candidates')
+    shared_c = pipeline({**base,'collection_splits':['train']},'collect-candidates')
+    assert shared_c['states'] == fresh_c['states'] < pipeline(base,'collect-candidates')['states']
+    # Full evaluate on the shared cache equals the fresh train-only run, cost counts included.
+    a = pipeline({**base,'steps':1,'collection_splits':['train'],'output':str(tmp_path/'fresh')},'evaluate')
+    b = pipeline({**base,'steps':1,'collection_splits':['train']},'evaluate')
+    assert a['counts'] == b['counts']
+    assert a['cost']['collection_generated_tokens'] == b['cost']['collection_generated_tokens']
+    assert len(a['candidate_coverage']) == len(b['candidate_coverage'])
+
+
+def test_store_records_detect_corruption(tmp_path: Path) -> None:
+    """records() reads each shard once and still rejects a tampered payload or a renamed shard."""
+    import json
+    store = ShardStore(tmp_path/'s',{'stage':'t'})
+    store.put('a',{'x':1})
+    store.put('b',{'x':2})
+    assert sorted(r['x'] for r in store.records()) == [1,2]
+    path = next((tmp_path/'s').glob('*.jsonl'))
+    record = json.loads(path.read_text())
+    record['payload']['x'] = 99
+    path.write_text(json.dumps(record))
+    with pytest.raises(ValueError,match='corrupt shard'):
+        store.records()
+
+
+def test_collection_splits_validation() -> None:
+    """Train-only collection is for head-free variants; malformed split lists fail closed."""
+    from chunkratio.config import validate
+    base = load_config('config/crpd/smoke.json')
+    validate({**base,'variant':'crpd_raw','collection_splits':['train']})
+    for bad in (['head_val'],['train','select'],'train',['train','train']):
+        with pytest.raises(ValueError):
+            validate({**base,'variant':'crpd_raw','collection_splits':bad})
+    with pytest.raises(ValueError,match='crpd_raw and crpd_suffix only'):
+        validate({**base,'variant':'crpd_main','collection_splits':['train']})
+
+
+def test_cache_keys_ignore_commit_but_follow_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Collection keys carry the source/library identity, not the git commit: a new commit reuses the
+    collection, while the manifest still records the full code revision (DECISIONS 87)."""
+    from chunkratio.artifacts import cache_revision, read_json, source_digest
+    from chunkratio.pipeline import pipeline
+    cfg = {**load_config('config/crpd/smoke.json'),'variant':'crpd_raw','output':str(tmp_path/'run')}
+    assert cache_revision().startswith(f'src.{source_digest()[:16]}+py.')
+    stores = lambda: sorted(p.name for p in (tmp_path/'run'/'cache').iterdir())
+    monkeypatch.setenv('CRPD_CODE_REVISION','aaa')
+    pipeline(cfg,'collect-candidates')
+    first = stores()
+    monkeypatch.setenv('CRPD_CODE_REVISION','bbb')
+    pipeline(cfg,'collect-candidates')
+    assert stores() == first
+    assert read_json(tmp_path/'run'/'manifest.json')['code_revision'].startswith('bbb+src.')
+
+
+@pytest.mark.parametrize('options',[{},{'shared_prefix_scoring':True},{'score_end_token':False},
+                                    {'policy_tokens_per_microbatch':64}])
+def test_pair_diagnostics_score_each_candidate_once(tmp_path: Path, options: dict) -> None:
+    """Post-training diagnostics from one score per candidate equal the former per-pair pass (pair_terms
+    over every pair) for the default rule, shared-prefix scoring, the unscored end token and a token budget,
+    while scoring fewer chunks than two per pair (DECISIONS 88)."""
+    import torch
+    from chunkratio.artifacts import read_jsonl
+    from chunkratio.pipeline import pair_diagnostics
+    cfg = {**load_config('config/crpd/smoke.json'),'variant':'crpd_raw',**options}
+    models,student,_,info = load_models(cfg)
+    prompts = prepare_prompts(read_jsonl(Path(cfg['prompts'])),cfg['seed'])
+    a,b = [ShardStore(tmp_path/name,{'test':name}) for name in ('prefix','candidate')]
+    states = collect_prefixes(prompts,models['student_ref'],cfg,info['eos'],a)
+    records = collect_candidates(states,models,cfg,info['eos'],b)
+    targets = build_targets(records,None,models,cfg,info['eos'],'reference_mean')
+    trainer = ChunkRatioTrainer(student,models['student_ref'],targets,prompts,{**cfg,'steps':2},info['eos'])
+    trainer.train(tmp_path/'policy.pt')
+    pairs = targets['pairs']
+    expected = {'excess_bce':0.,'logit_error':0.,'saturation':0.}
+    with torch.no_grad():
+        _,metrics = trainer.pair_terms(pairs)
+        weights = torch.tensor([p['weight'] for p in pairs],dtype=torch.float64)
+        for key in expected:
+            expected[key] = float((metrics[key].double().cpu()*weights).sum())
+    calls = []
+    original = trainer.candidate_logps
+    trainer.candidate_logps = lambda chunk: calls.append(sum(len(c) for _,c in chunk)) or original(chunk)
+    got = pair_diagnostics(trainer,pairs,cfg)
+    assert expected['logit_error'] > 0
+    for key in expected:
+        assert got[key] == pytest.approx(expected[key],rel=1e-5,abs=1e-7)
+    unique = len({(p['state']['id'],p[s]['id']) for p in pairs for s in ('c','d')})
+    assert sum(calls) == unique < 2*len(pairs)
+
+
+def test_shards_record_rng_digests_that_replay(tmp_path: Path) -> None:
+    """Shards keep sha256 digests of the draw streams instead of ~5 KB integer lists: the 'before' digest is
+    the named stream's initial state, and replaying a candidate draw reproduces its tokens and 'after' digest
+    (DECISIONS 88)."""
+    import json
+    from chunkratio.artifacts import read_jsonl
+    from chunkratio.config import collection_seed
+    from chunkratio.sampling import generate_batch, rng_digest
+    cfg = load_config('config/crpd/smoke.json')
+    models,_,_,info = load_models(cfg)
+    prompts = prepare_prompts(read_jsonl(Path(cfg['prompts'])),cfg['seed'])
+    a,b = [ShardStore(tmp_path/name,{'test':name}) for name in ('prefix','candidate')]
+    states = collect_prefixes(prompts,models['student_ref'],cfg,info['eos'],a)
+    records = collect_candidates(states,models,cfg,info['eos'],b)
+    seed = collection_seed(cfg)
+    prefix = a.records()[0]
+    assert prefix['rng_before'] == rng_digest(stream(seed,'prefix/'+prefix['prompt']['id']))
+    record = records[0]
+    state,draw = record['state'],record['rng']['teacher_plus'][0]
+    rng = stream(seed,f"candidate/{state['id']}/teacher_plus/0")
+    assert draw['before'] == rng_digest(rng)
+    tokens = generate_batch(models['teacher_plus'],[state['prefix_ids']],[cfg['horizon']-state['n']],info['eos'],
+                            [rng],cfg['chunk_length'])[0]
+    assert draw['after'] == rng_digest(rng)
+    assert any(c['tokens'] == tokens and 'teacher_plus' in c['sources'] for c in record['candidates'])
+    sizes = [len(json.dumps(r['rng'])) for r in records]
+    assert max(sizes) < 2000

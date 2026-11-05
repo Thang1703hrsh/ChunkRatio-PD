@@ -165,6 +165,11 @@ GPU_TAG = '' if CRPD_GPU == 'A100-80GB' else '-'+CRPD_GPU.lower().replace('-',''
 # CRPD_OUTPUT_TAG=v2 writes outputs and cache under a tag as well, so a rerun with new code sits beside
 # the finished results of an earlier config instead of colliding with them.
 OUTPUT_TAG = os.environ.get('CRPD_OUTPUT_TAG','')
+# CRPD_CACHE_TAG=shared keeps the cache under its own tag while CRPD_OUTPUT_TAG names the outputs, so runs
+# with new output names reuse one collection (the stage keys still check models, data, sampler, end-token
+# rule and code; DECISIONS 87). Unset: the cache follows the output tag, as before.
+CACHE_TAG = os.environ.get('CRPD_CACHE_TAG','')
+CACHE_SUFFIX = GPU_TAG+('-'+CACHE_TAG if CACHE_TAG else '-'+OUTPUT_TAG if OUTPUT_TAG else '')
 GPU_TAG += '-'+OUTPUT_TAG if OUTPUT_TAG else ''
 # CRPD_COMPACT=1: the user's compact configuration (DECISIONS), tagged so it never shares outputs or cache
 # with protocol runs. K=2 (one rho + one T+ sibling), correction rolled out from every nonterminal
@@ -174,6 +179,7 @@ COMPACT = os.environ.get('CRPD_COMPACT','0') == '1'
 COMPACT_SETTINGS = {'candidates':2,'correction_seeds':'endpoints','endpoint_fraction':1.,'head_positions':'boundary',
                     'states_per_prompt':2,'selection_interval':50}
 GPU_TAG += '-compact' if COMPACT else ''
+CACHE_SUFFIX += '-compact' if COMPACT else ''
 # CRPD_ALPHAS=0.03,0.1 trains each variant once per alpha instead of the protocol alpha. Collection,
 # head and target keys do not contain alpha, so the sweep reuses them while the code revision is the same.
 ALPHA_TEXT = os.environ.get('CRPD_ALPHAS','')
@@ -212,7 +218,7 @@ image = (modal.Image.debian_slim(python_version='3.12')
                'PYTORCH_CUDA_ALLOC_CONF':'expandable_segments:True',
                'CRPD_SCALE':SCALE,'CRPD_HF_PUSH':'1' if HF_PUSH else '0','CRPD_TEACHERS':TEACHERS,
                'CRPD_GPU':CRPD_GPU,'CRPD_ALPHAS':ALPHA_TEXT,'CRPD_SWEEP_LITE':'1' if SWEEP_LITE else '0',
-               'CRPD_VARIANTS':VARIANT_TEXT,'CRPD_OUTPUT_TAG':OUTPUT_TAG,'CRPD_COMPACT':'1' if COMPACT else '0',
+               'CRPD_VARIANTS':VARIANT_TEXT,'CRPD_OUTPUT_TAG':OUTPUT_TAG,'CRPD_CACHE_TAG':CACHE_TAG,'CRPD_COMPACT':'1' if COMPACT else '0',
                'CRPD_CORRECTION_BATCH':CORRECTION_BATCH,'CRPD_FAST_OPTIONS':'1' if FAST_OPTIONS else '0',
                'CRPD_BIG_BATCH':'1' if BIG_BATCH else '0','CRPD_STEPS':STEPS,'CRPD_BATCH_SIZE':BATCH_SIZE,
                'CRPD_TURBO':'1' if TURBO else '0','CRPD_ONE_PROCESS':'1' if ONE_PROCESS else '0',
@@ -549,8 +555,12 @@ def write_pilot_configs() -> dict[str,str]:
                                                    '(endpoint_fraction 1), head on chunk-boundary states only, '
                                                    '2 states per prompt, selection every 50 steps; a user-requested '
                                                    'deviation from the K=4 protocol (DECISIONS)')}
-        if GPU_TAG:
-            cfg.update(output=f'{ROOT}/{variant}{GPU_TAG}/seed0',cache_root=f'{ROOT}/cache{GPU_TAG}')
+        if GPU_TAG or CACHE_SUFFIX:
+            cfg.update(output=f'{ROOT}/{variant}{GPU_TAG}/seed0',cache_root=f'{ROOT}/cache{CACHE_SUFFIX}')
+        # Turbo raw/suffix runs (no head): collect the train split only and skip the duplicate student.pt
+        # (the HF export holds the same weights). Train pairs and targets are unchanged (DECISIONS 87).
+        if TURBO and variant in ('crpd_raw','crpd_suffix'):
+            cfg.update(collection_splits=['train'],save_student_state_dict=False)
         if SWEEP_LITE:
             cfg['selection_baseline'] = False
         path.write_text(json.dumps(cfg,indent=2),encoding='utf-8')

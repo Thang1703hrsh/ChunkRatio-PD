@@ -83,6 +83,13 @@ def validate(cfg: dict[str,Any]) -> None:
         raise ValueError('teacher_gap_scale must be a number in (0, 1]')
     if gamma != 1 and cfg['variant'] != 'crpd_raw':
         raise ValueError('teacher_gap_scale < 1 is implemented for crpd_raw only')
+    # The head is fitted on head_val corrections, so only head-free variants may collect train alone.
+    splits = cfg.get('collection_splits',['train','head_val'])
+    if (not isinstance(splits,(list,tuple)) or 'train' not in splits or
+            not set(splits) <= {'train','head_val'} or len(set(splits)) != len(splits)):
+        raise ValueError("collection_splits must be ['train'] or ['train', 'head_val']")
+    if 'head_val' not in splits and cfg['variant'] not in ('crpd_raw','crpd_suffix'):
+        raise ValueError('collection_splits without head_val is implemented for crpd_raw and crpd_suffix only')
     for key,default in (('score_tokens_per_batch',8192),('head_feature_cache_mb',0)):
         value = cfg.get(key,default)
         if type(value) is not int or value < (0 if key == 'head_feature_cache_mb' else 1):

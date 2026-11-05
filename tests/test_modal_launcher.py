@@ -168,3 +168,26 @@ def test_gamma_sweep_names_and_guards(monkeypatch) -> None:
         load(CRPD_GAMMAS='0.3',CRPD_VARIANTS='crpd_raw')
     with pytest.raises(SystemExit,match=r'in \(0, 1\]'):
         load(CRPD_ALPHAS='0.03',CRPD_GAMMAS='0,0.3',CRPD_VARIANTS='crpd_raw')
+
+
+def test_cache_tag_is_independent_of_output_tag(monkeypatch) -> None:
+    """CRPD_CACHE_TAG names the cache apart from the outputs; unset, the cache follows the output tag as
+    before; the tag reaches the container (DECISIONS 87)."""
+    def load(**env):
+        """Import the launcher under one environment."""
+        for key in ('CRPD_OUTPUT_TAG','CRPD_CACHE_TAG','CRPD_GPU','CRPD_COMPACT'):
+            monkeypatch.delenv(key,raising=False)
+        for key,value in {'CRPD_SCALE':'x10','CRPD_TEACHERS':'hda',**env}.items():
+            monkeypatch.setenv(key,value)
+        spec = importlib.util.spec_from_file_location('qwen3_pilot_cache',Path('script/modal/qwen3_pilot.py'))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    assert (load().GPU_TAG,load().CACHE_SUFFIX) == ('','')
+    old = load(CRPD_OUTPUT_TAG='gamma')
+    assert (old.GPU_TAG,old.CACHE_SUFFIX) == ('-gamma','-gamma')
+    new = load(CRPD_OUTPUT_TAG='g01',CRPD_CACHE_TAG='shared')
+    assert (new.GPU_TAG,new.CACHE_SUFFIX) == ('-g01','-shared')
+    compact = load(CRPD_OUTPUT_TAG='g01',CRPD_CACHE_TAG='shared',CRPD_COMPACT='1')
+    assert (compact.GPU_TAG,compact.CACHE_SUFFIX) == ('-g01-compact','-shared-compact')
+    assert "'CRPD_CACHE_TAG':CACHE_TAG" in Path('script/modal/qwen3_pilot.py').read_text(encoding='utf-8')

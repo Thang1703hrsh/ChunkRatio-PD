@@ -498,3 +498,45 @@ distillation stage (`scripts/run_narval.py`); it has no SFT or teacher-DPO code 
     labels come mainly from GPT-4 ratings, so they are called available preference labels, not human labels.
     Tests: `test_teacher_gap_scale_scales_raw_targets_only`, `test_gamma_sweep_shares_collection_and_keys_targets`,
     `test_gamma_sweep_names_and_guards`.
+87. **CRPD time optimizations that keep results (user request, 5 November 2026).** Reviewed against the code and
+    the gamma runs (gamma 1: 36.8 min with collection, collect-candidates 601 s for 1,513 states; gamma 0.1:
+    22.7 min reusing it). (a) Collection, correction, head and target keys carry `cache_revision` (hash of the
+    chunkratio sources + Python, torch and transformers versions) instead of the git commit. The gamma
+    collection was keyed `d192806-dirty+src.ef4f37bd` while HEAD 1c21d1d has the same sources, so a commit alone
+    forced a recollection. Manifests and the policy key keep the full code_revision; any source or library
+    change still gives new keys. Existing caches get new key names (they were reachable only from their own
+    commit). (b) `collection_splits: ['train']` (crpd_raw and crpd_suffix only; validated): the head_val prompts
+    are not collected. Each prompt has its own stream and shard, so train states, candidates, pairs, weights,
+    targets and the trained student are identical (test); at x10 this skips 160 of 800 collected prompts. A
+    store that also holds head_val shards returns the configured splits only. `candidate_coverage` and
+    `counts.states` then cover train states only. (c) Launcher `CRPD_CACHE_TAG` names the cache apart from
+    `CRPD_OUTPUT_TAG` (unset: unchanged behaviour). Turbo crpd_raw/crpd_suffix set `collection_splits: ['train']`
+    and `save_student_state_dict: false` (the HF export holds the same weights). (d) `cost.stage_seconds` and
+    selection `generate_seconds`, `rm_load_seconds`, `rm_score_seconds` record where wall time goes (timing only).
+    Not done: lazy loading of the teachers when every collection stage is cached (needs trusted fingerprint
+    records; estimated 1-2 min per reuse run, to be measured with (d) first); precomputed rho log-probs (pairs
+    are seen about 2.7 times at x10 but about once in a full-data epoch, so little gain at full scale, and the
+    exact-zero initial margin depends on scoring rho exactly as the student); smaller K or fewer steps (they
+    change the data or the training, not the speed of the same method). Tests:
+    `test_train_only_collection_keeps_raw_pairs_and_student`, `test_shared_store_gives_only_configured_splits`,
+    `test_collection_splits_validation`, `test_cache_keys_ignore_commit_but_follow_sources`,
+    `test_cache_tag_is_independent_of_output_tag`. Follow-up from an external (Codex) review: `collect_candidates`
+    returned every record of a shared store (head_val included) and the cost counts read every prefix shard;
+    both now follow the requested states/splits, and a full evaluate on a shared cache equals a fresh train-only
+    run (counts, cost, coverage). `ShardStore.records()` read each shard twice (once for the job id, once in
+    get()); it now reads once with the same name, job-id and checksum checks (`test_store_records_detect_corruption`).
+88. **Post-training diagnostics per candidate and RNG digests in shards (user request, 5 November 2026; from the
+    Codex review, items 2 and 3).** Neither changes data, targets, loss or gradients. (a) `pair_diagnostics`
+    scores every candidate that appears in a pair once per model (`ChunkRatioTrainer.candidate_logps`, the
+    training rule: student precision, end-token rule, one shared prefix pass per state with
+    shared_prefix_scoring, cached FP32 rho exactly where pair_terms reads it), then evaluates pair_loss and the
+    diagnostics for all pairs from those scores. x10: 4,770 candidates scored instead of 14,216 pair sides
+    (about 3x fewer); at full data the saving grows with the pair count. Groups keep the former chunk-row
+    budget. Values equal the per-pair pass up to rounding of the grouping
+    (`test_pair_diagnostics_score_each_candidate_once`: default, shared prefix, unscored end token, token budget).
+    (b) Shards record `rng_digest` (sha256 of the generator state bytes) instead of the state as a JSON integer
+    list (19 KB each, eight per candidate shard). The before-state is that of `stream(seed, name)` and the
+    after-state follows by replaying the job, so the digests identify both
+    (`test_shards_record_rng_digests_that_replay`). Candidate shards: about 142 KB -> 2.3 KB in the smoke cache;
+    x10 about 236 MB -> 4 MB of JSON written and read. Keys carry `rng_record: sha256`, so no store mixes the
+    two formats. Nothing read the stored states.
