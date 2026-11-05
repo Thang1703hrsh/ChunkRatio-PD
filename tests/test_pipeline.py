@@ -158,6 +158,112 @@ def test_selection_and_checkpoint_cadence(tmp_path: Path, monkeypatch: pytest.Mo
         validate({**unresolved,'synthetic':False})
 
 
+def test_sampler_choice_is_part_of_every_collection_key(tmp_path: Path) -> None:
+    """Switching gpu_sampling on a shared cache must collect afresh, never reuse the other sampler's
+    rollouts; the default sampler keeps its existing keys, and batch grouping does not change keys."""
+    from chunkratio.pipeline import pipeline
+    cfg = {**load_config('config/crpd/smoke.json'),'output':str(tmp_path/'run')}
+    pipeline(cfg,'collect-prefixes')
+    pipeline({**cfg,'generation_batch_size':1},'collect-prefixes')
+    caches = lambda: sorted(p.name for p in (tmp_path/'run'/'cache').iterdir() if p.name.startswith('prefixes-'))
+    default = caches()
+    assert len(default) == 1
+    pipeline({**cfg,'gpu_sampling':True},'collect-prefixes')
+    both = caches()
+    assert len(both) == 2 and default[0] in both
+    from chunkratio.artifacts import read_json
+    responses = {name:sorted(tuple(read_json(p)['payload']['response'])
+                             for p in (tmp_path/'run'/'cache'/name).glob('*.jsonl')) for name in both}
+    assert responses[both[0]] != responses[both[1]]
+
+
+@pytest.mark.parametrize('autocast',[None,'bfloat16'])
+def test_shared_prefix_scoring_matches_default_end_to_end(tmp_path: Path, autocast: object) -> None:
+    """shared_prefix_scoring (candidate scores, student and rho pair scores) reproduces the default run:
+    candidate log-probs, every step's loss and the pair diagnostics agree up to rounding."""
+    from chunkratio.artifacts import read_json
+    from chunkratio.pipeline import pipeline
+    base = {**load_config('config/crpd/smoke.json'),'variant':'crpd_raw','steps':3,'policy_autocast_dtype':autocast}
+    runs = {}
+    for name,extra in (('default',{}),('shared',{'shared_prefix_scoring':True,'score_tokens_per_batch':64})):
+        result = pipeline({**base,**extra,'output':str(tmp_path/name)},'evaluate')
+        records = {r['state']['id']:r for r in read_json(Path(read_json(tmp_path/name/'target_index.json')['path']))['records']}
+        runs[name] = (result,records)
+    (a,ra),(b,rb) = runs['default'],runs['shared']
+    assert ra.keys() == rb.keys()
+    for state_id,record in ra.items():
+        for c,d in zip(record['candidates'],rb[state_id]['candidates']):
+            assert c['tokens'] == d['tokens']
+            for key in ('logp_student_ref','logp_teacher_base','logp_teacher_plus'):
+                assert c[key] == pytest.approx(d[key],abs=1e-4)
+    losses = lambda r: [h['loss'] for h in r['policy']['history'] if h['loss'] is not None]
+    assert losses(a) == pytest.approx(losses(b),abs=2e-4)
+    for key,value in a['pair_diagnostics'].items():
+        assert b['pair_diagnostics'][key] == pytest.approx(value,abs=1e-3)
+
+
+def test_unscored_end_token_has_its_own_candidate_cache(tmp_path: Path) -> None:
+    """score_end_token=False rescored candidates under a separate key: same tokens, and every chunk that
+    ends with EOS loses exactly that token's score; chunks without EOS keep theirs."""
+    from chunkratio.artifacts import read_json
+    from chunkratio.pipeline import pipeline
+    cfg = {**load_config('config/crpd/smoke.json'),'variant':'crpd_raw','output':str(tmp_path/'run')}
+    pipeline(cfg,'collect-candidates')
+    pipeline({**cfg,'score_end_token':False},'collect-candidates')
+    stores = sorted(p for p in (tmp_path/'run'/'cache').iterdir() if p.name.startswith('candidates-'))
+    assert len(stores) == 2
+    records = [{read_json(p)['payload']['state']['id']:read_json(p)['payload'] for p in store.glob('*.jsonl')} for store in stores]
+    assert records[0].keys() == records[1].keys()
+    eos = load_models(cfg)[3]['eos']
+    changed = 0
+    for state_id,a in records[0].items():
+        for c,d in zip(a['candidates'],records[1][state_id]['candidates']):
+            assert c['tokens'] == d['tokens']
+            if eos in c['tokens']:
+                changed += any(abs(c[k]-d[k]) > 1e-6 for k in ('logp_teacher_plus','logp_teacher_base','logp_student_ref'))
+            else:
+                assert all(abs(c[k]-d[k]) < 1e-5 for k in ('logp_teacher_plus','logp_teacher_base','logp_student_ref'))
+    assert changed > 0
+
+
+def test_gamma_sweep_shares_collection_and_keys_targets(tmp_path: Path) -> None:
+    """gamma runs on one cache reuse the gamma = 1 collection (one prefix and one candidate store); an
+    explicit gamma = 1 keeps the original target store, gamma < 1 gets its own, and its targets are
+    gamma times the gamma = 1 targets with unchanged pairs and weights (DECISIONS)."""
+    from chunkratio.artifacts import read_json
+    from chunkratio.pipeline import pipeline
+    cfg = {**load_config('config/crpd/smoke.json'),'variant':'crpd_raw','output':str(tmp_path/'run')}
+    index = lambda: read_json(tmp_path/'run'/'target_index.json')['path']
+    pipeline(cfg,'build-targets')
+    base_path = index()
+    base = read_json(Path(base_path))
+    pipeline({**cfg,'teacher_gap_scale':1.},'build-targets')
+    assert index() == base_path
+    pipeline({**cfg,'teacher_gap_scale':.3},'build-targets')
+    assert index() != base_path
+    scaled = read_json(Path(index()))
+    stores = lambda stage: [p for p in (tmp_path/'run'/'cache').iterdir() if p.name.startswith(stage+'-')]
+    assert len(stores('prefixes')) == len(stores('candidates')) == 1 and len(stores('targets')) == 2
+    for a,b in zip(base['records'],scaled['records']):
+        for c,d in zip(a['candidates'],b['candidates']):
+            assert c['tokens'] == d['tokens'] and d['target_score'] == pytest.approx(.3*c['target_score'],abs=1e-12)
+    assert [(p['id'],p['weight']) for p in base['pairs']] == [(p['id'],p['weight']) for p in scaled['pairs']]
+
+
+def test_candidate_coverage_scores_end_token_for_student_and_rho(tmp_path: Path) -> None:
+    """Coverage measures actual chunk probabilities: with score_end_token=false rho is rescored with the
+    end token like the student, so its mass equals the default run's rho mass on the same tokens."""
+    from chunkratio.pipeline import pipeline
+    base = {**load_config('config/crpd/smoke.json'),'variant':'crpd_raw','steps':1}
+    a = pipeline({**base,'output':str(tmp_path/'scored')},'evaluate')
+    b = pipeline({**base,'score_end_token':False,'output':str(tmp_path/'unscored')},'evaluate')
+    ra = {r['state_id']:r for r in a['candidate_coverage']}
+    assert ra.keys() == {r['state_id'] for r in b['candidate_coverage']}
+    for row in b['candidate_coverage']:
+        assert row['end_token_scored']
+        assert row['reference_candidate_mass'] == pytest.approx(ra[row['state_id']]['reference_candidate_mass'],rel=1e-5)
+
+
 def test_overlong_prompts_dropped_before_generation(tmp_path: Path) -> None:
     """Prompt + H beyond any model context is excluded by rule and recorded, not fatal (§5.2)."""
     import json

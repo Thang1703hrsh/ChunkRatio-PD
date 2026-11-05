@@ -48,14 +48,45 @@ def validate(cfg: dict[str,Any]) -> None:
             raise ValueError(f'{key} must be finite and positive')
     if not isinstance(cfg.get('head_batch_size',1),int) or cfg.get('head_batch_size',1) <= 0:
         raise ValueError('head_batch_size must be positive integer')
-    for key in ('states_per_prompt','generation_batch_size','collection_seed','max_prompt_tokens'):
+    for key in ('states_per_prompt','generation_batch_size','collection_seed','max_prompt_tokens',
+                'selection_generation_batch_size','correction_generation_batch_size','prefix_generation_batch_size',
+                'policy_tokens_per_microbatch','generation_tokens_per_batch','generation_max_rows',
+                'score_max_states'):
         value = cfg.get(key)
         if value is not None and (not isinstance(value,int) or value < (0 if key == 'collection_seed' else 1)):
             raise ValueError(f'{key} must be a positive integer or null')
     if cfg.get('cache_root') is not None and (not isinstance(cfg['cache_root'],str) or Path(cfg['cache_root']).is_absolute()):
         raise ValueError('cache_root must be a relative path')
-    if cfg['candidates'] != 4 or not 0 <= cfg['endpoint_fraction'] <= 1:
-        raise ValueError('initial protocol requires K=4 and valid endpoint fraction')
+    # K=4 (2 rho + 2 T+) is the protocol; K=2 (1 rho + 1 T+) is the opt-in compact configuration (DECISIONS).
+    if cfg['candidates'] not in (2,4) or not 0 <= cfg['endpoint_fraction'] <= 1:
+        raise ValueError('candidates must be K=4 (protocol) or K=2 (compact), with a valid endpoint fraction')
+    if cfg.get('correction_seeds','prefix_and_endpoints') not in ('prefix_and_endpoints','endpoints'):
+        raise ValueError('correction_seeds must be prefix_and_endpoints or endpoints')
+    if cfg.get('head_positions','all') not in ('all','boundary'):
+        raise ValueError('head_positions must be all or boundary')
+    if not isinstance(cfg.get('batch_candidate_scoring',False),bool):
+        raise ValueError('batch_candidate_scoring must be a boolean')
+    if not isinstance(cfg.get('gpu_sampling',False),bool):
+        raise ValueError('gpu_sampling must be a boolean')
+    if not isinstance(cfg.get('shared_prefix_scoring',False),bool):
+        raise ValueError('shared_prefix_scoring must be a boolean')
+    if not isinstance(cfg.get('score_end_token',True),bool):
+        raise ValueError('score_end_token must be a boolean')
+    # Correction returns, the head and the exponential audit always score the end-of-turn token, so an
+    # unscored end token is only consistent for variants whose targets are chunk scores alone (DECISIONS).
+    if not cfg.get('score_end_token',True) and cfg['variant'] not in ('crpd_raw','crpd_suffix'):
+        raise ValueError('score_end_token=false is implemented for crpd_raw and crpd_suffix only')
+    # gamma scales the teacher gap the student must reproduce: t = gamma * delta_T (DECISIONS). Main would
+    # need gamma * (delta_T + mu_hat) and a new zero-residual argument, so only raw supports gamma < 1.
+    gamma = cfg.get('teacher_gap_scale',1.0)
+    if isinstance(gamma,bool) or not isinstance(gamma,(int,float)) or not math.isfinite(gamma) or not 0 < gamma <= 1:
+        raise ValueError('teacher_gap_scale must be a number in (0, 1]')
+    if gamma != 1 and cfg['variant'] != 'crpd_raw':
+        raise ValueError('teacher_gap_scale < 1 is implemented for crpd_raw only')
+    for key,default in (('score_tokens_per_batch',8192),('head_feature_cache_mb',0)):
+        value = cfg.get(key,default)
+        if type(value) is not int or value < (0 if key == 'head_feature_cache_mb' else 1):
+            raise ValueError(f'{key} must be an integer with a valid nonnegative budget')
     if cfg.get('weight_decay',0) != 0 or cfg['optimizer'] not in ('AdamW','Adam','RMSprop'):
         raise ValueError('unsupported optimizer or nonzero primary weight decay')
     if cfg.get('collection_decoding',{}) != {'temperature':1,'top_k':0,'top_p':1}:

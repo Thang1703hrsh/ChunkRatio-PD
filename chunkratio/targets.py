@@ -75,6 +75,12 @@ def build_targets(records: list[dict[str,Any]], head: MeanHead | None, models: d
             row['target_score'] = target_score(*(torch.tensor([row[k]],dtype=torch.float64) for k in
                                                  ('logp_teacher_plus','logp_teacher_base','endpoint_mu')),
                                                torch.tensor([row['terminal']])).item()
+            # crpd_raw with gamma < 1: t = gamma * delta_T (mu = 0 there). The teacher log-probs stay as
+            # collected, so the collection is shared; gamma = 1 leaves the target untouched (bit for bit).
+            gamma = cfg.get('teacher_gap_scale',1.0)
+            if gamma != 1:
+                assert cfg['variant'] == 'crpd_raw' and mu == 0.
+                row['target_score'] = gamma*row['target_score']
             candidates.append(row)
             # Fixed audit endpoints split evenly by proposing source, so teacher endpoints are covered (§7.4).
             if (cfg['variant'] == 'crpd_audit' and not row['terminal']

@@ -195,3 +195,11 @@ def test_correction_audit_reads_sibling_differences() -> None:
     split = correction_audit(pairs,rows,FirstFeature(),features,0)['endpoints']
     assert abs(split['all']['corr']-.8) < 1e-12
     assert abs(split['rho']['corr']+1) < 1e-12 and abs(split['teacher']['corr']+1) < 1e-12
+    # Endpoint-only correction (compact) has no prefix seeds: inferring parents from them finds no state,
+    # while parents taken from the candidate records audit the same endpoints as before.
+    endpoint_only = rows[1:]
+    assert correction_audit(pairs,endpoint_only,FirstFeature(),features,0)['endpoints']['states'] == 0
+    parents = {row['seed']['id']:state['id'] for row in endpoint_only}
+    fixed = correction_audit(pairs,endpoint_only,FirstFeature(),features,0,parents=parents)['endpoints']
+    assert fixed['states'] == 1 and fixed['endpoints'] == 4
+    assert fixed['all'] == split['all'] and fixed['rho'] == split['rho'] and fixed['teacher'] == split['teacher']

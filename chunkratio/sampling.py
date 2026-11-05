@@ -54,9 +54,29 @@ def select_rows(past: object, index: torch.Tensor) -> object:
     raise TypeError(f'cannot select batch rows of a {type(past).__name__} cache')
 
 
+def sample_rows(logits: torch.Tensor, generators: list[torch.Generator], gpu: bool = False) -> list[int]:
+    """One temperature-1 categorical draw per row from softmax(raw logits), each from its own generator.
+
+    Default: the row's CPU generator drives torch.multinomial over CPU probabilities (the original rule).
+    gpu=True (opt-in): the row's generator draws one FP64 uniform u on the CPU and the token is found on
+    the device by inverse CDF over FP64 probabilities, so only `rows` uniforms and token ids cross the
+    bus instead of [rows, vocab] probabilities. Both are exact categorical sampling from the same
+    distribution and keep one independent stream per row; their draws differ, so a run must use one rule.
+    """
+    if not gpu:
+        probs = logits.softmax(-1).cpu()
+        return [int(torch.multinomial(probs[j],1,generator=g)) for j,g in enumerate(generators)]
+    uniforms = torch.tensor([float(torch.rand((),generator=g,dtype=torch.float64)) for g in generators],
+                            dtype=torch.float64,device=logits.device)
+    cdf = logits.double().softmax(-1).cumsum(-1)
+    tokens = torch.searchsorted(cdf,(uniforms*cdf[:,-1])[:,None],right=True).clamp(max=cdf.shape[-1]-1)
+    return tokens[:,0].tolist()
+
+
 @torch.no_grad()
 def generate_batch(model: nn.Module, prefixes: list[list[int]], remaining: list[int], eos: int,
-                   rngs: list[torch.Generator], chunk_length: int | None = None) -> list[list[int]]:
+                   rngs: list[torch.Generator], chunk_length: int | None = None,
+                   gpu_sampling: bool = False) -> list[list[int]]:
     """Batched KV-cached temperature-1 categorical sampling; one generator per row (§5.3).
 
     Rows are left-padded; each row draws only from its own generator over softmax(raw logits),
@@ -88,13 +108,11 @@ def generate_batch(model: nn.Module, prefixes: list[list[int]], remaining: list[
         logits = out.logits[:,-1].float()
         past = getattr(out,'past_key_values',None)
         assert torch.isfinite(logits).all()
-        # One device-to-host copy per step; the CPU stream state stays portable between machines.
-        probs = logits.softmax(-1).cpu()
-        tokens, keep = [],[]
+        # Row streams are CPU generators, so their state stays portable between machines.
+        tokens, keep = sample_rows(logits,[rngs[i] for i in rows],gpu_sampling),[]
         for j,i in enumerate(rows):
-            token = int(torch.multinomial(probs[j],1,generator=rngs[i]))
+            token = tokens[j]
             results[i].append(token)
-            tokens.append(token)
             if token != eos and len(results[i]) < limits[i]:
                 keep.append(j)
         if not keep:

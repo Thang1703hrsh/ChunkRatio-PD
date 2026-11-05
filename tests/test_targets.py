@@ -64,6 +64,42 @@ def test_build_targets_sign_correction_terminal_and_budget() -> None:
     assert [c['target_score'] for c in raw['records'][0]['candidates']] == pytest.approx([.8,-.2,.2])
 
 
+def test_teacher_gap_scale_scales_raw_targets_only() -> None:
+    """crpd_raw with gamma: t = gamma * delta_T, teacher log-probs unchanged; gamma = 1 is the original
+    target bit for bit; pair weights and pairs do not depend on gamma (DECISIONS)."""
+    cfg = {**load_config('config/crpd/smoke.json'),'variant':'crpd_raw'}
+    models,_,_,info = load_models(cfg)
+    state = {'id':'s','prefix_ids':[1,2],'response_ids':[5],'prompt_id':'p','split':'train','n':1}
+    rows = [candidate('c',[3,4],False,-1.,-1.8),candidate('d',[5,6],False,-2.,-1.8),
+            candidate('e',[7,0],True,-.5,-.7)]
+    build = lambda extra: build_targets([{'state':state,'candidates':copy.deepcopy(rows),'skipped':False}],None,models,
+                                        {**cfg,**extra},info['eos'],'reference_mean')
+    base,one,scaled = build({}),build({'teacher_gap_scale':1.}),build({'teacher_gap_scale':.3})
+    scores = lambda result: [c['target_score'] for c in result['records'][0]['candidates']]
+    assert scores(one) == scores(base)
+    assert scores(scaled) == pytest.approx([.3*s for s in scores(base)],abs=1e-12)
+    for a,b in zip(base['records'][0]['candidates'],scaled['records'][0]['candidates']):
+        assert (a['logp_teacher_plus'],a['logp_teacher_base']) == (b['logp_teacher_plus'],b['logp_teacher_base'])
+    assert [(p['id'],p['weight']) for p in scaled['pairs']] == [(p['id'],p['weight']) for p in base['pairs']]
+
+
+@pytest.mark.parametrize('extra,message',[
+    ({'variant':'crpd_main','teacher_gap_scale':.3},'crpd_raw only'),
+    ({'variant':'crpd_raw','teacher_gap_scale':0.},'in \\(0, 1\\]'),
+    ({'variant':'crpd_raw','teacher_gap_scale':1.5},'in \\(0, 1\\]'),
+    ({'variant':'crpd_raw','teacher_gap_scale':True},'in \\(0, 1\\]'),
+    ({'variant':'crpd_main','score_end_token':False},'crpd_raw and crpd_suffix only'),
+    ({'variant':'crpd_audit','audit_replicates':2,'score_end_token':False},'crpd_raw and crpd_suffix only')])
+def test_unsupported_gamma_and_end_token_combinations_fail_closed(extra: dict, message: str) -> None:
+    """gamma < 1 needs crpd_raw (main would need gamma*(delta_T+mu) and a new zero-residual argument);
+    an unscored end token needs a variant without correction returns or audits (DECISIONS)."""
+    from chunkratio.config import validate
+    cfg = load_config('config/crpd/smoke.json')
+    with pytest.raises(ValueError,match=message):
+        validate({**cfg,**extra})
+    validate({**cfg,'variant':'crpd_raw','teacher_gap_scale':.1,'score_end_token':False})
+
+
 def hierarchical_records() -> list[dict]:
     """Two train prompts (states with K=2,3 and K=4), one skip and one head_val state (§7.2)."""
     def record(prompt: str, state: str, k: int, split: str = 'train', skipped: bool = False) -> dict:

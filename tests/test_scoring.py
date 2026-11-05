@@ -8,6 +8,52 @@ from chunkratio.scoring import (continuation_increments, continuation_increments
 from chunkratio.tiny import TinyLM
 
 
+def _sibling_models() -> list:
+    """A recurrent TinyLM and a two-layer HF Llama with a real KV cache, both FP32."""
+    torch.manual_seed(7)
+    models = [TinyLM(vocab_size=9,hidden_size=10)]
+    transformers = pytest.importorskip('transformers')
+    config = transformers.LlamaConfig(vocab_size=9,hidden_size=16,intermediate_size=32,num_hidden_layers=2,
+                                      num_attention_heads=2,num_key_value_heads=2,max_position_embeddings=64)
+    models.append(transformers.LlamaForCausalLM(config).eval())
+    return models
+
+
+@pytest.mark.parametrize('index',[0,1])
+def test_sibling_logprobs_match_score_batch_with_gradients(index: int) -> None:
+    """A shared prefix computed once gives each chunk the score and the parameter gradient of
+    score_batch(prefix, chunk): chunks of different lengths, EOS inside a chunk, left-padded prefixes."""
+    from chunkratio.scoring import sibling_logprobs
+    model = _sibling_models()[index]
+    eos = 0
+    prefixes = [[1,2,3,4,5],[2],[3,4,1]]
+    chunk_lists = [[[6,7,8],[5,0,7,7]],[[8]],[[1,2],[3,0],[4,4,4,4]]]
+    shared = sibling_logprobs(model,prefixes,chunk_lists,eos)
+    pairs = [(p,c) for p,cs in zip(prefixes,chunk_lists) for c in cs]
+    single = torch.cat([score_batch(model,[p],[c],eos,frozen=False) for p,c in pairs])
+    torch.testing.assert_close(torch.cat(shared),single,atol=1e-5,rtol=1e-5)
+    weights = torch.linspace(.5,2.,len(pairs))
+    grad_shared = torch.autograd.grad((torch.cat(shared)*weights).sum(),list(model.parameters()))
+    grad_single = torch.autograd.grad((single*weights).sum(),list(model.parameters()))
+    for a,b in zip(grad_shared,grad_single):
+        torch.testing.assert_close(a,b,atol=1e-5,rtol=1e-4)
+
+
+@pytest.mark.parametrize('index',[0,1])
+def test_unscored_end_token_drops_eos_and_later_tokens(index: int) -> None:
+    """score_eos=False: a chunk with an end-of-turn token scores like its tokens before that EOS, in
+    score_batch and sibling_logprobs alike; chunks without EOS are unchanged."""
+    from chunkratio.scoring import sibling_logprobs
+    model,eos = _sibling_models()[index],0
+    prefix = [1,2,3]
+    with_end,plain = [5,6,0,7],[5,6]
+    unscored = score_batch(model,[prefix,prefix],[with_end,[4,4]],eos,score_eos=False)
+    torch.testing.assert_close(unscored,score_batch(model,[prefix,prefix],[plain,[4,4]],eos),atol=1e-5,rtol=0)
+    assert not torch.allclose(score_batch(model,[prefix],[with_end],eos),unscored[:1])
+    shared = sibling_logprobs(model,[prefix],[[with_end,[4,4]]],eos,False)[0]
+    torch.testing.assert_close(shared,unscored,atol=1e-5,rtol=1e-5)
+
+
 def test_scored_positions_only_match_full_log_softmax() -> None:
     """Gathering response positions before the log-softmax equals normalising every position."""
     gen = torch.Generator().manual_seed(5)

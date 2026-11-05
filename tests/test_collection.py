@@ -56,6 +56,100 @@ def test_correction_rollouts_labels_and_features(tmp_path: Path, variant: str, s
             torch.testing.assert_close(features[t],alone,atol=1e-6,rtol=0)
 
 
+def test_compact_k2_candidates_and_endpoint_only_correction_seeds(tmp_path: Path) -> None:
+    """K=2 draws one rho and one T+ sibling, which are the first draws of K=4; correction_seeds='endpoints'
+    drops the prefix seeds and, with endpoint_fraction 1, rolls out every nonterminal endpoint (compact)."""
+    from chunkratio.collection import correction_seeds
+    from chunkratio.config import validate
+    cfg = load_config('config/crpd/smoke.json')
+    compact = {**cfg,'candidates':2,'correction_seeds':'endpoints','endpoint_fraction':1.}
+    validate(compact)
+    with pytest.raises(ValueError,match='K=4'):
+        validate({**cfg,'candidates':3})
+    models,_,_,info = load_models(cfg)
+    eos = info['eos']
+    prompts = prepare_prompts(read_jsonl(Path(cfg['prompts'])),cfg['seed'])
+    states = collect_prefixes(prompts,models['student_ref'],cfg,eos,ShardStore(tmp_path/'p',{'t':'p'}))[:4]
+    full = {r['state']['id']:r for r in collect_candidates(states,models,cfg,eos,ShardStore(tmp_path/'c4',{'t':'c4'}))}
+    small = collect_candidates(states,models,compact,eos,ShardStore(tmp_path/'c2',{'t':'c2'}))
+    for record in small:
+        assert {k:len(v) for k,v in record['rng'].items()} == {'student_ref':1,'teacher_plus':1}
+        assert record['rng'] == {k:v[:1] for k,v in full[record['state']['id']]['rng'].items()}
+        assert {tuple(c['tokens']) for c in record['candidates']} <= {tuple(c['tokens']) for c in full[record['state']['id']]['candidates']}
+        assert 1 <= len(record['candidates']) <= 2
+    seeds = correction_seeds(small,compact)
+    assert all(seed['seed_source'] != 'prefix' for seed in seeds)
+    assert {seed['id'] for seed in seeds} == {c['id'] for r in small for c in r['candidates'] if not c['terminal']}
+    assert any(seed['seed_source'] == 'prefix' for seed in correction_seeds(small,cfg))
+
+
+def test_prefix_and_candidate_order_and_group_size_do_not_change_records(tmp_path: Path) -> None:
+    """Length-sorted groups of any size (and any input order) give the same prefix and candidate records."""
+    cfg = load_config('config/crpd/smoke.json')
+    models,_,_,info = load_models(cfg)
+    eos = info['eos']
+    prompts = prepare_prompts(read_jsonl(Path(cfg['prompts'])),cfg['seed'])
+    runs = {}
+    for size,order in ((1,prompts),(64,prompts[::-1])):
+        run = {**cfg,'generation_batch_size':size,'prefix_generation_batch_size':size}
+        states = collect_prefixes(order,models['student_ref'],run,eos,ShardStore(tmp_path/f'p{size}',{'t':'p'}))
+        records = collect_candidates(states[::-1][:5],models,run,eos,ShardStore(tmp_path/f'c{size}',{'t':'c'}))
+        runs[size] = (states,{r['state']['id']:r for r in records})
+    assert runs[1][0] == runs[64][0]
+    assert runs[1][1].keys() == runs[64][1].keys()
+    for state_id,record in runs[1][1].items():
+        other = runs[64][1][state_id]
+        assert [c['tokens'] for c in record['candidates']] == [c['tokens'] for c in other['candidates']]
+        for c,d in zip(record['candidates'],other['candidates']):
+            for key in ('logp_student_ref','logp_teacher_base','logp_teacher_plus'):
+                assert c[key] == pytest.approx(d[key],abs=1e-4)
+
+
+def test_gpu_sampling_is_exact_categorical_and_token_budget_groups_keep_records(tmp_path: Path) -> None:
+    """gpu_sampling draws softmax(raw logits) exactly (frequency check) from one stream per row, and with
+    token-budget generation groups every prefix and candidate record equals the one-row-at-a-time result."""
+    from chunkratio.sampling import sample_rows
+    logits = torch.tensor([[2.,0.,-1.,1.,-3.]]).repeat(20000,1)
+    tokens = torch.tensor(sample_rows(logits,[stream(0,f'row{i}') for i in range(len(logits))],gpu=True))
+    expected = logits[0].softmax(-1)
+    observed = torch.bincount(tokens,minlength=5).double()/len(tokens)
+    assert ((observed-expected.double()).abs() <= 4*(expected*(1-expected)/len(tokens)).sqrt().double()+1e-9).all()
+    again = sample_rows(logits[:50],[stream(0,f'row{i}') for i in range(50)],gpu=True)
+    assert again == tokens[:50].tolist()
+    cfg = {**load_config('config/crpd/smoke.json'),'gpu_sampling':True}
+    models,_,_,info = load_models(cfg)
+    eos = info['eos']
+    prompts = prepare_prompts(read_jsonl(Path(cfg['prompts'])),cfg['seed'])
+    runs = {}
+    for name,extra in (('single',{'generation_batch_size':1}),('budget',{'generation_tokens_per_batch':64,'generation_max_rows':7})):
+        run = {**cfg,**extra}
+        states = collect_prefixes(prompts,models['student_ref'],run,eos,ShardStore(tmp_path/f'p{name}',{'t':'p'}))
+        records = collect_candidates(states[:6],models,run,eos,ShardStore(tmp_path/f'c{name}',{'t':'c'}))
+        runs[name] = (states,{r['state']['id']:[c['tokens'] for c in r['candidates']] for r in records})
+    assert runs['single'] == runs['budget']
+
+
+def test_correction_group_size_does_not_change_rollouts(tmp_path: Path) -> None:
+    """correction_generation_batch_size only regroups jobs: tokens, labels and features are unchanged."""
+    cfg = load_config('config/crpd/smoke.json')
+    models,_,_,info = load_models(cfg)
+    eos = info['eos']
+    prompts = prepare_prompts(read_jsonl(Path(cfg['prompts'])),cfg['seed'])
+    states = collect_prefixes(prompts,models['student_ref'],cfg,eos,ShardStore(tmp_path/'p',{'t':'p'}))[:3]
+    records = collect_candidates(states,models,cfg,eos,ShardStore(tmp_path/'c',{'t':'c'}))
+    runs = {}
+    for size in (1,64):
+        store = ShardStore(tmp_path/f'r{size}',{'t':'r'})
+        rows = collect_correction(records,models,{**cfg,'correction_generation_batch_size':size},eos,store)
+        load = correction_features(store)
+        runs[size] = {r['id']:(r['tokens'],r['labels'],load(r)) for r in rows}
+    assert runs[1].keys() == runs[64].keys() and runs[1]
+    for job,(tokens,labels,features) in runs[1].items():
+        assert runs[64][job][0] == tokens
+        assert runs[64][job][1] == pytest.approx(labels,abs=1e-5)
+        torch.testing.assert_close(runs[64][job][2],features,atol=1e-5,rtol=0)
+
+
 def test_candidate_budget_is_global_and_chunk_cutoff_nonterminal(tmp_path: Path) -> None:
     """Candidates stop at EOS or min(L,H-n); only EOS/H is terminal (§5.2)."""
     cfg = {**load_config('config/crpd/smoke.json'),'chunk_length':4}

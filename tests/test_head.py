@@ -31,6 +31,28 @@ def test_head_gradient_and_resume(tmp_path: Path) -> None:
     assert extended_meta['history'] == meta['history']
 
 
+def test_boundary_head_positions_keep_only_chunk_grid_states(tmp_path: Path) -> None:
+    """head_positions='boundary' scores rollout position t only when (n + t) % L == 0, enters the head
+    identity, and leaves the default all-position objective unchanged (compact configuration)."""
+    from chunkratio.math import head_objective
+    torch.manual_seed(5)
+    head = MeanHead(3)
+    features = torch.randn(10,3)
+    budgets = [1-t/16 for t in range(10)]
+    labels = [float(t) for t in range(10)]
+    row = {'seed':{'split':'train','n':3},'features':features.tolist(),'budgets':budgets,'labels':labels}
+    keep = [1,5,9]
+    expected = head_objective([head(features[keep],torch.tensor(budgets)[keep])],[torch.tensor(labels)[keep]],16)
+    torch.testing.assert_close(trajectory_loss(head,[row],16,boundary=4),expected)
+    everything = head_objective([head(features,torch.tensor(budgets))],[torch.tensor(labels)],16)
+    torch.testing.assert_close(trajectory_loss(head,[row],16),everything)
+    rows = [row,{**row,'seed':{'split':'head_val','n':3}}]
+    cfg = {'horizon':16,'seed':3,'head_learning_rate':.01,'device':'cpu','head_epochs':2,'chunk_length':4}
+    _,default = fit_head(rows,cfg,tmp_path/'all.pt')
+    _,boundary = fit_head(rows,{**cfg,'head_positions':'boundary'},tmp_path/'boundary.pt')
+    assert default['identity'] != boundary['identity'] and boundary['positions'] == 'chunk boundaries (L=4)'
+
+
 def test_feature_shards_and_minibatch_head(tmp_path: Path) -> None:
     """Binary feature shards verify content; minibatches take ceil(N/B) steps and resume exactly (§§7.4,10)."""
     torch.manual_seed(6)

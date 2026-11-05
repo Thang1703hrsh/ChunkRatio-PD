@@ -86,6 +86,40 @@ def margin_trainer(cfg: dict) -> tuple:
     return trainer,pair,rho
 
 
+def test_token_budget_microbatches_keep_the_step_gradient() -> None:
+    """policy_tokens_per_microbatch regroups one step's pairs by length; the accumulated gradient equals
+    the fixed-size split's up to summation order, and every pair is used exactly once."""
+    import copy
+    torch = pytest.importorskip('torch')
+    from chunkratio.scoring import score_batch
+    from chunkratio.tiny import TinyLM
+    from chunkratio.training import ChunkRatioTrainer
+    torch.manual_seed(5)
+    rho = TinyLM(vocab_size=7,hidden_size=8)
+    pairs = []
+    for i in range(12):
+        prefix = [1]+[2+(i+j)%4 for j in range(1+3*(i%5))]
+        pair = {'state':{'prefix_ids':prefix,'prompt_id':f'p{i%3}','id':f's{i}'},'weight':1/12,'id':str(i)}
+        for side,tokens,target in (('c',[4,5,1,2][:1+i%4],.3*i),('d',[2,6],-.2*i)):
+            pair[side] = {'tokens':tokens,'target_score':target,'logp_student_ref':score_batch(rho,[prefix],[tokens],6).item()}
+        pairs.append(pair)
+    width = lambda p: len(p['state']['prefix_ids'])+max(len(p['c']['tokens']),len(p['d']['tokens']))
+    grads = {}
+    for name,cfg in (('fixed',{'policy_microbatch_size':5}),('budget',{'policy_tokens_per_microbatch':24})):
+        trainer = ChunkRatioTrainer(copy.deepcopy(rho),rho,{'route':'reference_mean','pairs':pairs},[],
+                                    {'seed':0,'alpha':.3,'device':'cpu',**cfg},6)
+        groups = trainer.microbatches(pairs)
+        assert sorted(p['id'] for g in groups for p in g) == sorted(p['id'] for p in pairs)
+        if name == 'budget':
+            assert len(groups) > 1 and all(len(g) == 1 or len(g)*max(map(width,g)) <= 24 for g in groups)
+        for micro in groups:
+            loss,_ = trainer.batch_loss(micro)
+            (loss*len(micro)/len(pairs)).backward()
+        grads[name] = [p.grad.clone() for p in trainer.student.parameters()]
+    for a,b in zip(grads['fixed'],grads['budget']):
+        torch.testing.assert_close(a,b,atol=1e-6,rtol=1e-5)
+
+
 def recorded_margin(trainer: object, pair: dict, monkeypatch: pytest.MonkeyPatch) -> object:
     """The student margin batch_loss hands to the loss."""
     import chunkratio.training as training
@@ -104,6 +138,14 @@ def recorded_margin(trainer: object, pair: dict, monkeypatch: pytest.MonkeyPatch
 def test_margin_is_exactly_zero_at_initialization_under_autocast(monkeypatch: pytest.MonkeyPatch) -> None:
     """a_theta = 0 at student = rho: autocast scores rho the same way instead of comparing with FP32."""
     trainer,pair,_ = margin_trainer({'policy_autocast_dtype':'bfloat16'})
+    assert (recorded_margin(trainer,pair,monkeypatch) == 0).all()
+
+
+@pytest.mark.parametrize('autocast',[None,'bfloat16'])
+def test_shared_prefix_margin_is_exactly_zero_at_initialization(monkeypatch: pytest.MonkeyPatch, autocast: object) -> None:
+    """With shared_prefix_scoring the student and rho scores come from the same computation, so the
+    margin a = log pi - log rho is exactly zero at student = rho, with or without autocast."""
+    trainer,pair,_ = margin_trainer({'policy_autocast_dtype':autocast,'shared_prefix_scoring':True})
     assert (recorded_margin(trainer,pair,monkeypatch) == 0).all()
 
 

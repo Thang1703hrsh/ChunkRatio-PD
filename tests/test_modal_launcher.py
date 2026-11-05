@@ -141,3 +141,30 @@ def test_finished_needs_same_config_and_same_code(tmp_path, monkeypatch) -> None
     assert module.finished(config,'diagnostics.json','abc') and not module.finished(config,'diagnostics.json','def')
     with pytest.raises(ValueError,match='different config'):
         module.finished({**config,'alpha':.1},'diagnostics.json','abc')
+
+
+def test_gamma_sweep_names_and_guards(monkeypatch) -> None:
+    """CRPD_GAMMAS: gamma = 1 keeps the plain alpha name; gamma < 1 needs alpha and crpd_raw only (DECISIONS)."""
+    def load(**env):
+        """Import the launcher under one environment."""
+        for key in ('CRPD_ALPHAS','CRPD_GAMMAS','CRPD_VARIANTS'):
+            monkeypatch.delenv(key,raising=False)
+        for key,value in env.items():
+            monkeypatch.setenv(key,value)
+        monkeypatch.setenv('CRPD_SCALE','x10')
+        monkeypatch.setenv('CRPD_TEACHERS','hda')
+        spec = importlib.util.spec_from_file_location('qwen3_pilot_gamma',Path('script/modal/qwen3_pilot.py'))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    sweep = load(CRPD_ALPHAS='0.03',CRPD_GAMMAS='1,0.3,0.1',CRPD_VARIANTS='crpd_raw')
+    assert sweep.GAMMAS == (1.,.3,.1)
+    assert sweep.run_name('crpd_raw',.03) == sweep.run_name('crpd_raw',.03,1.) == 'crpd_raw-alpha0p03'
+    assert sweep.run_name('crpd_raw',.03,.3) == 'crpd_raw-alpha0p03-gamma0p3'
+    assert "'CRPD_GAMMAS':GAMMA_TEXT" in Path('script/modal/qwen3_pilot.py').read_text(encoding='utf-8')
+    with pytest.raises(SystemExit,match='crpd_raw only'):
+        load(CRPD_ALPHAS='0.03',CRPD_GAMMAS='0.3',CRPD_VARIANTS='crpd_main,crpd_raw')
+    with pytest.raises(SystemExit,match='needs CRPD_ALPHAS'):
+        load(CRPD_GAMMAS='0.3',CRPD_VARIANTS='crpd_raw')
+    with pytest.raises(SystemExit,match=r'in \(0, 1\]'):
+        load(CRPD_ALPHAS='0.03',CRPD_GAMMAS='0,0.3',CRPD_VARIANTS='crpd_raw')

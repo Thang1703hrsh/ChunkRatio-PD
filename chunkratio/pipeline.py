@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import os
 import importlib.metadata
+import math
 import platform
 import subprocess
 import time
@@ -22,7 +23,7 @@ from .evaluation import reward_selector
 from .math import diagnostics, routing
 from .models import load_models
 from .sampling import generate, stream
-from .scoring import fingerprint, score_batch
+from .scoring import fingerprint, length_groups, score_batch
 from .targets import build_targets
 from .training import ChunkRatioTrainer
 from .value_head import fit_head, save_tensor
@@ -89,6 +90,10 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
     common = {'models':identities,'tokenizer':info,'horizon':cfg['horizon'],'precision':manifest['precision'],
               'split_hash':manifest['split_hash'],'collection_seed':collection_seed(cfg),'schema':1,'code_revision':revision,
               'documents':documents,'feature_convention':'last-valid-token/final-layer/budget'}
+    # The sampler decides which tokens are drawn, so every collection key carries it. The GPU rule enters
+    # the keys only when set, so default runs keep their stage keys; batch grouping never enters them.
+    if cfg.get('gpu_sampling',False):
+        common['sampler'] = 'gpu-inverse-cdf-fp64'
     length = 1 if cfg['variant'] == 'crpd_token' else cfg['chunk_length']
     dependencies = {**common,'schedule':length,'states_per_prompt':cfg.get('states_per_prompt')}
     def store(stage: str, metadata: dict[str,Any]) -> ShardStore:
@@ -107,7 +112,12 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
     states = collect_prefixes(prompts,models['student_ref'],cfg,eos,prefix_store)
     if until == 'collect-prefixes':
         return {'states':len(states),'route':route}
-    candidate_deps = {**dependencies,'candidate_rule':'suffix' if cfg['variant'] == 'crpd_suffix' else length,'K':4}
+    candidate_deps = {**dependencies,'candidate_rule':'suffix' if cfg['variant'] == 'crpd_suffix' else length,
+                      'K':cfg['candidates']}
+    # Unscored end-of-turn tokens change every stored chunk score, so they enter the candidate key (and
+    # every key built on it); the protocol rule keeps its keys.
+    if not cfg.get('score_end_token',True):
+        candidate_deps['end_token'] = 'unscored'
     candidate_store = store('candidates',candidate_deps)
     records = collect_candidates(states,models,cfg,eos,candidate_store)
     if until == 'collect-candidates':
@@ -117,18 +127,30 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
     if not bypass_head:
         correction_deps = {**candidate_deps,'direction':'teacher' if cfg['variant'] == 'crpd_mu_teacher' else 'reference',
                            'endpoint_fraction':cfg['endpoint_fraction'],'replicates':cfg['correction_replicates']}
+        # Compact settings enter the keys only when set, so protocol runs keep their stage keys.
+        if cfg.get('correction_seeds','prefix_and_endpoints') != 'prefix_and_endpoints':
+            correction_deps['seeds'] = cfg['correction_seeds']
         correction_store = store('correction',correction_deps)
         corrections = collect_correction(records,models,cfg,eos,correction_store)
         if until == 'collect-correction':
             return {'trajectories':len(corrections),'route':route}
-        head_path = cache/stage_key('head',{**correction_deps,'epochs':cfg['head_epochs'],'lr':cfg['head_learning_rate'],
-                                                         'batch':cfg.get('head_batch_size')})/'head.pt'
-        head,head_meta = fit_head(corrections,cfg,head_path,correction_features(correction_store))
+        head_deps = {**correction_deps,'epochs':cfg['head_epochs'],'lr':cfg['head_learning_rate'],
+                     'batch':cfg.get('head_batch_size')}
+        if cfg.get('head_positions','all') != 'all':
+            head_deps['positions'] = cfg['head_positions']
+        head_path = cache/stage_key('head',head_deps)/'head.pt'
+        head,head_meta = fit_head(corrections,cfg,head_path,correction_features(
+            correction_store,cfg.get('head_feature_cache_mb',0)*1024**2))
     if until in ('collect-correction','fit-head'):
         return {'head':head_meta,'route':route,'bypassed':bypass_head}
     targets = build_targets(records,head,models,cfg,eos,route)
-    target_path = cache/stage_key('targets',{**candidate_deps,'head':head_meta['hash'],
-                'variant':cfg['variant'],'audit_replicates':cfg.get('audit_replicates',0)})
+    target_deps = {**candidate_deps,'head':head_meta['hash'],'variant':cfg['variant'],
+                   'audit_replicates':cfg.get('audit_replicates',0)}
+    # gamma enters the target key only when set, so gamma = 1 keeps the existing keys (the policy key
+    # carries the whole config, gamma included).
+    if cfg.get('teacher_gap_scale',1.0) != 1:
+        target_deps['teacher_gap_scale'] = cfg['teacher_gap_scale']
+    target_path = cache/stage_key('targets',target_deps)
     write_json(target_path/'targets.json',targets)
     write_json(output/'target_index.json',{'path':str(target_path/'targets.json'),'head_hash':head_meta['hash']})
     if until == 'build-targets':
@@ -155,29 +177,67 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
     if not cfg.get('synthetic',False):
         student.save_pretrained(output/'student')
         tokenizers[2].save_pretrained(output/'student')
-    save_tensor(output/'student.pt',{'state_dict':student.state_dict(),'synthetic':cfg.get('synthetic',False)})
+    if cfg.get('save_student_state_dict',True) or cfg.get('synthetic',False):
+        save_tensor(output/'student.pt',{'state_dict':student.state_dict(),'synthetic':cfg.get('synthetic',False)})
     if until == 'train-policy':
         return policy
     # Measure-weighted pair diagnostics in microbatches (each pair keeps its hierarchical weight).
     weighted = {'excess_bce':0.,'logit_error':0.,'saturation':0.}
     size = cfg.get('diagnostic_batch_size',32)
+    pairs = targets['pairs']
+    # With a token budget the no-grad pass groups pairs by length like training does (twice the training
+    # budget: no activations are kept for backward); the weighted sums do not depend on the grouping.
+    budget = cfg.get('policy_tokens_per_microbatch')
+    widths = [len(p['state']['prefix_ids'])+max(len(p['c']['tokens']),len(p['d']['tokens'])) for p in pairs]
+    groups = ([[pairs[i] for i in g] for g in length_groups(widths,2*budget)] if budget else
+              [pairs[offset:offset+size] for offset in range(0,len(pairs),size)])
     with torch.no_grad():
-        for offset in range(0,len(targets['pairs']),size):
-            chunk = targets['pairs'][offset:offset+size]
+        for chunk in groups:
             _,metrics = trainer.pair_terms(chunk)
             weights = torch.tensor([p['weight'] for p in chunk],dtype=torch.float64)
             for key in weighted:
                 weighted[key] += float((metrics[key].detach().double().cpu()*weights).sum())
+    # Endpoint -> state from the candidate records, so endpoint-only correction is audited as well.
+    parents = {c['id']:r['state']['id'] for r in records for c in r['candidates']}
     sibling_audit = correction_audit(targets['pairs'],[r for r in corrections if r['seed']['split'] == 'head_val'],head,
                                      correction_features(correction_store) if head is not None else None,
-                                     collection_seed(cfg))
-    observed_mass = []
+                                     collection_seed(cfg),parents=parents)
+    # Student mass on each state's candidates; with batch_candidate_scoring the rows of many states share
+    # length-sorted forwards (FP32 rounding differences only), otherwise one forward per state.
+    rows = [(r,c) for r in targets['records'] for c in r['candidates']]
+    def chunk_logps(model: torch.nn.Module) -> list[float]:
+        """Actual chunk log-probs (end-of-turn token scored once), whatever the training score rule."""
+        logps: list[float] = [0.]*len(rows)
+        if cfg.get('batch_candidate_scoring',False):
+            lengths = [len(r['state']['prefix_ids'])+len(c['tokens']) for r,c in rows]
+            for group in length_groups(lengths,cfg.get('score_tokens_per_batch',8192)):
+                scores = score_batch(model,[rows[i][0]['state']['prefix_ids'] for i in group],
+                                     [rows[i][1]['tokens'] for i in group],eos,score_eos=True).double().tolist()
+                for i,score in zip(group,scores):
+                    logps[i] = score
+        else:
+            offset = 0
+            for record in targets['records']:
+                cs = record['candidates']
+                scores = score_batch(model,[record['state']['prefix_ids']]*len(cs),[c['tokens'] for c in cs],eos,
+                                     score_eos=True).double().tolist()
+                logps[offset:offset+len(cs)] = scores
+                offset += len(cs)
+        return logps
+    student_logps = chunk_logps(student)
+    # The cached rho scores follow score_end_token; with it off they omit the end token, so rho is
+    # rescored under the same rule as the student (student = rho then gives equal masses).
+    reference_logps = (chunk_logps(models['student_ref']) if not cfg.get('score_end_token',True) else
+                       [c['logp_student_ref'] for _,c in rows])
+    observed_mass, offset = [],0
     for record in targets['records']:
         cs = record['candidates']
-        prefix = record['state']['prefix_ids']
-        p = score_batch(student,[prefix]*len(cs),[c['tokens'] for c in cs],eos).double().exp().sum().item()
-        observed_mass.append({'state_id':record['state']['id'],'student_candidate_mass':p,
-                              'reference_candidate_mass':sum(__import__('math').exp(c['logp_student_ref']) for c in cs)})
+        span = slice(offset,offset+len(cs))
+        offset += len(cs)
+        observed_mass.append({'state_id':record['state']['id'],
+                              'student_candidate_mass':sum(math.exp(v) for v in student_logps[span]),
+                              'reference_candidate_mass':sum(math.exp(v) for v in reference_logps[span]),
+                              'end_token_scored':True})
     generated_counts,scored_counts = {},{}
     all_cost_records = prefix_store.records()+records+corrections+targets['audits']
     for record in all_cost_records:

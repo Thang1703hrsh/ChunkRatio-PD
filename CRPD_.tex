@@ -1,0 +1,756 @@
+\documentclass[pdflatex,sn-mathphys-num,review]{sn-jnl}
+\usepackage{graphicx}%
+\usepackage{subfig}
+\usepackage{multirow}%
+\usepackage{amsmath,amssymb,amsfonts}%
+\usepackage{amsthm}%
+\usepackage[title]{appendix}%
+\usepackage{textcomp}%
+\usepackage{manyfoot}%
+\usepackage{booktabs}%
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{listings}%
+\usepackage[table]{xcolor}
+\usepackage{colortbl}
+\usepackage{tabularx}
+\usepackage{url}
+\providecommand{\burl}[1]{\url{#1}}
+
+\theoremstyle{thmstyleone}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+
+\theoremstyle{thmstyletwo}
+\newtheorem{example}[theorem]{Example}
+\newtheorem{remark}[theorem]{Remark}
+
+\theoremstyle{thmstylethree}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+
+\newcolumntype{C}{>{\centering\arraybackslash}X}
+
+\providecommand{\Tp}{T^{+}}
+\providecommand{\Tz}{T^{0}}
+\providecommand{\pth}{\pi_{\theta}}
+\providecommand{\popt}{\pi^{\star}}
+\providecommand{\E}{\mathbb{E}}
+\providecommand{\KL}{\mathrm{KL}}
+\providecommand{\Var}{\mathrm{Var}}
+\providecommand{\osc}{\operatorname{osc}}
+\providecommand{\softplus}{\operatorname{softplus}}
+\providecommand{\Jg}{\mathcal{J}}
+\providecommand{\Cset}{\mathcal{C}}
+\providecommand{\Yset}{\mathcal{Y}}
+\providecommand{\muhat}{\widehat{\mu}}
+\providecommand{\phat}{\widehat{p}}
+
+\newcommand{\mstd}[2]{#1$_{\pm #2}$}
+\newcommand{\best}[1]{\textbf{#1}}
+\newcommand{\tbd}[1][]{\textcolor{red}{\textbf{TBD#1}}}
+
+\raggedbottom
+
+\begin{document}
+
+\title[ChunkRatio-PD]{ChunkRatio-PD: Preference Distillation with Sibling Chunk Ratios and Mean Residual Correction}
+\author[1]{\fnm{Thang} \sur{Duc Tran}}
+\author*[1]{\fnm{Linh} \sur{Ngo Van}}\email{linhnv@soict.hust.edu.vn}
+\affil[1]{\orgname{Hanoi University of Science and Technology},\orgaddress{\country{Vietnam}}}
+\abstract{Preference distillation can transfer the changes induced by teacher alignment while retaining the student's own reference distribution. We study an explicit sequence-level target: the frozen student reference reweighted by the likelihood ratio between an aligned teacher and its actual alignment reference. For two chunks extending the same prefix, we derive an exact decomposition of the target's reference-relative log-odds into an analytic teacher chunk ratio and a difference of endpoint continuation values. ChunkRatio-PD approximates each continuation value, a log-exponential expectation, by the expected future teacher log-ratio under the student reference. A scalar predictor estimates this mean from frozen-reference rollouts, after which the student is trained on fixed soft sibling preferences using binary cross-entropy. Neither the teachers nor the predictor is required at inference. We characterize the discrepancy between the induced target and the exact sequence target through local Jensen gaps. With exact mean prediction and a uniformly bounded future-displacement range, the local KL divergence admits a fourth-order upper bound; a separate identity accounts for student fitting error. These results identify sufficient approximation conditions without establishing universal improvement over raw ratios. We also specify exact identity-case handling and an evaluation protocol that separates the benefit of residual correction from the choice of supervision granularity. Language-model effectiveness and computational savings remain empirical questions.}
+\keywords{Preference distillation, Preference optimization, Knowledge distillation, Ratio matching, Language models}
+\maketitle
+
+\section{Introduction}
+\label{sec1}
+
+Preference alignment adapts the response distribution of a language model to a chosen source of feedback. Reinforcement learning from human feedback (RLHF) and direct preference optimization (DPO) have become standard tools for this task~\citep{ouyang2022training,rafailov2023direct}. Running such a pipeline for every model size, however, requires its own feedback data and training. It is therefore natural to transfer alignment from a large, already aligned teacher to a smaller student, which is the goal of preference distillation. Existing methods pursue it through teacher-generated comparisons, distributional guidance, or value-based supervision~\citep{zhang2024plad,gao2025advantage,kwon2025preference}. Yet transfer can mean two different things. A student can reproduce the distribution of the aligned teacher, or it can inherit only the change that alignment made to that teacher. In this paper, we study the second goal.
+
+To make this goal precise, we assume access to three frozen models. These are an aligned teacher $\Tp$, the reference $\Tz$ used to align it, and the student's own initialization $\rho$. The sequence log-ratio $\log(\Tp/\Tz)$ then records how alignment changed the teacher's response probabilities. Under the idealized DPO model, this ratio equals a reward in units of the teacher's KL coefficient, up to a prompt-dependent constant. For real checkpoints, it remains an observable displacement signal, although its agreement with human judgment has to be checked empirically. We therefore define the transfer target as the student reference $\rho$ reweighted by the exponentiated teacher displacement. This target is the solution of a KL-regularized objective anchored at $\rho$, so it moves the student only where the teacher's alignment moved the teacher.
+
+The difficulty is that this target is defined over complete responses, whereas a student is trained most efficiently with local comparisons. A natural local rule multiplies the reference's next-token probabilities by the teacher ratio $\Tp/\Tz$ at every step, much like decoding-time logit arithmetic~\citep{mitchell2024emulator,liu2024tuning}. However, this rule normalizes at every state, while the target normalizes once over whole sequences. Under the target, the probability of a partial response also depends on the weighted continuations that can follow it, and the local rule ignores this dependence. The two coincide when the student shares the teacher's reference, $\rho=\Tz$. In distillation, though, the student is a different and usually smaller model, so the two generally differ.
+
+To expose this dependence, we compare two chunks that extend the same prefix, which we call \emph{siblings}. We show that the exact reference-relative log-odds between siblings split into two parts. The first part is the teacher's chunk log-ratio, which teacher-forced scoring gives in closed form. The second part is a difference of endpoint continuation values, each of which is the logarithm of an exponential expectation of future teacher displacement under $\rho$. Because siblings share a prefix, the normalizer of the current state cancels. The endpoint residual, by contrast, remains. Ignoring it is exact when it is constant across siblings, as in the case $\rho=\Tz$, and is an approximation otherwise.
+
+Building on this decomposition, we propose ChunkRatio-PD (CRPD). CRPD replaces each log-exponential endpoint value with its first-order cumulant, namely the expected future teacher log-ratio under $\rho$. This mean avoids exponentiating rollout scores and is straightforward to estimate. Complete rollouts from $\rho$, scored by both teachers, give unbiased regression labels through reverse cumulative sums. A single scalar predictor on frozen reference-model features then fits these labels with a squared loss. We then freeze the predictor, convert the corrected chunk scores into soft sibling preferences, and train the student with binary cross-entropy on its own chunk log-ratio differences. Two identity cases are handled exactly. When $\Tp=\Tz$, the student reference is returned unchanged; when $\rho=\Tz$, the residual is set to zero and the predictor is bypassed. Since neither the teachers nor the predictor is used at inference, the trained student generates as an ordinary autoregressive model.
+
+Our analysis separates three sources of error: the first-order approximation, the predictor, and the fit of the student. Using the KL chain rule, we write the divergence between the corrected and exact targets as a sum of sibling-level Jensen gaps. Errors shared by all siblings therefore cancel, and what matters is how the endpoint gaps vary across siblings. When the predictor is exact and the range of future displacement is small, this yields a fourth-order upper bound on the local KL divergence. A separate identity then accounts for the student's fitting error. The gap between expected and soft continuation values is already known from value-guided decoding~\citep{mudgal2024controlled,zhou2025qsharp}. Our analysis instead characterizes when this gap matters for training an independent student. Moreover, with unit chunks and matched settings, the population CRPD score coincides with the reference-$Q$ score of TokenRatio~\citep{nguyen2026tokenratio}. That score is therefore a first-order approximation to our sequence target. Finally, these results give sufficient conditions only. They do not imply that correction always beats raw ratios, nor that chunks always beat complete responses, so we test both questions separately.
+
+Our main contributions are as follows:
+\begin{itemize}
+    \item We formulate teacher-relative alignment transfer as sequence-level reweighting of a frozen student reference. We then derive an exact sibling decomposition of its local log-odds, which isolates the endpoint residual that local ratio rules omit whenever $\rho\neq\Tz$.
+    \item We propose CRPD, an offline distillation procedure that approximates this residual with a frozen predictor of the reference-policy mean and transfers the corrected target through soft sibling preferences. The procedure handles both identity cases exactly and adds no cost at inference.
+    \item We characterize the target error through sibling-level Jensen gaps, establish a fourth-order local KL bound under a bounded displacement range, and separate predictor error from student fitting error. We also connect the CRPD score to the reference-$Q$ score of TokenRatio.
+    \item We design an evaluation protocol that tests the correction and localization hypotheses independently. It combines exact checks on enumerable trees with language-model comparisons against raw ratios, token-level and complete-response supervision, and teacher-delta baselines under matched compute.
+\end{itemize}
+
+The rest of the paper is organized as follows. Section~\ref{sec:related} reviews related work, and Section~\ref{sec:background} introduces the transfer objective. Section~\ref{sec:method} presents CRPD, and Section~\ref{sec:theory} analyzes its approximation and fitting errors. Section~\ref{sec:llm} then presents the experimental setup, main results, ablations, and analysis. Finally, Section~\ref{sec:discussion} discusses limitations, and Section~\ref{sec:conclusion} concludes.
+
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Preference optimization and localized supervision.}
+DPO casts preference learning as a comparison of likelihood ratios between the policy and a fixed reference~\citep{rafailov2023direct}. It relies on the closed-form solution of KL-regularized reward maximization, in which the optimal policy is the reference reweighted by the exponentiated reward. \citet{korbak2022rl} read this solution as Bayesian inference with the pretrained model as the prior. Follow-up methods keep the ratio form and change one ingredient at a time. IPO and KTO change the feedback model, SimPO removes the explicit reference, and WPO and Ra-DPO reweight comparisons to handle off-policy data and uncertainty~\citep{azar2024general,ethayarajh2024kto,meng2024simpo,zhou2024wpo,zhang2025radpo}. Bregman preference optimization then shows that the logistic DPO loss is one member of a broader family of ratio-matching objectives~\citep{kim2026preference}. We stay within this logistic family and claim nothing new about the loss. Other work moves supervision below the complete response, through token-level formulations and step-level comparisons~\citep{rafailov2024from,zeng2024token,lai2024step}. TokenRatio, in particular, matches ratios with reference-$Q$ and advantage-based scores, and it adds state-dependent corrections when compared tokens follow different prefixes~\citep{nguyen2026tokenratio}. Our sibling construction is closest to its reference-$Q$ case: with unit chunks and matched reward, reference, and scales, the two population scores coincide (Section~\ref{subsec:tokenratio}). Because siblings share a prefix, the current-state correction cancels, yet a residual at the chunk endpoints remains. This residual separates two kinds of continuation value. Controlled decoding guides a reference model with the expected reward of its own continuations~\citep{mudgal2024controlled}. Q$\sharp$, however, shows that this expected value does not recover the KL-regularized optimum in general, and it learns the soft value with distributional reinforcement learning instead~\citep{zhou2025qsharp}. In our notation, $\phi$ is the soft value and $\mu$ the expected value, so the gap itself is known. What we add is an account of when the cheaper mean suffices for training a separate student, since only the variation of the gap across siblings enters the local error. Finally, we estimate $\mu$ from Monte Carlo returns of reference rollouts, much as process supervision and VinePPO estimate intermediate-state values~\citep{wang2024mathshepherd,kazemnejad2025vineppo}. Shared prefixes, chunking, and rollout-based value estimation are therefore established ingredients, and we do not present them as new.
+
+\paragraph{Knowledge and preference distillation.}
+Classical distillation trains a student to match the teacher's output distribution, and sequence-level distillation trains it on the teacher's generated outputs~\citep{hinton2015distilling,kim2016sequence}. For language models, MiniLLM and generalized knowledge distillation study which divergence to minimize and whether the student should learn from its own samples~\citep{gu2024minillm,agarwal2024policy}. BranchOPD, in turn, adds alternative continuations from shared prefixes~\citep{chen2026branchopd}. Because these methods imitate the teacher, they also carry over properties that $\Tp$ inherits from its base $\Tz$. Our target, by contrast, keeps the student's reference $\rho$ and reweights it by the change that alignment produced in the teacher. Preference-focused methods such as PLaD, DPKD, and PAD come closer to this goal, as they turn teacher signals into preferences over responses~\citep{zhang2024plad,li2024direct,gu2025capturing}. Value guidance has entered this line of work too: ADPA supplies advantage-based teacher guidance, and TVKD shapes preference optimization with teacher values~\citep{gao2025advantage,kwon2025preference}. NARVAL goes further and combines nested risk-aware value shaping with geometric token weights derived from the aligned/reference KL sensitivity~\citep{van2026narval}. Since our $\phi$ is a log-exponential expectation, it also has a risk-sensitive reading as an entropic certainty equivalent~\citep{howard1972risk}. However, the exponent in CRPD is fixed at one by the sequence target and expresses no risk preference. We also replace $\phi$ by its risk-neutral mean and use no token weighting. We therefore use NARVAL as a baseline and a source of reported results, not as evidence for our approximation. Lastly, CTPD handles teachers and students with different tokenizers~\citep{truong2026ctpd}; we set that problem aside and assume a shared token action space.
+
+\paragraph{Teacher-relative displacement.}
+Several methods treat the change between a tuned model and its base as a signal that can be moved to another model. Emulated fine-tuning combines the log-probabilities of a fine-tuned model, its base, and a model of a different size to transfer fine-tuning effects across scales~\citep{mitchell2024emulator}. Proxy tuning applies related logit arithmetic at decoding time~\citep{liu2024tuning}. Weak-to-strong search instead scores chunks from a frozen large model with the log-likelihood difference between a small tuned model and its untuned version~\citep{zhou2024weak}. At training time, OPD$^2$ uses teacher-minus-base guidance, and $\Delta$-MOPD re-anchors teacher-relative shifts at a frozen student initialization~\citep{heo2026opd,sang2026composing}. The displacement signal, its use on chunks, and anchoring at the student reference are thus all familiar. Our analysis looks instead at what happens when the ratio is applied locally. Consider the per-token rule $q(a\mid s)\propto\rho(a\mid s)\Tp(a\mid s)/\Tz(a\mid s)$. Because it normalizes at every state, its product along a response contains a trajectory-dependent product of local normalizers. By Proposition~\ref{prop:decomp}, the rule matches our globally normalized target exactly when $\phi(sa)$ is constant across sibling actions at every state. This holds when $\rho=\Tz$, but it generally fails once the student's base differs from the teacher's. The claim concerns the specified distributions only and does not imply that any related method optimizes our objective. Our contribution is the explicit residual analysis together with its practical approximation, whose value we still have to establish against these alternatives.
+
+\section{Background and Transfer Objective}
+\label{sec:background}
+
+\subsection{Stopped autoregressive distributions}
+\label{subsec:bg-notation}
+A state $s=(x,p_s)$ contains a prompt $x$ and a generated response prefix $p_s$. We write $n(s)$ for its response-token count and $sc$ for the state obtained by appending a token sequence $c$. Fix a finite vocabulary and a response horizon $H$. Generation terminates upon an admissible EOS token or after $H$ response tokens. The finite response space $\Yset_H(x)$ contains both EOS-terminated responses and horizon-truncated responses; a horizon-truncated response has no artificially appended EOS. All probabilities below refer to this same stopped process.
+
+\begin{assumption}[Common support and stopping]
+\label{ass:support}
+The aligned teacher $\Tp$, its actual alignment reference $\Tz$, the frozen student reference $\rho$, and the trainable student $\pth$ share a token action space, token meanings, prompt serialization, admissible-action masks, and stopping convention. Each model assigns strictly positive probability to every admissible next token at each nonterminal state.
+\end{assumption}
+
+This assumption makes all ratios finite and all stopped response distributions normalized. It requires explicit verification: model-family membership alone does not establish tokenizer or chat-template compatibility, and decoding masks can invalidate positivity despite a softmax output layer. For any admissible continuation $c$,
+\begin{equation}
+\log\pi(c\mid s)=\sum_{j=1}^{|c|}\log\pi(c_j\mid s,c_{<j}).
+\label{eq:chain}
+\end{equation}
+We use token sums throughout. Length averaging, reward clipping, and altered stopping conventions change the target.
+
+\subsection{Teacher displacement and the sequence target}
+Define
+\begin{equation}
+d_T(y\mid x)=\log\frac{\Tp(y\mid x)}{\Tz(y\mid x)}.
+\label{eq:bg-dT}
+\end{equation}
+If $\Tp$ exactly maximizes $\E_\pi r-\beta\KL(\pi\|\Tz)$ on the declared response space, then
+\begin{equation}
+\Tp(y\mid x)=\frac{\Tz(y\mid x)e^{r(x,y)/\beta}}{Z_T(x)},
+\qquad d_T(y\mid x)=r(x,y)/\beta-\log Z_T(x).
+\label{eq:bg-dpo}
+\end{equation}
+This is the idealized reward-policy relation underlying DPO~\citep{rafailov2023direct}. A trained checkpoint need not satisfy the relation for the human reward, particularly under finite data, restricted capacity, or a different training horizon. We therefore use $d_T$ as a declared preference proxy. It measures checkpoint displacement; it does not uniquely separate human utility from all other effects of post-training.
+
+For each prompt, we fix
+\begin{equation}
+\begin{aligned}
+J_x(\pi)&=\E_{y\sim\pi(\cdot\mid x)}d_T(y\mid x)-\KL(\pi(\cdot\mid x)\|\rho(\cdot\mid x)),\\
+\popt(y\mid x)&=\frac{\rho(y\mid x)e^{d_T(y\mid x)}}{Z(x)},
+\quad Z(x)=\sum_{y\in\Yset_H(x)}\rho(y\mid x)e^{d_T(y\mid x)}.
+\end{aligned}
+\label{eq:bg-target}
+\end{equation}
+The second line is the unique maximizer over all distributions on $\Yset_H(x)$. If Eq.~\eqref{eq:bg-dpo} holds, the same policy maximizes $\E_\pi r-\beta\KL(\pi\|\rho)$. This statement identifies an unrestricted distributional optimum; it does not guarantee that a finite-capacity student trained with DPO attains it. We fix the teacher-displacement coefficient to one. The pair scale introduced below changes preference encoding, not this coefficient.
+
+Two identities calibrate the target: $\Tp=\Tz$ implies $\popt=\rho$, and $\rho=\Tz$ implies $\popt=\Tp$. These are equalities of distributions under the declared response convention, rather than approximate similarities between model families.
+
+\section{Methodology}
+\label{sec:method}
+
+\subsection{Sibling chunks and exact continuation correction}
+\label{subsec:chunks}
+Starting from a nonterminal state $s$, a chunk stops after $L$ tokens or at termination, whichever occurs first. The remaining budget is $H-n(s)$ and is not reset at a chunk boundary. The resulting action set $\Cset_L(s)$ is prefix-free and exhaustive: each complete suffix starts with exactly one chunk, and $\sum_{c\in\Cset_L(s)}\pi(c\mid s)=1$. Distinct chunks from this set are siblings. Define
+\begin{equation}
+\delta_T(c\mid s)=\log\frac{\Tp(c\mid s)}{\Tz(c\mid s)},
+\qquad a_\theta(c\mid s)=\log\frac{\pth(c\mid s)}{\rho(c\mid s)}.
+\label{eq:chunk-ratios}
+\end{equation}
+Let $D_T(s)$ denote the teacher log-ratio accumulated along the response prefix. For a complete suffix $z$ from $s$, define $d_s(z)=\log[\Tp(z\mid s)/\Tz(z\mid s)]$ and
+\begin{equation}
+\phi(s)=\log\E_{z\sim\rho(\cdot\mid s)}e^{d_s(z)}.
+\label{eq:phi}
+\end{equation}
+At a terminal state the only suffix is empty, so $d_s=\phi(s)=0$. The value $\phi$ is the optimal entropy-regularized continuation value for the remaining displacement reward.
+
+\begin{proposition}[Exact sibling decomposition]
+\label{prop:decomp}
+Under Assumption~\ref{ass:support},
+\begin{equation}
+\log\frac{\popt(c\mid s)}{\rho(c\mid s)}=\delta_T(c\mid s)+\phi(sc)-\phi(s).
+\label{eq:decomp}
+\end{equation}
+Thus the reference-relative sibling log-odds satisfy
+\begin{equation}
+\log\frac{\popt(c\mid s)\rho(d\mid s)}{\popt(d\mid s)\rho(c\mid s)}
+=\delta_T(c\mid s)-\delta_T(d\mid s)+\phi(sc)-\phi(sd).
+\label{eq:sibling-exact}
+\end{equation}
+Composing the exact chunk conditionals recovers Eq.~\eqref{eq:bg-target}, independently of $L$.
+\end{proposition}
+\begin{proof}
+Let $\rho(s\mid x)$ and $\popt(s\mid x)$ denote prefix probabilities, with the prompt omitted from the scored tokens. Marginalizing the sequence target over complete suffixes gives
+\[
+\popt(s\mid x)=\rho(s\mid x)e^{D_T(s)+\phi(s)}/Z(x).
+\]
+Taking the ratio at $sc$ and $s$ proves Eq.~\eqref{eq:decomp}; subtracting the equations for siblings proves Eq.~\eqref{eq:sibling-exact}. Along chunk boundaries $x=s_0,\ldots,s_K=y$, residual differences telescope to $-\phi(x)$ because $\phi(y)=0$. Since $\phi(x)=\log Z(x)$, the product of conditionals equals the sequence target.
+\end{proof}
+
+The shared prefix removes $\phi(s)$ but leaves endpoint differences. In particular, raw scores $\delta_T$ recover the exact conditional at $s$ if and only if $\phi(sc)$ is constant over $c\in\Cset_L(s)$. The condition $\rho=\Tz$ is sufficient, since then $\phi\equiv0$, but is not necessary. Complete-suffix chunks also have zero endpoint residual for arbitrary references.
+
+\subsection{Mean residual correction}
+\label{subsec:correction}
+We approximate $\phi$ by
+\begin{equation}
+\mu(s)=\E_{z\sim\rho(\cdot\mid s)}d_s(z),\qquad
+g(s)=\phi(s)-\mu(s)=\Jg_{\rho(\cdot\mid s)}(d_s)\ge0,
+\label{eq:mu}
+\end{equation}
+where $\Jg_p(f)=\log\E_pe^f-\E_pf$. This is a first-order cumulant approximation: for $K_s(t)=\log\E_\rho e^{t d_s}$, $K_s'(0)=\mu(s)$ whereas $K_s(1)=\phi(s)$. Calling it first order refers to an expansion in teacher-displacement amplitude, not to first-order accuracy for arbitrary checkpoints.
+
+The implemented score is
+\begin{equation}
+t_s(c)=\delta_T(c\mid s)+\muhat(sc),\qquad \muhat(u)=0\text{ at termination}.
+\label{eq:score}
+\end{equation}
+An equivalent residual representation is $\phi(s)=\log\E_{\Tp(\cdot\mid s)}e^{\ell_s}$ with $\ell_s(z)=\log[\rho(z\mid s)/\Tz(z\mid s)]$. Its corresponding mean $\mu_{\Tp}(s)=\E_{\Tp}\ell_s$ controls a different approximation error. The $\rho$-mean targets small teacher displacement even when reference mismatch is substantial; it does not uniformly dominate the teacher-side mean or zero correction. Estimating an ordinary mean avoids exponentiating rollout scores, although it still requires sufficient samples and predictor coverage.
+
+\paragraph{Correction data and regression.}
+We construct a frozen pool of prefixes from $\rho$ rollouts, selecting boundaries every $L$ response tokens, including the prompt state. At each boundary we independently draw an even number $K$ of candidate chunks, half from $\rho$ and half from $\Tp$. We deduplicate candidates and skip states with fewer than two distinct chunks. Source identity never determines a label. Teacher-forced scoring under $\Tp$, $\Tz$, and $\rho$ provides chunk log-probabilities and reference-model features.
+
+Before collecting correction outcomes, we fix seed prefixes and a budgeted, source-stratified subset of nonterminal candidate endpoints. From each seed we draw a fresh complete continuation from $\rho$, with temperature one and no uncorrected top-$k$, top-$p$, or repetition transformation. Along a trajectory with next tokens $y_0,\ldots,y_{N-1}$ and pre-token states $s_0,\ldots,s_N$, define
+\begin{equation}
+Y_t=\sum_{j=t}^{N-1}\left[\log\Tp(y_j\mid s_j)-\log\Tz(y_j\mid s_j)\right],\qquad Y_N=0.
+\label{eq:labels}
+\end{equation}
+Reverse cumulative sums provide labels for causally selected visited states, and $\E[Y_t\mid s_t]=\mu(s_t)$. Labels from one trajectory are correlated. Endpoint seeds proposed by the teacher receive fresh $\rho$ continuations; teacher-generated suffixes cannot be treated as unbiased labels for $\mu$.
+
+Let $h_\rho(s)$ be the final-layer reference hidden state at the last prefix token, and $b(s)=(H-n(s))/H$. A scalar two-layer predictor $f_\psi(h_\rho(s),b(s))$ is fitted by
+\begin{equation}
+\mathcal L_{\mathrm{head}}(\psi)=\frac1B\sum_{i=1}^B\frac1H
+\sum_{t\in I_i}\big[f_\psi(h_\rho(s_{i,t}),b(s_{i,t}))-Y_{i,t}\big]^2,
+\label{eq:head}
+\end{equation}
+where $I_i$ is a predetermined or otherwise causal set of visited nonterminal states. The fixed denominator avoids outcome-dependent weighting by realized suffix length. If multiple seeds originate from one prompt, their sampling multiplicity is specified explicitly. Data are split by prompt, including near duplicates and all derived trajectories, before collection. We select the predictor on held-out prompts, freeze it, and enforce an exact terminal value of zero. Regression on compressed features can introduce approximation error even with unlimited data; unbiased rollout labels do not imply an unbiased learned predictor.
+
+\paragraph{Exact identity cases.}
+Before correction collection, verified identity $\Tp=\Tz$ returns the student reference unchanged. Verified identity $\rho=\Tz$ instead sets the residual correction to zero and bypasses predictor training. Indeed, in the latter case $\phi=0$ but $\mu(s)=-\KL(\Tz(\cdot\mid s)\|\Tp(\cdot\mid s))$, generally nonzero. Checkpoint identity under identical model and scoring configurations is sufficient to certify these equalities; approximate similarity is not. The mean-approximation analysis below concerns the mean branch, not this exact bypass.
+
+\subsection{Frozen soft-preference training}
+\label{subsec:loss}
+For sibling chunks $c,d$, use the synthetic label and student margin
+\begin{equation}
+\phat_s(c,d)=\sigma\!\left(\alpha[t_s(c)-t_s(d)]\right),\qquad
+m_\theta(s,c,d)=\alpha[a_\theta(c\mid s)-a_\theta(d\mid s)],
+\label{eq:pair}
+\end{equation}
+with $\alpha>0$ and $\sigma(v)=(1+e^{-v})^{-1}$. These labels encode a teacher-induced comparison rule; they are not measured probabilities of human preference over incomplete chunks. Likewise, $m_\theta$ is a reference-relative preference logit, not an unadjusted policy log-odds.
+
+The sole primary policy objective is
+\begin{equation}
+\mathcal L_{\mathrm{CRPD}}(\theta)=\E_{(x,s,c,d)\sim w}
+\left[\softplus(m_\theta)-\phat_s(c,d)m_\theta\right].
+\label{eq:loss}
+\end{equation}
+Labels, reference scores, and predictor parameters are frozen. The margin derivative is $\sigma(m_\theta)-\phat$, and excess per-pair loss is Bernoulli KL. Swapping the pair reverses the margin and complements the label, leaving the loss invariant. We use logit-space cross-entropy and unnormalized token-log-probability sums. If both endpoint predictions have error at most $\eta$, their contribution to label error is at most $\alpha\eta/2$ because $\sup\sigma'=1/4$.
+
+For a cached dataset, sample eligible prompts uniformly, then states within a prompt uniformly, then unordered candidate pairs within a state uniformly:
+\begin{equation}
+w_{x,s,c,d}=\frac1{N_{\mathrm p}}\frac1{N_{\mathrm s}(x)}\binom{K_s}{2}^{-1}.
+\label{eq:weights}
+\end{equation}
+This weighting concerns policy comparisons and differs from the trajectory-weighted predictor regression. Student scores require the full causal prefix even though only chunk tokens contribute to the loss.
+
+\begin{theorem}[Population identification]
+\label{thm:recovery}
+Fix $\muhat$ and an ideal population comparison objective of the form~\eqref{eq:loss}. Give every nonterminal boundary state in the chunk tree positive weight, and at each state let positive-weight comparisons form a connected graph on the full finite set $\Cset_L(s)$. Suppose a policy in the student's class simultaneously realizes every target margin. Then every global minimizer has chunk conditionals
+\begin{equation}
+q_{\muhat}(c\mid s)=\frac{\rho(c\mid s)e^{t_s(c)}}{\sum_{d\in\Cset_L(s)}\rho(d\mid s)e^{t_s(d)}}.
+\label{eq:qmu}
+\end{equation}
+With $\muhat=\phi$, their composition equals $\popt$. Using the same positive $\alpha$ in labels and margins does not change this population optimum.
+\end{theorem}
+\begin{proof}
+The per-pair loss is strictly convex in its margin and uniquely minimized at $m=\alpha[t_s(c)-t_s(d)]$. Simultaneous realizability and positive weights force every global minimizer to attain these pairwise minima. Connectivity implies $a_\theta(c\mid s)=t_s(c)+k_s$ across the full action set. Normalization determines $k_s$ and yields Eq.~\eqref{eq:qmu}. For $\muhat=\phi$, Eq.~\eqref{eq:decomp} gives the exact conditionals.
+\end{proof}
+
+A fixed finite prefix pool and four candidates per state do not satisfy these population assumptions. At a sampled state, connected comparisons determine ratios only among observed chunks; their total probability mass and the probabilities of unobserved actions remain unidentified. Training never evaluates the denominator in Eq.~\eqref{eq:qmu}. The theorem is an identification result, not a finite-data or neural-optimization guarantee. Finite precision and saturated labels further limit its literal application.
+
+\begin{algorithm}[t]
+\caption{ChunkRatio-PD with a frozen correction predictor}
+\label{alg:crpd}
+\begin{algorithmic}[1]
+\Require frozen $\Tp,\Tz,\rho$; $\pth\gets\rho$; horizon $H$; chunk length $L$; even $K$; scale $\alpha>0$
+\If{verified $\Tp=\Tz$}\State \Return $\rho$\EndIf
+\State Fix prompt splits; build reference prefix pools on a causal schedule
+\State Generate $K$ sibling candidates per selected state; deduplicate and score
+\If{verified $\rho=\Tz$}
+\State Set $\muhat\gets0$
+\Else
+\State Fix correction seeds and budget; generate fresh $\rho$ suffixes
+\State Score suffixes with both teachers; construct reverse-sum labels
+\State Fit Eq.~\eqref{eq:head}; select on held-out prompts and freeze the predictor
+\EndIf
+\State Set terminal corrections to zero; cache scores and labels from Eqs.~\eqref{eq:score}--\eqref{eq:pair}
+\State Train $\pth$ with Eq.~\eqref{eq:loss} and weights~\eqref{eq:weights}
+\State \Return $\pth$ for ordinary autoregressive generation
+\end{algorithmic}
+\end{algorithm}
+
+\section{Theoretical Analysis}
+\label{sec:theory}
+All statements concern finite stopped distributions and the declared teacher proxy. Write $q=q_{\muhat}$ for the composition of Eq.~\eqref{eq:qmu} along the chunk tree, and $s_k$ for visited nonterminal chunk boundaries. Approximate targets can depend on $L$, even though the exact target does not.
+
+\subsection{Exact error identities}
+\begin{lemma}[Objective regret]
+\label{lem:regret}
+For every policy $\pi$, $J_x(\popt)-J_x(\pi)=\KL(\pi\|\popt)$.
+\end{lemma}
+\begin{proof}
+Equation~\eqref{eq:bg-target} implies $\KL(\pi\|\popt)=\log Z(x)-J_x(\pi)$. Substituting $\pi=\popt$ proves the result.
+\end{proof}
+
+Let $e(u)=\muhat(u)-\phi(u)$, with $e=0$ at terminal states, and let $\osc f=\max f-\min f$ over the indicated finite action set.
+\begin{proposition}[Sibling Jensen-gap identities]
+\label{prop:jensen}
+\begin{equation}
+\begin{aligned}
+\KL(\popt\|q)&=\E_{\popt}\sum_k\Jg_{\popt(\cdot\mid s_k)}\big(e(s_k\,\cdot)\big),\\
+\KL(q\|\popt)&=\E_q\sum_k\Jg_{q(\cdot\mid s_k)}\big(-e(s_k\,\cdot)\big).
+\end{aligned}
+\label{eq:jensen}
+\end{equation}
+Each local term is at most $[\osc_{c\in\Cset_L(s_k)}e(s_kc)]^2/8$.
+\end{proposition}
+\begin{proof}
+At a fixed state,
+\[
+q(c\mid s)=\frac{\popt(c\mid s)e^{e(sc)}}{\E_{\popt(\cdot\mid s)}e^{e(s\,\cdot)}}.
+\]
+Taking the expected log-ratio under $\popt$ gives the forward local gap; rewriting $\popt$ as a tilt of $q$ by $-e$ gives the reverse gap. The KL chain rule on the common finite chunk tree proves Eq.~\eqref{eq:jensen}. Hoeffding's lemma bounds $\log\E e^{f-\E f}$ by $\osc(f)^2/8$~\citep{hoeffding1963probability}.
+\end{proof}
+
+The directions in Eq.~\eqref{eq:jensen} use different visitation distributions. Objective regret is the reverse KL and must be bounded under $q$, not by substituting the forward expression. Errors common to all sibling endpoints have no local effect.
+
+\subsection{Mean approximation and its limits}
+\begin{corollary}[Fourth-order local upper bound]
+\label{cor:fourth}
+At a boundary $s$, suppose that for every endpoint $u=sc$, the range of $d_u(z)$ over all admissible complete suffixes has width at most $\varepsilon_s$. Then $0\le g(u)\le\varepsilon_s^2/8$. With exact means $\muhat=\mu$, either local KL direction between $q_\mu$ and $\popt$ satisfies
+\begin{equation}
+\KL_{\mathrm{local}}\le\varepsilon_s^4/512.
+\label{eq:fourth}
+\end{equation}
+If additionally $|\muhat(u)-\mu(u)|\le\eta_s$ at all sibling endpoints of every visited boundary, then
+\begin{equation}
+J_x(\popt)-J_x(q)\le\frac18\E_q\sum_k
+\left(2\eta_{s_k}+\frac{\varepsilon_{s_k}^2}{8}\right)^2.
+\label{eq:regret-bound}
+\end{equation}
+\end{corollary}
+\begin{proof}
+Jensen's inequality and Hoeffding's lemma give $0\le g(u)\le\varepsilon_s^2/8$. Since $e=(\muhat-\mu)-g$, endpoint errors lie in $[-\eta_s-\varepsilon_s^2/8,\eta_s]$. Their oscillation is at most $2\eta_s+\varepsilon_s^2/8$. Apply Proposition~\ref{prop:jensen}, and then Lemma~\ref{lem:regret}. For $\eta_s=0$ the local constant is $(\varepsilon_s^2/8)^2/8=\varepsilon_s^4/512$.
+\end{proof}
+
+Equation~\eqref{eq:fourth} is an approximation upper bound as a uniform displacement range shrinks. It is neither a fourth-order statistical rate nor an unconditional guarantee for the trained student. Rare suffixes and long horizons can make the range large. Conversely, a large range does not establish that correction fails.
+
+Let $\omega_s=\osc_c g(sc)$. Without a small-range assumption, the same argument gives
+\begin{equation}
+J_x(\popt)-J_x(q)\le\frac18\E_q\sum_k(\omega_{s_k}+2\eta_{s_k})^2.
+\label{eq:sibling-bound}
+\end{equation}
+Thus even large endpoint gaps can be harmless if they are nearly constant among siblings. Raw ratios have $e=-\phi$; comparing oscillation bounds suggests when correction could help, but ordering two upper bounds does not prove an ordering of their actual KL divergences. Direct target-error and generation comparisons remain necessary.
+
+To clarify the role of variance, define $K_u(t)=\log\E_{\rho(\cdot\mid u)}e^{t d_u}$ and the tilted suffix law $\rho_{u,t}(z)=\rho(z\mid u)e^{t d_u(z)-K_u(t)}$. Finite support permits differentiation, giving the exact identity
+\begin{equation}
+g(u)=\int_0^1(1-t)\Var_{\rho_{u,t}}(d_u)\,dt.
+\label{eq:tilted}
+\end{equation}
+Indeed, $K_u''(t)=\Var_{\rho_{u,t}}(d_u)$ and Taylor's integral formula gives Eq.~\eqref{eq:tilted}. The heuristic $g\approx\Var_\rho(d_u)/2$ requires higher-cumulant control. If $|K_u'''(t)|\le C_s$ uniformly over sibling endpoints and $t\in[0,1]$, then
+\begin{equation}
+\left|g(u)-\tfrac12\Var_\rho(d_u)\right|\le C_s/6.
+\label{eq:variance-remainder}
+\end{equation}
+Small observed variance or a small fraction of changed output tokens does not certify these conditions.
+
+\subsection{Student fitting error}
+\label{subsec:fitting}
+The preceding bounds concern $q$, not an arbitrary neural student. For any positive $\pth$, define $\Delta_s(c)=\log[\pth(c\mid s)/q(c\mid s)]$. Then
+\begin{equation}
+\KL(\pth\|\popt)=\E_{\pth}\sum_k
+\Jg_{\pth(\cdot\mid s_k)}\big(-e(s_k\,\cdot)-\Delta_{s_k}(\cdot)\big).
+\label{eq:fitting}
+\end{equation}
+To verify this, note that $\popt(c\mid s)$ is a normalized tilt of $\pth(c\mid s)$ by $-e(sc)-\Delta_s(c)$, and apply the same local argument and chain rule as in Proposition~\ref{prop:jensen}. If $\osc_c\Delta_s(c)\le\zeta_s$ and the predictor bound above holds, a consequence is
+\begin{equation}
+J_x(\popt)-J_x(\pth)\le\frac18\E_{\pth}\sum_k(\omega_{s_k}+2\eta_{s_k}+\zeta_{s_k})^2.
+\label{eq:fitted-bound}
+\end{equation}
+These are conditional full-action-space statements. A low empirical loss on a small candidate set does not establish a uniform bound on $\zeta_s$, particularly at unobserved prefixes or actions. No triangle inequality for KL is assumed.
+
+\subsection{Connection to reference-policy values}
+\label{subsec:tokenratio}
+For terminal proxy reward $d_T(y\mid x)$, forcing chunk $c$ and continuing under $\rho$ gives
+\begin{equation}
+Q^\rho(s,c)=\E_{z\sim\rho(\cdot\mid sc)}d_T(p_scz\mid x)
+=D_T(s)+\delta_T(c\mid s)+\mu(sc).
+\label{eq:q}
+\end{equation}
+Thus the population corrected score is $Q^\rho(s,c)-D_T(s)$. With unit chunks, matched reward, reference, and scales, it matches TokenRatio's reference-Q score~\citep{nguyen2026tokenratio}. The same-prefix comparison cancels a current-state baseline; the predictor here estimates the continuation mean, not TokenRatio's partition baseline. The exact score adds $g(sc)$, so exact and mean-based \emph{preference logits} differ by $\alpha[g(sc)-g(sd)]$. Reference-relative policy log-odds differ by $g(sc)-g(sd)$ without $\alpha$. This correspondence is at the score level and does not establish equivalence to TBPO-Q/A algorithms or their intended objectives.
+
+\section{Experiments}
+\label{sec:llm}
+
+We design our experiments around four questions. First, does CRPD transfer alignment better than existing preference-distillation methods (RQ1)? Second, does the endpoint correction improve on raw sibling ratios, and does the direction of the mean matter (RQ2)? Third, do chunks give a better quality-cost tradeoff than tokens and complete responses (RQ3)? Finally, how accurate is the mean approximation in practice, and where does it break down (RQ4)? Section~\ref{subsec:setup} describes the setup. Sections~\ref{subsec:main_results} and~\ref{subsec:generation} then address RQ1, and Section~\ref{sec:ablation} addresses RQ2 and RQ3. Finally, Sections~\ref{subsec:regime} and~\ref{subsec:cost} address RQ4 and the cost side of RQ3.
+
+\subsection{Experimental Setup}
+\label{subsec:setup}
+
+\paragraph{Models.}
+We use three teacher-student configurations: Llama-3.1-8B $\to$ Llama-3.2-1B, Qwen3-8B $\to$ Qwen3-1.7B, and Qwen3-1.7B $\to$ Qwen3-0.6B. Within each configuration, the teacher and student share a tokenizer and chat template, as Assumption~\ref{ass:support} requires, and we verify this before any collection. Because the teacher reference must be the exact checkpoint used for alignment, we construct each teacher pair ourselves. We first fine-tune the teacher on instruction data to obtain $\Tz$ (the SFT teacher), and then align it with DPO to obtain $\Tp$ (the DPO teacher). The student reference $\rho$ is the student after the same supervised fine-tuning stage (the SFT student). % TODO: confirm that this matches the runs.
+
+\paragraph{Data.}
+Following \citet{van2026narval}, we use Deita~\citep{liu2024what} for supervised fine-tuning and binarized UltraFeedback~\citep{cui2310ultrafeedback} for teacher DPO. CRPD itself uses prompts only. We draw its prompts from a split that is disjoint from teacher alignment, and we group near-duplicate prompts before splitting. Correction training, predictor validation, policy training, model selection, and final evaluation each use separate prompt groups. \tbd[: dataset revisions, filtering, and split sizes.]
+
+\paragraph{Baselines.}
+We compare against four groups of methods. The first group trains the student directly on human preference labels: DPO, WPO, and Ra-DPO~\citep{rafailov2023direct,zhou2024wpo,zhang2025radpo}. The second group consists of preference-distillation methods: DCKD, ADPA, TVKD, and NARVAL~\citep{gao2025advantage,kwon2025preference,van2026narval}. % TODO: add the DCKD citation.
+The third group contains the methods closest to our construction. These are a single-teacher adaptation of teacher-delta distillation~\citep{sang2026composing,heo2026opd} and TBPO-Q/A in their original formulation~\citep{nguyen2026tokenratio}. The fourth group consists of controlled variants of CRPD that share its data and budget. These are raw sibling ratios ($\muhat=0$), the teacher-side mean $\mu_{\Tp}$, token-level chunks ($L=1$), and complete-response comparisons from the same prefixes. We also report an anchored variant that adds a supervised term to Eq.~\eqref{eq:loss}. Because this term changes the objective, we list it separately and give the same anchor to the relevant controls. Rows marked R are reported by \citet{van2026narval}, whose setup uses the same three configurations and data sources. We did not reproduce these rows, so they provide context, and all claims about CRPD rest on the methods we train ourselves.
+
+\paragraph{Evaluation.}
+We evaluate general capabilities on HellaSwag, ARC, MMLU, TruthfulQA, Winogrande, and GSM8K with a pinned version of the LM Evaluation Harness~\citep{eval-harness}. For open-ended generation, we use MT-Bench~\citep{zheng2023judging} and pairwise comparisons on held-out HH-RLHF prompts, reporting both the raw win rate and a length-controlled win rate~\citep{dubois2024length}. As in \citet{van2026narval}, GPT-5.4-mini is the judge and GPT-4o-mini is the comparator, and we randomize answer order. Since the length-controlled estimator is applied to HH-RLHF prompts, these numbers are not official AlpacaEval scores. Alongside quality, we report response length, the EOS rate, and the horizon-truncation rate. We train each method with three seeds where the budget allows, and we report prompt-clustered paired confidence intervals.
+
+\paragraph{Implementation details.}
+We use a response horizon $H=512$, chunk length $L=32$, and $K=4$ candidates per state, two sampled from $\rho$ and two from $\Tp$. The pair scale $\alpha$ is selected from $\{0.1,0.3,1\}$ on held-out prompts, and every baseline receives a comparable tuning budget. The correction predictor is a two-layer network with 256 hidden units and GELU activations, applied to the final-layer hidden state of $\rho$ and the remaining-budget feature. All log-probabilities are accumulated in FP32, prompt and padding tokens are masked, and the primary method uses no auxiliary loss. \tbd[: optimizer, learning rate, batch size, training steps, correction-seed budget, and hardware.]
+
+\subsection{Main Results on Preference Distillation}
+\label{subsec:main_results}
+
+Table~\ref{tab:main} reports general-capability scores for all three configurations. Among the reported baselines, NARVAL obtains the highest average in every configuration, with $44.21$, $63.63$, and $51.24$ points. Its margin over the strongest remaining baseline is small, however, at $0.91$, $1.43$, and $0.31$ points, respectively. Differences of this size call for seed-level uncertainty, which we therefore report for every method we train. Because the six benchmarks mainly measure retained capability, we read them alongside the generation results in Section~\ref{subsec:generation}.
+
+\tbd[: compare CRPD with raw ratios first, then with TBPO-Q/A, the teacher-delta baseline, and the distillation baselines; give effect sizes and intervals.]
+
+\begin{table*}[t]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.05}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lccccccc}
+\toprule
+\textbf{Method} & \textbf{HellaSwag} & \textbf{ARC} & \textbf{MMLU} & \textbf{TruthfulQA} & \textbf{Winogrande} & \textbf{GSM8K} & \textbf{Avg.} \\
+\midrule
+\multicolumn{8}{l}{\textit{Llama-3.1-8B $\to$ Llama-3.2-1B}} \\
+\midrule
+DPO teacher\textsuperscript{R} & 83.05 & 52.30 & 63.39 & 57.37 & 78.22 & 52.77 & 64.52 \\
+SFT teacher\textsuperscript{R} & 81.85 & 51.20 & 63.05 & 53.59 & 78.45 & 47.84 & 62.66 \\
+\cmidrule(lr){1-8}
+SFT student\textsuperscript{R} & 65.84 & 39.24 & 31.08 & 41.13 & 62.90 & 7.28 & 41.25 \\
+DPO\textsuperscript{R} & 66.94 & 39.25 & 31.21 & 44.57 & 62.12 & 7.88 & 42.00 \\
+WPO\textsuperscript{R} & 67.44 & 40.70 & 31.21 & 42.45 & 62.27 & 6.22 & 41.72 \\
+Ra-DPO\textsuperscript{R} & 66.14 & 39.40 & 31.02 & 41.61 & 62.83 & 7.71 & 41.45 \\
+DCKD\textsuperscript{R} & 65.52 & 38.29 & 33.21 & 48.60 & 62.27 & 6.90 & 42.47 \\
+ADPA\textsuperscript{R} & 65.87 & 38.57 & 32.85 & 51.46 & 62.27 & 6.88 & 42.98 \\
+TVKD\textsuperscript{R} & 67.64 & 39.12 & 33.00 & 50.53 & 62.59 & 6.91 & 43.30 \\
+NARVAL\textsuperscript{R} & 68.20 & 40.19 & 34.81 & 51.35 & 62.92 & 7.76 & 44.21 \\
+Teacher-delta baseline & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+% CRPD (raw, $\muhat=0$) & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+\rowcolor{gray!20}
+\textbf{CRPD} & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+% CRPD (anchored) & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+\midrule
+\multicolumn{8}{l}{\textit{Qwen3-8B $\to$ Qwen3-1.7B}} \\
+\midrule
+DPO teacher\textsuperscript{R} & 80.60 & 66.55 & 77.37 & 61.52 & 75.93 & 80.89 & 73.81 \\
+SFT teacher\textsuperscript{R} & 79.30 & 66.04 & 77.19 & 58.96 & 75.69 & 79.53 & 72.79 \\
+\cmidrule(lr){1-8}
+SFT student\textsuperscript{R} & 67.47 & 52.90 & 64.90 & 49.52 & 64.40 & 64.37 & 60.59 \\
+DPO\textsuperscript{R} & 68.44 & 53.84 & 64.69 & 52.54 & 64.01 & 65.25 & 61.46 \\
+WPO\textsuperscript{R} & 68.81 & 55.29 & 64.83 & 53.02 & 64.01 & 64.31 & 61.71 \\
+Ra-DPO\textsuperscript{R} & 67.82 & 54.10 & 64.70 & 56.04 & 63.93 & 65.16 & 61.96 \\
+DCKD\textsuperscript{R} & 66.75 & 54.92 & 65.72 & 54.26 & 64.64 & 66.49 & 62.13 \\
+ADPA\textsuperscript{R} & 68.30 & 56.23 & 64.35 & 55.50 & 64.56 & 64.25 & 62.20 \\
+TVKD\textsuperscript{R} & 68.47 & 54.90 & 63.99 & 56.52 & 64.40 & 64.37 & $62.11^{\dagger}$ \\
+NARVAL\textsuperscript{R} & 69.31 & 55.95 & 64.96 & 57.40 & 64.93 & 69.22 & 63.63 \\
+Teacher-delta baseline & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+% CRPD (raw, $\muhat=0$) & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+\rowcolor{gray!20}
+\textbf{CRPD} & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+% CRPD (anchored) & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+\midrule
+\multicolumn{8}{l}{\textit{Qwen3-1.7B $\to$ Qwen3-0.6B}} \\
+\midrule
+DPO teacher\textsuperscript{R} & 68.44 & 53.84 & 64.69 & 52.54 & 64.01 & 65.25 & 61.46 \\
+SFT teacher\textsuperscript{R} & 67.47 & 52.90 & 64.90 & 49.52 & 64.40 & 64.37 & 60.59 \\
+\cmidrule(lr){1-8}
+SFT student\textsuperscript{R} & 53.08 & 37.63 & 50.59 & 45.92 & 59.51 & 47.84 & 49.09 \\
+DPO\textsuperscript{R} & 53.74 & 39.08 & 50.80 & 46.92 & 59.43 & 52.46 & 50.41 \\
+WPO\textsuperscript{R} & 52.81 & 37.80 & 50.33 & 47.24 & 59.51 & 53.36 & 50.17 \\
+Ra-DPO\textsuperscript{R} & 52.42 & 36.24 & 48.99 & 45.92 & 59.43 & 52.42 & 49.24 \\
+DCKD\textsuperscript{R} & 53.12 & 37.84 & 49.76 & 46.92 & 59.27 & 53.18 & 50.01 \\
+ADPA\textsuperscript{R} & 54.10 & 39.33 & 50.98 & 46.11 & 59.27 & 53.22 & 50.50 \\
+TVKD\textsuperscript{R} & 53.42 & 38.48 & 50.27 & 49.00 & 59.98 & 54.44 & 50.93 \\
+NARVAL\textsuperscript{R} & 53.85 & 39.68 & 50.61 & 48.19 & 60.14 & 54.97 & 51.24 \\
+Teacher-delta baseline & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+% CRPD (raw, $\muhat=0$) & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+\rowcolor{gray!20}
+\textbf{CRPD} & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+% CRPD (anchored) & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+\bottomrule
+\end{tabular}
+}
+\caption{General-capability scores for the three teacher-student configurations. Rows marked R are reported by \citet{van2026narval} and were not reproduced in this study. $\dagger$: average recomputed from the six displayed scores; the source prints $62.61$.}
+\label{tab:main}
+\end{table*}
+
+\subsection{Generation Quality}
+\label{subsec:generation}
+
+Tables~\ref{tab:mtbench} and~\ref{tab:hhrlhf} report open-ended generation quality. On MT-Bench, NARVAL has the highest reported average ($5.21$, compared with $4.86$ for TVKD), but the categories do not move together. TVKD scores higher on Coding, STEM, and Humanities, whereas NARVAL leads in the other five categories. For this reason, we report category scores together with the average. On HH-RLHF, NARVAL's raw win rate is much higher than that of TVKD ($14.04$ versus $4.45$), yet the length-controlled rates are almost equal ($3.27$ versus $3.24$). Part of the raw gain may therefore reflect response length, which is why we report lengths for every method. The source does not state which configuration these two tables use, so we evaluate CRPD on \tbd[: configuration] and treat the reported rows as context.
+
+\tbd[: compare CRPD with the protocol-matched baselines; report lengths, intervals, and safety outcomes separately.]
+
+\begin{table*}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.1}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lccccccccc}
+\toprule
+\textbf{Method} & \textbf{Writing} & \textbf{Roleplay} & \textbf{Extraction} & \textbf{Math} & \textbf{Coding} & \textbf{Reasoning} & \textbf{STEM} & \textbf{Humanities} & \textbf{Avg.} \\
+\midrule
+SFT student\textsuperscript{R} & 4.30 & 5.65 & 1.50 & 1.20 & 2.25 & 1.70 & 5.25 & 4.75 & 3.33 \\
+DPO & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+WPO & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+Ra-DPO & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+DCKD\textsuperscript{R} & 7.13 & 6.85 & 2.40 & 2.40 & 2.30 & 3.20 & 5.93 & 5.70 & 4.49 \\
+ADPA\textsuperscript{R} & 6.65 & 6.00 & 3.30 & 2.10 & 2.25 & 3.05 & 5.95 & 5.47 & 4.35 \\
+TVKD\textsuperscript{R} & 6.70 & 6.48 & 2.65 & 2.15 & 3.50 & 3.15 & 6.58 & 7.65 & 4.86 \\
+NARVAL\textsuperscript{R} & 8.08 & 7.15 & 3.85 & 2.85 & 2.35 & 3.95 & 6.45 & 6.98 & 5.21 \\
+Teacher-delta baseline & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+TBPO-Q & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+TBPO-A & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+CRPD (raw, $\muhat=0$) & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+\rowcolor{gray!20}
+\textbf{CRPD} & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+CRPD (anchored) & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+\bottomrule
+\end{tabular}
+}
+\caption{MT-Bench category scores. Rows marked R are reported by \citet{van2026narval}, whose table does not state the teacher-student configuration. CRPD configuration and judge snapshot: \tbd.}
+\label{tab:mtbench}
+\end{table*}
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.1}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Method} & \textbf{LC win rate} & \textbf{Win rate} \\
+\midrule
+SFT student\textsuperscript{R} & 0.25 & 1.46 \\
+DPO & \tbd & \tbd \\
+WPO & \tbd & \tbd \\
+Ra-DPO & \tbd & \tbd \\
+DCKD\textsuperscript{R} & 0.85 & 4.39 \\
+ADPA\textsuperscript{R} & 0.99 & 4.52 \\
+TVKD\textsuperscript{R} & 3.24 & 4.45 \\
+NARVAL\textsuperscript{R} & 3.27 & 14.04 \\
+Teacher-delta baseline & \tbd & \tbd \\
+TBPO-Q & \tbd & \tbd \\
+TBPO-A & \tbd & \tbd \\
+CRPD (raw, $\muhat=0$) & \tbd & \tbd \\
+\rowcolor{gray!20}
+\textbf{CRPD} & \tbd & \tbd \\
+CRPD (anchored) & \tbd & \tbd \\
+\bottomrule
+\end{tabular}
+\caption{Pairwise win rates on HH-RLHF prompts, judged by GPT-5.4-mini against GPT-4o-mini. Rows marked R are reported by \citet{van2026narval} without confidence intervals. These are not official AlpacaEval scores.}
+\label{tab:hhrlhf}
+\end{table}
+
+\subsection{Ablation Studies}
+\label{sec:ablation}
+
+We now isolate the two design choices behind CRPD, the endpoint correction and the chunk granularity, while keeping every other component fixed. Each ablation is run under two resource regimes. With matched candidates, all variants see the same prefixes and sibling chunks, so any difference comes from the target. With matched total compute, we also charge correction collection and tuning, so the comparison reflects practical value. We regard a design choice as supported only when it helps under both regimes, with uncertainty taken into account.
+
+\paragraph{Endpoint correction.}
+Table~\ref{tab:abl_correction} compares three choices for the endpoint value. These are no correction (raw ratios), the teacher-side mean $\mu_{\Tp}$, and the reference-side mean $\mu_\rho$ used by CRPD. Our analysis predicts that $\mu_\rho$ helps most when teacher displacement is small but reference mismatch is large, and that $\mu_{\Tp}$ helps in the opposite regime. \tbd[: findings.]
+
+\begin{table*}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.1}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lccccccc}
+\toprule
+\textbf{Endpoint correction} & \textbf{HellaSwag} & \textbf{ARC} & \textbf{MMLU} & \textbf{TruthfulQA} & \textbf{Winogrande} & \textbf{GSM8K} & \textbf{Avg.} \\
+\midrule
+None (raw, $\muhat=0$) & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+Teacher-side mean $\mu_{\Tp}$ & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+\rowcolor{gray!20}
+\textbf{Reference-side mean $\mu_\rho$ (CRPD)} & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+\bottomrule
+\end{tabular}
+}
+\caption{Effect of the endpoint correction on \tbd[: configuration], under \tbd[: matched candidates or matched total compute].}
+\label{tab:abl_correction}
+\end{table*}
+
+\paragraph{Supervision granularity.}
+Table~\ref{tab:abl_granularity} varies the supervision unit from single tokens, through chunks of $8$, $32$, and $64$ tokens, to complete responses. All units are drawn from the same branching prefixes. Complete responses have zero endpoint residual, so this comparison tests localization separately from the correction. Shorter units give more comparisons per rollout but rely more heavily on the predictor, whereas complete responses need no predictor but cost longer generations. \tbd[: findings.]
+
+\begin{table*}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.1}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lccccccc}
+\toprule
+\textbf{Supervision unit} & \textbf{HellaSwag} & \textbf{ARC} & \textbf{MMLU} & \textbf{TruthfulQA} & \textbf{Winogrande} & \textbf{GSM8K} & \textbf{Avg.} \\
+\midrule
+Tokens ($L=1$) & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+Chunks ($L=8$) & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+\rowcolor{gray!20}
+\textbf{Chunks ($L=32$)} & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+Chunks ($L=64$) & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+Complete responses & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd & \tbd \\
+\bottomrule
+\end{tabular}
+}
+\caption{Effect of the supervision unit on \tbd[: configuration] under a common compute budget. Complete responses end at EOS or the horizon.}
+\label{tab:abl_granularity}
+\end{table*}
+
+\paragraph{Pair scale.}
+Finally, Table~\ref{tab:abl_scale} reports sensitivity to the pair scale $\alpha$, with the chunk length, candidates, and predictor held fixed. In the population limit, $\alpha$ does not change the recovered policy (Theorem~\ref{thm:recovery}). With finite data, however, it controls how sharp the soft labels are and how quickly they saturate. \tbd[: findings.]
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{6pt}
+\renewcommand{\arraystretch}{1.1}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Pair scale $\alpha$} & \textbf{Primary quality} & \textbf{Six-task avg.} & \textbf{MT-Bench} \\
+\midrule
+$0.1$ & \tbd & \tbd & \tbd \\
+$0.3$ & \tbd & \tbd & \tbd \\
+$1.0$ & \tbd & \tbd & \tbd \\
+\bottomrule
+\end{tabular}
+\caption{Sensitivity to the pair scale on \tbd[: configuration].}
+\label{tab:abl_scale}
+\end{table}
+
+\subsection{Analysis of the Residual Correction}
+\label{subsec:regime}
+
+\paragraph{Controlled study on enumerable trees.}
+Before turning to language models, we test the approximation where every quantity can be computed exactly. On enumerable autoregressive trees, we obtain $\phi$, both means, and $\popt$ in closed form, and we vary teacher displacement and reference mismatch independently. Table~\ref{tab:tree} reports the resulting target error, with identity shortcuts disabled so that each approximation is exposed in both identity corners. We also inject Gaussian noise into the predicted means to find how accurate the predictor must be for the correction to beat raw ratios (Figure~\ref{fig:noise}). These checks confirm the identities of Section~\ref{sec:theory} numerically, but they say nothing about language-model quality.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.1}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Regime $(a,b)$} & \textbf{Raw} & \textbf{Teacher mean} & \textbf{Reference mean} \\
+\midrule
+Small disp., large mism. $(0.08,1)$ & \tbd & \tbd & \tbd \\
+Large disp., small mism. $(1,0.08)$ & \tbd & \tbd & \tbd \\
+Both moderate $(0.5,0.5)$ & \tbd & \tbd & \tbd \\
+Zero displacement $(0,1)$ & \tbd & \tbd & \tbd \\
+Shared reference $(1,0)$ & \tbd & \tbd & \tbd \\
+\bottomrule
+\end{tabular}
+\caption{Mean $\KL(q\,\|\,\popt)$ on enumerable trees, where $a$ scales teacher displacement and $b$ scales reference mismatch. Identity shortcuts are disabled. Seeds: \tbd.}
+\label{tab:tree}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.9\linewidth}{\centering\vspace{2.5em}\tbd[: target KL against predictor noise level, for raw ratios and CRPD]\vspace{2.5em}}}
+\caption{Target error on enumerable trees as Gaussian noise is added to the predicted means. The crossing point marks the predictor accuracy at which the correction stops helping.}
+\label{fig:noise}
+\end{figure}
+
+\paragraph{Predictor accuracy on language models.}
+On language models, we measure the predictor at fixed audit endpoints, where we collect several independent continuations from $\rho$. We report the held-out prediction error and the noise of repeated labels. The key quantity, however, is the error in sibling differences $\muhat(sc)-\muhat(sd)$, because only these differences enter the training labels. We report each quantity separately for endpoints proposed by $\rho$ and by $\Tp$. On a feasible subset, we also estimate $\phi$ directly by log-sum-exp averaging, together with the effective sample size of its exponential weights. Estimates with unstable weights are marked as unresolved.
+
+\paragraph{Coverage and termination.}
+Because the student is trained on a frozen pool of reference prefixes, we also check what the training data covers. At each cached state, we measure the probability mass of the candidate set under $\rho$ and under the trained student, and we evaluate the student on its own free-running generations. In addition, the Jensen gap is zero at terminal endpoints and nonnegative elsewhere, so dropping it could shift probability toward termination. We therefore compare the EOS rate and response length of CRPD with those of raw ratios and complete-response supervision.
+
+\tbd[: summarize the diagnostics and state in which regimes the approximation holds.]
+
+\subsection{Computational Cost}
+\label{subsec:cost}
+
+For $P$ selected states, $K$ candidates of mean length $\bar L$, and $M$ correction trajectories of mean suffix length $\bar T$, the number of generated tokens before reuse is approximately
+\begin{equation}
+C_{\mathrm{gen}}\approx PK\bar L+M\bar T.
+\label{eq:cost}
+\end{equation}
+Correction rollouts are generated by $\rho$, which is cheaper than generating with the teacher. Nevertheless, both teachers still score every correction token, so token counts alone do not imply a speedup. Table~\ref{tab:cost} therefore reports generated and teacher-scored tokens, GPU-hours, wall time, and peak memory under a common accounting rule. The rule covers correction collection, predictor fitting, policy training, and tuning, while audit rollouts are reported separately. \tbd[: findings.]
+
+\begin{table*}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.1}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Method} & \textbf{Generated tokens} & \textbf{Teacher-scored tokens} & \textbf{GPU-hours} & \textbf{Wall time (h)} & \textbf{Peak memory (GB)} \\
+\midrule
+Raw sibling ratios & \tbd & \tbd & \tbd & \tbd & \tbd \\
+\rowcolor{gray!20}
+\textbf{CRPD} & \tbd & \tbd & \tbd & \tbd & \tbd \\
+Teacher-side mean & \tbd & \tbd & \tbd & \tbd & \tbd \\
+Token-level ($L=1$) & \tbd & \tbd & \tbd & \tbd & \tbd \\
+Complete responses & \tbd & \tbd & \tbd & \tbd & \tbd \\
+Teacher-delta baseline & \tbd & \tbd & \tbd & \tbd & \tbd \\
+ADPA & \tbd & \tbd & \tbd & \tbd & \tbd \\
+TVKD & \tbd & \tbd & \tbd & \tbd & \tbd \\
+\bottomrule
+\end{tabular}
+}
+\caption{End-to-end training cost on \tbd[: configuration and hardware]. Peak memory is reported \tbd[: per device or in aggregate].}
+\label{tab:cost}
+\end{table*}
+
+\section{Discussion and Limitations}
+\label{sec:discussion}
+CRPD provides a precise target and a tractable approximation, but several distinctions limit what can be concluded. First, teacher displacement is an observable preference proxy whose transfer can reproduce teacher errors and post-training artifacts. Second, the exact identities concern finite stopped distributions with common support; tokenizer mismatch and changes in termination require a different formulation. Third, the fourth-order bound is conditional on a full-suffix range and accurate mean prediction. Finite rollout diagnostics cannot generally certify either condition over the action space.
+
+Fourth, finite candidate graphs and a frozen reference prefix pool leave unobserved probability mass and trained-student prefix shift uncontrolled. Equation~\eqref{eq:fitting} exposes fitting error but does not bound it from cached empirical loss alone. Fifth, the mean correction can be worse than raw ratios, including near a shared reference when teacher displacement is substantial. Exact identity handling does not solve the entire neighborhood of an identity case. Finally, cheap reference generation does not remove teacher-scoring cost, and amortization is beneficial only if sufficient predictor accuracy and coverage are achieved within the total budget.
+
+The contribution should therefore be assessed through the usefulness of the target analysis and the evidence for correction and localization. Additional theorems, a renamed standard loss, or teacher-agreement gains alone do not establish improved preference alignment.
+
+\section{Conclusion}
+\label{sec:conclusion}
+We formulated teacher-relative preference transfer as sequence reweighting of a frozen student reference and derived its exact sibling-chunk decomposition. ChunkRatio-PD approximates the required endpoint continuation value with one frozen predictor of the reference-policy mean return, then trains an independently deployed student on soft sibling comparisons. The analysis characterizes target error through Jensen gaps, supplies a conditional fourth-order local KL upper bound, and separates this error from student fitting. These results establish a mathematical foundation and identify limitations of the approximation. Claims about language-model quality, computational savings, and preferred chunk granularity await the specified empirical evaluation.
+
+\section*{Declarations}
+% Author declarations must be completed from author knowledge, not inferred.
+\noindent\textbf{Funding:} \tbd[: author confirmation].\\
+\textbf{Competing interests:} \tbd[: author confirmation].\\
+\textbf{Data and code availability:} The implementation for ARC-BPO can be found in \url{https://github.com/Thang1703hrsh/ChunkRatio-PD}. \\
+\textbf{Author contributions:} \tbd[: author-approved contributions].\\
+\textbf{Ethics and human evaluation:} \tbd[: applicable approval or exemption, consent, compensation, and data-protection arrangements; specify if no human study is conducted].
+
+% \appendix
+% \section{Direct mean-estimation bound}
+% \label{app:concentration}
+% For $N_q$ audit endpoints fixed before estimation, suppose each suffix return has range width at most $\varepsilon$. With $n$ independent fresh $\rho$ continuations at each endpoint, Hoeffding's inequality and a union bound give, with probability at least $1-\delta$,
+% \begin{equation}
+% \max_u|\overline d_u-\mu(u)|\le\varepsilon\sqrt{\frac{\log(2N_q/\delta)}{2n}}.
+% \label{eq:concentration}
+% \end{equation}
+% This controls direct means at the declared endpoints. It does not establish uniform generalization of the learned head, nor can correlated prefix labels from one trajectory be counted as independent repeated returns at an endpoint.
+
+% \section{Reproducibility record}
+% The accompanying standard-library script \texttt{verify\_crpd.py} constructs depth-five trees with two continuing tokens and one EOS token. It checks five displacement/mismatch regimes, six seeds, and chunk lengths $1,2,3,5$ (120 configurations), including 41,280 inequality checks. The checked identities cover residual measure change, sequence recovery, both KL chain decompositions, objective regret, the Q-score relation, population-margin scaling, and the fitted-student identity. These independent finite checks are distinct from any numerical table in earlier proposals. They neither replace the proofs nor constitute language-model results; detailed errors and regime summaries are saved in \texttt{verification\_results.json}.
+
+% For each experiment, release configuration files, immutable checkpoint and tokenizer identifiers, prompt-group split hashes, stopping and masking conventions, candidate-source counts, correction seeds and trajectories, score precision, predictor-selection criteria, policy optimizer and regularization, random seeds, evaluation prompts and judges, and the resource-accounting script. Preserve per-prompt outputs and per-seed metrics subject to applicable data restrictions. Exact-tree checks should include a construction script and machine-readable outputs. Language-model result claims require their corresponding run artifacts; finite numerical identity checks are not substitutes.
+
+
+\bibliography{sn-bibliography}
+
+\end{document}

@@ -144,6 +144,39 @@ def test_hf_policy_selection_export_and_rm_evaluation(tmp_path: Path, monkeypatc
     assert summary['n_prompts'] == 2 and summary['split'] == 'test'
 
 
+def test_batched_selection_matches_one_prompt_at_a_time(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Left-padded batched greedy selection gives the per-prompt rewards and token counts of the original
+    one-prompt rule on prompts of different lengths, and the RM is read only when a selection runs."""
+    from chunkratio.evaluation import reward_selector
+    paths = checkpoints(tmp_path)
+    rm_config = transformers.LlamaConfig(vocab_size=16,hidden_size=16,intermediate_size=32,num_hidden_layers=1,
+                                         num_attention_heads=2,num_key_value_heads=2,num_labels=1,
+                                         max_position_embeddings=64,pad_token_id=0)
+    torch.manual_seed(2)
+    reward = transformers.LlamaForSequenceClassification(rm_config)
+    loads = []
+    def rm_model(name: str, **kwargs: object) -> object:
+        loads.append(name)
+        return copy.deepcopy(reward)
+    monkeypatch.setattr(transformers.AutoModelForSequenceClassification,'from_pretrained',rm_model)
+    monkeypatch.setattr(transformers.AutoTokenizer,'from_pretrained',lambda name,**kwargs: tokenizer())
+    cfg = real_config(tmp_path,paths)
+    prompts = [{'split':'select','prompt_ids':[1]+[2+(i+j)%12 for j in range(1+i%5)]+[1],
+                'messages':[{'role':'user','content':' '.join(f'w{2+(i+j)%12}' for j in range(1+i%5))}]} for i in range(7)]
+    student = transformers.LlamaForCausalLM.from_pretrained(paths['student_ref']).eval()
+    results = {}
+    for batch in (1,3,8):
+        select,cost = reward_selector({**cfg,'selection_generation_batch_size':batch},prompts,tokenizer())
+        assert not loads
+        score = select(student)
+        results[batch] = (score,select.last_scores,cost['generated_tokens'],cost['rm_scored_input_tokens'])
+        assert len(loads) == 1
+        select(student)
+        assert len(loads) == 1
+        loads.clear()
+    assert results[1] == results[3] == results[8]
+
+
 def test_preparation_sft_then_teacher_dpo(tmp_path: Path) -> None:
     """SFT then DPO launchers run; DPO records its frozen reference = the SFT checkpoint (§11.1)."""
     from chunkratio.preparation import prepare_checkpoint

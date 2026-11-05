@@ -181,7 +181,8 @@ def _corr_r2(predictions: list[float], labels: list[float]) -> dict[str,float | 
 
 
 def correction_audit(pairs: list[dict[str,Any]], corrections: list[dict[str,Any]], head: nn.Module | None,
-                     features: Any, seed: int, bootstrap: int = 200) -> dict[str,Any]:
+                     features: Any, seed: int, bootstrap: int = 200,
+                     parents: dict[str,str] | None = None) -> dict[str,Any]:
     """Sibling view of the endpoint correction mu_hat; a diagnostic only (head objective and selection unchanged).
 
     Pair targets use t_c - t_d, so what matters is mu_hat(sc) - mu_hat(sd), not the level of mu_hat. Pairs:
@@ -224,16 +225,23 @@ def correction_audit(pairs: list[dict[str,Any]], corrections: list[dict[str,Any]
             seed_row = row['seed']
             if seed_row.get('seed_source') == 'prefix' or not row['labels']:
                 continue
-            ids = seed_row['prefix_ids']
-            parents = [s for s in prefixes.get(seed_row['prompt_id'],[]) if len(s['prefix_ids']) < len(ids)
-                       and ids[:len(s['prefix_ids'])] == s['prefix_ids']]
-            if not parents:
-                continue
-            parent = max(parents,key=lambda s:len(s['prefix_ids']))
+            if parents is not None:
+                # Candidate records give each endpoint's state directly (an endpoint seed's id is its
+                # candidate's id), so endpoint-only correction (no prefix seeds) is audited too.
+                parent_id = parents.get(seed_row['id'])
+                if parent_id is None:
+                    continue
+            else:
+                ids = seed_row['prefix_ids']
+                found = [s for s in prefixes.get(seed_row['prompt_id'],[]) if len(s['prefix_ids']) < len(ids)
+                         and ids[:len(s['prefix_ids'])] == s['prefix_ids']]
+                if not found:
+                    continue
+                parent_id = max(found,key=lambda s:len(s['prefix_ids']))['id']
             first = features(row)[:1].float()
             device = next(head.parameters()).device
             mu = float(head(first.to(device),torch.tensor(row['budgets'][:1],device=device)))
-            siblings.setdefault(parent['id'],[]).append((seed_row['prompt_id'],_source(seed_row),mu,row['labels'][0]))
+            siblings.setdefault(parent_id,[]).append((seed_row['prompt_id'],_source(seed_row),mu,row['labels'][0]))
     centred = []
     for members in siblings.values():
         if len(members) < 2:

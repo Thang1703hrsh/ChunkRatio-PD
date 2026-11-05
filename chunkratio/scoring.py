@@ -106,7 +106,7 @@ def padded(sequences: list[list[int]], device: torch.device, pad: int) -> tuple[
 
 
 def score_batch(model: nn.Module, prefixes: list[list[int]], chunks: list[list[int]],
-                eos: int, frozen: bool = True) -> Tensor:
+                eos: int, frozen: bool = True, score_eos: bool = True) -> Tensor:
     """One authoritative chunk scorer for frozen roles and gradient-carrying student (§6.1).
 
     The LM head runs only on the positions that predict chunk tokens (tail_logprobs); the student's
@@ -115,7 +115,7 @@ def score_batch(model: nn.Module, prefixes: list[list[int]], chunks: list[list[i
     assert len(prefixes) == len(chunks) > 0 and all(prefixes)
     model.eval()
     with torch.no_grad() if frozen else contextlib.nullcontext():
-        values,_ = tail_logprobs(model,prefixes,chunks,eos)
+        values,_ = tail_logprobs(model,prefixes,chunks,eos,score_eos)
     return values.sum(-1)
 
 
@@ -125,7 +125,8 @@ def state_features(model: nn.Module, states: list[list[int]]) -> Tensor:
     model.eval()
     device = next(model.parameters()).device
     ids,attention = padded(states,device,0)
-    hidden = model(ids,attention_mask=attention,output_hidden_states=True,use_cache=False).hidden_states[-1]
+    hidden = model(ids,attention_mask=attention,output_hidden_states=True,use_cache=False,
+                   **logits_tail(model,1)).hidden_states[-1]
     idx = torch.tensor([len(s)-1 for s in states],device=device)
     return hidden[torch.arange(len(states),device=device),idx].detach().float()
 
@@ -136,7 +137,8 @@ def trajectory_features(model: nn.Module, prefix: list[int], tokens: list[int]) 
     assert prefix and tokens
     model.eval()
     ids = torch.tensor([prefix+tokens[:-1]],device=next(model.parameters()).device)
-    hidden = model(ids,attention_mask=torch.ones_like(ids),output_hidden_states=True,use_cache=False).hidden_states[-1]
+    hidden = model(ids,attention_mask=torch.ones_like(ids),output_hidden_states=True,use_cache=False,
+                   **logits_tail(model,1)).hidden_states[-1]
     return hidden[0,len(prefix)-1:].detach().float()
 
 
@@ -165,13 +167,14 @@ def length_groups(lengths: list[int], tokens_per_batch: int) -> list[list[int]]:
 
 
 def tail_logprobs(model: nn.Module, prefixes: list[list[int]], suffixes: list[list[int]],
-                  eos: int) -> tuple[Tensor,Tensor]:
+                  eos: int, score_eos: bool = True) -> tuple[Tensor,Tensor]:
     """FP32 log-probs of each suffix token after its prefix, [rows, longest suffix], and the scored mask (§6.1).
 
     Rows are left-padded with position ids, so every suffix ends at the last column and the LM head
     runs only on the last longest-suffix + 1 positions; the backbone still reads each full context.
     As in score_tokens, prompt and padding are never scored, the first EOS is scored once and later
-    tokens are not. Gradients flow unless the caller disables them.
+    tokens are not. With score_eos=False (opt-in `score_end_token: false`, DECISIONS) the end-of-turn
+    token is not scored either, so ending a response is neutral for every role. Gradients flow unless the caller disables them.
     """
     device = next(model.parameters()).device
     ids,attention,positions = left_padded([p+s for p,s in zip(prefixes,suffixes)],device,eos)
@@ -188,13 +191,55 @@ def tail_logprobs(model: nn.Module, prefixes: list[list[int]], suffixes: list[li
     for r,suffix in enumerate(suffixes):
         targets[r,:len(suffix)] = torch.tensor(suffix,device=device,dtype=torch.long)
     eos_hits = (targets == eos) & valid
-    mask = valid & (eos_hits.cumsum(-1)-eos_hits.long() == 0)
+    mask = valid & (eos_hits.cumsum(-1)-(eos_hits.long() if score_eos else 0) == 0)
     raw = logits.gather(1,index[:,:,None].expand(-1,-1,logits.shape[-1]))
     raw = raw if raw.dtype == torch.float64 else raw.float()
     assert torch.isfinite(raw).all(), 'nonfinite prediction logits'
     logps = raw.log_softmax(-1).gather(-1,targets[:,:,None]).squeeze(-1).masked_fill(~mask,0)
     assert torch.isfinite(logps).all()
     return logps,mask
+
+
+def sibling_logprobs(model: nn.Module, prefixes: list[list[int]], chunk_lists: list[list[list[int]]],
+                     eos: int, score_eos: bool = True) -> list[Tensor]:
+    """Summed FP32 log-probs of several chunks after one shared prefix each (§6.1), prefix computed once.
+
+    The prefixes run once (left-padded, positions from the mask) with their cache; the cache rows are
+    repeated for each prefix's chunks, which then run on it right-padded, as generation continues a
+    prefix. Scores equal score_batch(prefix, chunk) up to floating-point rounding, with the same masks:
+    prefix and padding never scored, the first EOS scored once, later tokens not. Gradients flow unless
+    the caller disables them. Returns, per prefix, a tensor of its chunks' sums in order.
+    """
+    from .sampling import select_rows
+    assert len(prefixes) == len(chunk_lists) > 0 and all(prefixes)
+    chunks = [chunk for group in chunk_lists for chunk in group]
+    assert chunks and all(chunks)
+    model.eval()
+    device = next(model.parameters()).device
+    ids,attention,positions = left_padded(prefixes,device,eos)
+    out = model(ids,attention_mask=attention,position_ids=positions,use_cache=True,**logits_tail(model,1))
+    owner = torch.tensor([i for i,group in enumerate(chunk_lists) for _ in group],device=device)
+    past = select_rows(out.past_key_values,owner)
+    span = max(map(len,chunks))
+    targets = torch.full((len(chunks),span),eos,dtype=torch.long,device=device)
+    chunk_mask = torch.zeros_like(targets)
+    for r,chunk in enumerate(chunks):
+        targets[r,:len(chunk)] = torch.tensor(chunk,device=device,dtype=torch.long)
+        chunk_mask[r,:len(chunk)] = 1
+    steps = torch.arange(span,device=device)[None,:]
+    cont = model(targets,attention_mask=torch.cat([attention[owner],chunk_mask],dim=1),
+                 position_ids=positions[owner][:,-1:]+1+steps,past_key_values=past,use_cache=True)
+    # The prefix's last position predicts chunk token 0; chunk position t-1 predicts token t.
+    logits = torch.cat([out.logits[:,-1:][owner],cont.logits[:,:span-1]],dim=1)
+    raw = logits if logits.dtype == torch.float64 else logits.float()
+    assert torch.isfinite(raw).all(), 'nonfinite prediction logits'
+    lengths = chunk_mask.sum(-1)
+    valid = steps < lengths[:,None]
+    eos_hits = (targets == eos) & valid
+    mask = valid & (eos_hits.cumsum(-1)-(eos_hits.long() if score_eos else 0) == 0)
+    sums = raw.log_softmax(-1).gather(-1,targets[:,:,None]).squeeze(-1).masked_fill(~mask,0).sum(-1)
+    assert torch.isfinite(sums).all()
+    return list(sums.split([len(group) for group in chunk_lists]))
 
 
 @torch.no_grad()

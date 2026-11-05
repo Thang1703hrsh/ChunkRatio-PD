@@ -494,3 +494,94 @@ No GPU time has been measured. The 1.7B DPO over about 60k pairs (microbatch 1) 
 the longest stage, and every duration and cost is unknown until a run reports it. Possible early
 failures, all in the cheap CPU `prepare` stage: a Hub download that needs a token, or a Deita
 field layout different from ShareGPT `conversations`.
+
+## Fast HDA x10 v1 — 4 November 2026
+
+The user explicitly requested a custom optimized implementation and a real x10 run.
+The new launcher is `script/modal/crpd_fast_x10.py`; the cross-platform experiment
+runner is `python -m chunkratio.fast_run`. Existing jobs/outputs are not overwritten.
+
+- Pair: the same pinned HDA Qwen3-1.7B T0/T+ and Qwen3-0.6B rho as x10 v2.
+- Data: snapshot of the existing 640 train / 160 head-val / 64 select prompts.
+- Explicit compact deviation: K=2 (one rho, one teacher), 2 states/prompt,
+  endpoint-only correction, R=1, boundary-only head fitting. H=512 and L=32 retained.
+- Policy: 100 steps, effective batch 64, microbatch 6, alpha .03, peak lr 1e-6,
+  cosine with 10% warmup; RM selection at 0/50/100, no fallback that hides a failed run.
+- Execution: opt-in cross-state candidate scoring (8192 padded-token budget), bounded
+  3 GiB CPU feature cache, tail-only logits for feature extraction, one pipeline call
+  per variant, shared collection cache for main/raw, no redundant student.pt export.
+- Completion is committed only after export and diagnostics, and binds config/source
+  and the exported files' SHA256 hashes. This avoids using early manifests as completion.
+- Planned post-selection evaluation: Winogrande 5-shot and TruthfulQA-MC2 0-shot,
+  plus fixed, disjoint student-held-out RM prompts (up to 64). Teacher exposure to the
+  RM test prompts is unverified. These test outcomes do not select checkpoints.
+
+Validation actually executed: final local suite **124 passed, 1 skipped** (Modal is not
+installed in the active Python 3.15 test interpreter); independent reference checks
+passed; ordinary smoke passed all 7 variants/export/reload; optimized synthetic smoke
+completed all stages (15 states, 9 pairs, 18 correction trajectories).
+
+Real A100-SXM4-80GB preflight passed: initial bf16-autocast student/rho displacement
+exactly 0; maximum FP32 score difference between per-state and cross-state scoring
+0.00037384033203125. Six-row scoring times were 1.4609 s individual and 0.8508 s batched;
+these are a small preflight measurement, not a warmed end-to-end speedup benchmark.
+
+Launched at 00:11 Vietnam time on 4 November. App/volume: `crpd-fast-hda-x10`, account
+`quangltt280305`; call `fc-01M6H69TC6RQE3YVMFRVWEN7MZ`. Source digest
+`e78dfc27a2e939b9009d319621040a6565c506d3f73f9a93c93e621911723c6a`.
+Output: `output/fast_hda_x10/e78dfc27a2e939b9` on that volume; local launch record and
+preflight/config snapshots are in output/. At this report update training is running:
+**final training quality, total time, GPU utilization and benchmark results are Not done**.
+Any later comparison must distinguish K/step-budget reductions from execution speedups.
+
+### Account change and restart — 4 November 2026
+
+At the user's request, the first fast-x10 call on `quangltt280305` was cancelled;
+its app was verified stopped with zero running containers at 00:24 Vietnam time.
+The user then explicitly requested the same job on `trinhson3392`. That account
+had no CRPD volumes, so only the frozen input/config snapshots were transferred
+and verified by SHA256. No partial collection cache or model weights were copied.
+Both resolved fast configs and the package source digest match the first attempt.
+
+Restart submitted at **00:30 Vietnam time**, call `fc-01M6H7BYV4Z5XHB25WKNRYV194`,
+app/volume `crpd-fast-hda-x10` on **trinhson3392**. The old account remains stopped.
+Local records: `output/fast-x10-launch-trinhson3392-20261104.json`,
+`output/fast-x10-input-migration-trinhson3392-20261104.json`, and
+`output/fast-x10-active.json` (current account/call pointer). The restarted run
+must produce its own GPU preflight and final results; the previous account's
+preflight measurements are not measurements of this restart.
+
+### Budgeted unattended smoke suite — 4 November 2026
+
+The user requested compact experiments during roughly eight hours away, with USD30
+total available. The potentially replayed fast-x10 orchestration was stopped at
+00:39. Its container-exec cache commit attempt failed at CLI argument parsing;
+only already durable shards can be assumed available.
+
+Another app, `crpd-qwen3-pilot-hda-smoke`, is running on trinhson3392. The asynchronous
+budget/ownership question is unanswered, so it is left untouched. Our own plan
+reserves at most USD14.55 of GPU work plus USD0.45 of CPU orchestration; the remainder
+is kept aside. This is not a provider-side invoice cap and does not control the
+other app's spend. Native/browser access was unavailable; no dashboard budget was set.
+
+`script/overnight_plan.py` and `script/modal/crpd_overnight.py` provide four small
+recipes, conditional medium promotion, fixed final test reporting, hard CPU/RAM
+limits, absolute GPU subprocess deadlines and pre-launch conservative reservations
+without refunds. The CPU controller is non-preemptible; GPU functions can still be
+preempted but receive the same fixed deadline. This suite runs GPU jobs serially.
+No test result selects a model, and smoke tests do not establish method superiority.
+
+Validation: four dedicated budget/promotion tests passed; the full suite passed
+**129 tests, 1 skipped** after reviewing the separately edited correction-batch
+setting. Remote CPU-only dry run passed. Package source digest:
+`c784e569e184ca1f5028693038c0d257a1204b926dd9e5a77817f52bcfe6fd18`.
+
+Submitted at 00:58 Vietnam time: `fc-01M6H8ZSYDEYMSD0VSTC1FHXGT`, app
+`crpd-overnight-budget` on trinhson3392. It waits up to one hour for the other smoke
+app, then runs or stops without starting GPUs. The scheduling window is bounded
+to seven hours. At this update it is waiting, with zero GPU reservations: overnight
+training results are **Not done**. Plan/status are on volume `crpd-fast-hda-x10` at
+`output/fast_hda_x10/c784e569e184ca1f/overnight_smoke_v1/{plan,budget}.json`;
+completion writes `summary.json`. Launch record:
+`output/overnight-launch-trinhson3392-20261104.json`. The active-call pointer now
+refers to this controller, not the cancelled fast-x10 call.

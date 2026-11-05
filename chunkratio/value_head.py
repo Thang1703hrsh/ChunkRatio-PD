@@ -51,16 +51,26 @@ def row_features(row: dict[str,Any], features: FeatureLoader | None) -> Tensor:
 
 
 def trajectory_loss(head: MeanHead, rows: list[dict[str,Any]], horizon: int,
-                    features: FeatureLoader | None = None) -> Tensor:
-    """Trajectory-uniform SSE/H including all nonterminal visited states (§7.4)."""
+                    features: FeatureLoader | None = None, boundary: int | None = None) -> Tensor:
+    """Trajectory-uniform SSE/H including all nonterminal visited states (§7.4).
+
+    With `boundary` = L (head_positions='boundary', compact), only states on the chunk grid count:
+    rollout position t of a seed at response length n is kept when (n + t) % L == 0. The head is only
+    queried at candidate endpoints, which always lie on that grid.
+    """
     device = next(head.parameters()).device
     predictions, labels = [],[]
     for row in rows:
         values = row_features(row,features).to(device=device,dtype=torch.float32)
         budgets = torch.tensor(row['budgets'],device=device)
+        target = torch.tensor(row['labels'],dtype=torch.float32,device=device)
         assert values.shape == (len(row['labels']),head.net[0].in_features-1)
+        if boundary is not None:
+            keep = [t for t in range(len(row['labels'])) if (row['seed']['n']+t) % boundary == 0]
+            index = torch.tensor(keep,dtype=torch.long,device=device)
+            values,budgets,target = values[index],budgets[index],target[index]
         predictions.append(head(values,budgets))
-        labels.append(torch.tensor(row['labels'],dtype=torch.float32,device=device))
+        labels.append(target)
     return head_objective(predictions,labels,horizon)
 
 
@@ -74,9 +84,11 @@ def fit_head(rows: list[dict[str,Any]], cfg: dict[str,Any], path: Path,
     # Trajectories per optimizer step; default is the full train set (one step per epoch).
     batch_size = min(cfg.get('head_batch_size',len(train)),len(train))
     hidden_size = row_features(train[0],features).shape[1]
-    identity = digest({'rows':rows,'horizon':cfg['horizon'],'lr':cfg['head_learning_rate'],
-                       'seed':collection_seed(cfg),'architecture':'Linear(d+1,256)-GELU-Linear(256,1)',
-                       'batch_size':batch_size})
+    boundary = cfg['chunk_length'] if cfg.get('head_positions','all') == 'boundary' else None
+    settings = {'rows':rows,'horizon':cfg['horizon'],'lr':cfg['head_learning_rate'],
+                'seed':collection_seed(cfg),'architecture':'Linear(d+1,256)-GELU-Linear(256,1)',
+                'batch_size':batch_size}
+    identity = digest({**settings,'boundary':boundary} if boundary else settings)
     torch.manual_seed(collection_seed(cfg)+503)
     head = MeanHead(hidden_size).to(cfg['device'])
     optimizer = torch.optim.AdamW(head.parameters(),lr=cfg['head_learning_rate'],weight_decay=0)
@@ -103,7 +115,7 @@ def fit_head(rows: list[dict[str,Any]], cfg: dict[str,Any], path: Path,
             optimizer.zero_grad(set_to_none=True)
             # Accumulate one trajectory at a time; normalize by step trajectories * H.
             for row in batch:
-                loss = trajectory_loss(head,[row],cfg['horizon'],features)/len(batch)
+                loss = trajectory_loss(head,[row],cfg['horizon'],features,boundary)/len(batch)
                 assert torch.isfinite(loss)
                 loss.backward()
                 total += loss.item()*len(batch)/len(train)
@@ -111,7 +123,7 @@ def fit_head(rows: list[dict[str,Any]], cfg: dict[str,Any], path: Path,
             scheduler.step()
         head.eval()
         with torch.no_grad():
-            val = trajectory_loss(head,validation,cfg['horizon'],features).item()
+            val = trajectory_loss(head,validation,cfg['horizon'],features,boundary).item()
         if val < best:
             best = val
             best_state = {k:v.detach().cpu().clone() for k,v in head.state_dict().items()}
@@ -124,6 +136,7 @@ def fit_head(rows: list[dict[str,Any]], cfg: dict[str,Any], path: Path,
     freeze(head)
     metadata = {'identity':identity,'hash':fingerprint(head),'head_val':best,'history':history,
                 'feature_layer':'final','feature_dtype':'float32','budget_encoding':'(H-n)/H',
-                'hidden_size':hidden_size,'batch_trajectories':batch_size,'train_prompt_reuse':True}
+                'hidden_size':hidden_size,'batch_trajectories':batch_size,'train_prompt_reuse':True,
+                'positions':f'chunk boundaries (L={boundary})' if boundary else 'all visited states'}
     save_tensor(path,{'metadata':metadata,'state_dict':head.state_dict()})
     return head,metadata

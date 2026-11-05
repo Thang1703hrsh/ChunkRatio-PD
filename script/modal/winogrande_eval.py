@@ -29,6 +29,12 @@ RHO = f'{CHECKPOINTS}/checkpoints/student_ref'
 STUDENT = CHECKPOINTS+'/{}/seed0/student'
 TEACHERS = {'teacher_base':'ayushshah/Qwen3-1.7B-UltraChat-SFT,revision=698d09a459656c6909e2b79c6827b66c7a10d70b',
             'teacher_plus':'ayushshah/Qwen3-1.7B-Chat,revision=2e46c30d9fba4ed1aaa8f21003e0de58fa7cf944'}
+# hda trio: rho, T0 and T+ are pinned published checkpoints; only the students live on the volume.
+HDA_STUDENT = '/source/output/narval/qwen3_1p7b_to_0p6b_hda/pilot/{}/seed0/student'
+HDA_SNAPSHOT = '/source/output/narval/qwen3_1p7b_to_0p6b_hda/pilot/{}-snapshots/seed0/snapshots/step{}'
+HDA_MODELS = {'rho':'hoangducanh1865/qwen3-0.6b-deita-sft-student,revision=fc0f225cb63e5db6e84a7e5705c997891ec85d65',
+              'teacher_base':'hoangducanh1865/qwen3-1.7b-deita-sft-student,revision=52f7c14ea4893128252ada7a365c957813820070',
+              'teacher_plus':'hoangducanh1865/qwen3-1.7b-ultrafeedback-dpo-teacher,revision=97a6de251a5e3f78494c6892fb4fbdf9b53c9f04'}
 TASK = os.environ.get('CRPD_EVAL_TASK','winogrande')
 FEWSHOT = {'winogrande':5,'truthfulqa_mc2':0}
 if TASK not in FEWSHOT:
@@ -40,10 +46,36 @@ SETS = {
     'stability':{'volume':'crpd-qwen3-pilot-hub-stability','output':'winogrande','stored':('rho','crpd_main'),
                  'models':{'alpha0p1':STUDENT.format('crpd_main-alpha0p1'),'alpha1p0':STUDENT.format('crpd_main-alpha1p0')},
                  'pairs':(('alpha0p1','rho'),('alpha1p0','rho'),('alpha0p1','crpd_main'),('alpha1p0','crpd_main'))},
+    'hda-x10':{'volume':'crpd-qwen3-pilot-hda-x10','output':'winogrande-hda-x10','stored':(),
+               'models':{**HDA_MODELS,'main_alpha0p03':HDA_STUDENT.format('crpd_main-alpha0p03-v2'),
+                         'raw_alpha0p03':HDA_STUDENT.format('crpd_raw-alpha0p03-v2')},
+               'pairs':(('main_alpha0p03','rho'),('raw_alpha0p03','rho'),('main_alpha0p03','raw_alpha0p03'),
+                        ('teacher_plus','teacher_base'))},
+    # Students saved every 50 steps by script/modal/policy_snapshots.py, each compared with rho.
+    'hda-x10-steps':{'volume':'crpd-qwen3-pilot-hda-x10','output':'winogrande-hda-x10-steps','stored':(),
+                     # main's snapshot run stopped after step 200; its step 300 is the x10 v2 export (best = step 300),
+                     # and raw's exported student is evaluated beside its step-300 snapshot as a reproduction check.
+                     'models':{'rho':HDA_MODELS['rho'],
+                               **{f'raw_step{step}':HDA_SNAPSHOT.format('crpd_raw-alpha0p03-v2',step) for step in range(50,301,50)},
+                               **{f'main_step{step}':HDA_SNAPSHOT.format('crpd_main-alpha0p03-v2',step) for step in range(50,201,50)},
+                               'main_step300':HDA_STUDENT.format('crpd_main-alpha0p03-v2'),
+                               'raw_export300':HDA_STUDENT.format('crpd_raw-alpha0p03-v2')},
+                     'pairs':(*((f'raw_step{step}','rho') for step in range(50,301,50)),
+                              *((f'main_step{step}','rho') for step in (50,100,150,200,300)),
+                              ('raw_step300','raw_export300'))},
+    # Turbo crpd_raw x10 (150 steps x 128 pairs) on the trinhson3392 volume, against rho.
+    'hda-x10-turbo':{'volume':'crpd-qwen3-pilot-hda-x10','output':'winogrande-hda-x10-turbo','stored':(),
+                     'models':{'rho':HDA_MODELS['rho'],'raw_turbo':HDA_STUDENT.format('crpd_raw-alpha0p03-turbo')},
+                     'pairs':(('raw_turbo','rho'),)},
+    # Latest hda smoke (10 steps, 8 train prompts): a plumbing check of the eval path, not a result.
+    'hda-smoke':{'volume':'crpd-qwen3-pilot-hda-smoke','output':'winogrande-hda-smoke','stored':(),
+                 'models':{'rho':HDA_MODELS['rho'],'main_alpha0p03':HDA_STUDENT.format('crpd_main-alpha0p03-v2'),
+                           'raw_alpha0p03':HDA_STUDENT.format('crpd_raw-alpha0p03-v2')},
+                 'pairs':(('main_alpha0p03','rho'),('raw_alpha0p03','rho'),('main_alpha0p03','raw_alpha0p03'))},
 }
 SET_NAME = os.environ.get('CRPD_EVAL_SET','x10')
 if SET_NAME not in SETS:
-    raise SystemExit('CRPD_EVAL_SET must be x10 or stability')
+    raise SystemExit(f'CRPD_EVAL_SET must be one of {", ".join(SETS)}')
 SELECTED = SETS[SET_NAME]
 if TASK != 'winogrande':
     SELECTED = {**SELECTED,'output':f'{TASK}-{SET_NAME}','stored':()}

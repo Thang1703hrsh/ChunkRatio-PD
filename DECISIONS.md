@@ -373,3 +373,128 @@ distillation stage (`scripts/run_narval.py`); it has no SFT or teacher-DPO code 
 76. **Fallback metadata (amends item 69).** `selection_score` is always the score of the exported model and
     `best_checkpoint_score` that of the best trained checkpoint; with the fallback enabled the rule is named
     `select_mean_reward_with_reference_fallback`, and an exported rho reports rho's select score.
+
+## Session of 3 November 2026: speed and the compact configuration (user requests)
+
+77. **Speed-only changes (no change to any result).** RM selection generates the select prompts in
+    left-padded batches (`selection_generation_batch_size`, 16 for hda runs; 1 is the original rule) and the RM
+    is read on the first selection call, so an evaluate stage after a finished policy never loads it. The
+    candidate and correction stages write `timing_<stage>.json` (CUDA-synchronized seconds per phase). hda x10
+    uses `generation_batch_size` 48 and `policy_microbatch_size` 6. A smoke rerun with this code reproduced every
+    `diagnostics.json` field of the earlier smoke except wall time.
+78. **Compact configuration (user request; conflicts with the K=4 hard constraint in CLAUDE.md, explicit user
+    instructions take precedence).** Opt-in keys, defaults unchanged: `candidates: 2` draws one rho and one T+
+    sibling (draw i of a source keeps its stream, so the K=2 siblings are the first draws of K=4);
+    `correction_seeds: endpoints` drops the prefix seeds (the head is queried only at candidate endpoints);
+    `head_positions: boundary` fits the head only on rollout states on the chunk grid, (n + t) % L == 0, where
+    every nonterminal endpoint lies. The launcher's `CRPD_COMPACT=1` sets these with `endpoint_fraction: 1`
+    (every nonterminal endpoint is rolled out once), 2 states per prompt and selection every 50 steps (one pair
+    per state makes the pool about six times smaller), and tags outputs and cache `-compact`. Compact results
+    are a deviation from the protocol and are reported as such.
+
+79. **Isolated fast x10 v1 (explicit user request, 4 November 2026).** Keep the pinned HDA
+    1.7B teacher pair and 0.6B rho, H=512/L=32, raw categorical sampling, FP32 frozen
+    scoring and matched student/rho autocast. Reuse the compact K=2/endpoint-only R=1/
+    boundary-head protocol as an explicitly labelled deviation, with 100 policy steps,
+    effective batch 64, alpha .03, lr 1e-6 and select-split RM at steps 0/50/100.
+    Cross-state candidate scoring is opt-in (`batch_candidate_scoring`), bounded by
+    `score_tokens_per_batch`; generation streams/deduplication are unchanged, while
+    real accelerator batch-shape rounding is checked rather than claimed bit-identical.
+    A bounded CPU feature cache avoids repeated attachment verification/reads during
+    head epochs. Feature-only forwards request one logit position, not the entire prefix.
+    Pretrained student export remains mandatory; `save_student_state_dict=false` skips
+    the redundant second weights export only in this run. `chunkratio.fast_run` snapshots
+    x10 prompts and writes a completion marker bound to config, source and exported-file
+    SHA256 hashes only after all training diagnostics succeed. It never treats an early
+    manifest as evidence of completion. Main/raw share compatible collection artifacts.
+    `script/modal/crpd_fast_x10.py` uses its own app/volume, reads the existing x10 volume
+    read-only, performs real-GPU score/initial-margin checks before training, and never
+    publishes/pushes. Validation selects checkpoints; fixed Winogrande/TruthfulQA and
+    a preselected student-held-out RM sample are evaluated afterward. Teacher exposure
+    to those RM test prompts is not verified. This is x10, not full-scale training.
+
+80. **Budgeted unattended smoke suite (4 November 2026, explicit user request).**
+    Replace the potentially retried x10 orchestration with `script/modal/crpd_overnight.py`.
+    With another smoke app running and no clarification received, leave it untouched,
+    wait for it to finish (at most one hour), and reserve USD14.55 of GPU work plus
+    USD0.45 for bounded CPU orchestration. This is resource/deadline-based protection,
+    not a provider-side workspace billing cap. Each GPU job reserves its full timeout
+    plus 180 seconds at USD4.50/A100-hour or USD3.00/L40S-hour before submission, with
+    no refunds or logical retries. CPU/RAM have hard limits. GPU preemption may still
+    happen; subprocesses retain an absolute deadline and overdue calls are cancelled
+    by a non-preemptible CPU controller. Four recipes use 64/16/16 prompt groups and
+    30 policy steps: compact main, raw, main with all-position head loss, and main
+    with alpha .01/lr 5e-7. A positive select-RM gain may promote one to 256/64/32
+    groups and 60 steps; this is exploratory. Only a positive medium validation gain
+    triggers fixed test reporting (32 RM prompts, Winogrande and TruthfulQA).
+    Reviewed package c784e569e184ca1f includes the separately edited correction batch
+    knob; its default is unchanged. This is neither full-data training nor evidence
+    that CRPD is superior. Every outcome, including timeouts, remains in the ledger.
+81. **Sampler in the collection keys (bug fix).** `gpu_sampling` changes which tokens are drawn but was not in
+    the collection cache keys, so switching it on a shared cache would have reused the other sampler's
+    rollouts. `pipeline` now adds `sampler: gpu-inverse-cdf-fp64` to the common dependencies when it is set
+    (default runs keep their keys; grouping/batch sizes never enter keys). The turbo x10 run used its own
+    `cache-turbo` and is unaffected. Regression test `test_sampler_choice_is_part_of_every_collection_key`
+    (fails without the fix).
+82. **Launcher stage list.** crpd_raw and crpd_suffix no longer run collect-correction and fit-head, which only
+    reloaded the three models (about 7–9 minutes in the turbo x10). `CRPD_ONE_PROCESS=1`, implied by
+    `CRPD_TURBO=1`, runs validate-config then one `evaluate` call, loading the models once; per-phase
+    collection seconds remain in `timing_*.json`.
+83. **Shared-prefix scoring (opt-in `shared_prefix_scoring`).** `scoring.sibling_logprobs` runs each prefix once
+    with its cache, repeats the cache rows for the prefix's chunks and scores them on it, with score_batch's
+    masks. Used for candidate scoring (`fast.score_candidate_siblings`, at most `score_max_states`=48 states
+    per forward because sibling FP32 logits otherwise grow with short prefixes) and for the policy pair
+    scores of student and rho (c and d on one prefix pass; rho always recomputed the same way, so the margin
+    is exactly zero at initialization). Tests: scores and gradients equal score_batch on TinyLM and a KV-cache
+    Llama; end-to-end crpd_raw run equal to the default in FP32 and bf16. A100 measurements: T+ scoring of
+    1,600 siblings 24.0 s vs 58.4 s (max difference 7.6e-4 nats, 33 GB); 128-pair policy step 2.89 s vs
+    4.05 s at token budget 8192 (50 GB). `CRPD_TURBO=1` turns it on. Not adopted: a faster selected-token
+    log-prob (about 1% of scoring FLOPs) and batched RM scoring (10-20 s per selection, padding risk).
+84. **End-of-turn token unscored (opt-in `score_end_token: false`; user request; deviates from the hard
+    constraint "include sampled EOS exactly once", explicit user instructions take precedence).** Diagnosis
+    of the turbo crpd_raw x10 student: 0% EOS and 1,024-token responses on the 64 held-out prompts (rho
+    98.4%, 247 tokens), 4-gram repetition 34% vs 15%, held-out RM -0.64 [-1.43, 0.11] vs rho. Cause: the hda
+    T+ ends 26 of 32 greedy responses with <|endoftext|> (T0 and rho end all with <|im_end|>) and writes
+    422 vs 214 tokens; at rho's own response ends T+ gives <|im_end|> log p -20.5 vs T0 -0.75, so pairs with
+    one ending side (12.9% of the training weight) preferred the ending side only 8.2% of the time. The
+    content signal is sound: on 256 independent UltraFeedback pairs delta_T ranks chosen above rejected 69.5%
+    (T+ alone 56.6%, longer-wins 53.1%, correlation with length difference 0.07). With the option off, the
+    first EOS and everything after it are unscored for every role (targets, student and rho margins), so
+    ending is neutral and the student keeps rho's ending behaviour; the setting enters the candidate cache
+    key. Launcher: `CRPD_NO_END_TOKEN=1`. The hda trio therefore violates the identical end-of-turn
+    assumption; this is a workaround, not a verification of T+'s DPO reference.
+
+## Session of 5 November 2026: consistency fixes and the gamma variant (user requests)
+
+85. **Unscored end token: consistency fixes (bug fixes, results of finished runs unchanged).** (a)
+    `script/modal/pd_diagnostics.py` section A scored the student and rho margins with the end token while the
+    targets of a `score_end_token: false` run omit it; it now takes the rule from `resolved_config.json` and
+    records it (`pair_margin_end_token_scored`). Sections B and C are unchanged. The `pairs` section of the
+    earlier noend diagnostics is therefore not comparable with its targets; its held-out RM, EOS rate, length
+    and repetition are unaffected. (b) `candidate_coverage` compared a student mass scored with the end token
+    with rho's cached mass scored without it; both are now actual chunk probabilities (end token scored
+    once), rho being rescored when the run leaves the end token unscored (`end_token_scored: true`). (c)
+    Correction returns, the head and the exponential audit always score the end token, so
+    `score_end_token: false` is now rejected for every variant except crpd_raw and crpd_suffix instead of
+    silently mixing the two rules. (d) `verify_hda_teachers` reuses earlier evidence only when its recorded
+    `sources` equal the current `HDA_CHECKPOINTS`, so a replaced teacher pair is checked again. Tests:
+    `test_unsupported_gamma_and_end_token_combinations_fail_closed`,
+    `test_candidate_coverage_scores_end_token_for_student_and_rho`.
+86. **crpd_raw with a scaled teacher gap (opt-in `teacher_gap_scale` = gamma; user request; a new variant
+    setting, not the protocol).** Diagnosis of the hda x10 raw students: the student is asked to reproduce the
+    full teacher log-ratio gap (tens of nats per chunk) and drifts far from rho (no end of turn, 4-gram
+    repetition 35%). With gamma in (0, 1], raw targets are t_gamma(c) = gamma * delta_T(c), so
+    p = sigmoid(alpha * gamma * (delta_T(c) - delta_T(d))) while the student margin m = alpha * (a_c - a_d) is
+    unchanged. Lowering gamma differs from lowering alpha: it changes the gap the student must match, not only
+    the label temperature. The cached teacher log-probs are kept, so collections are shared; gamma enters the
+    target key only when it is not 1 (gamma = 1 keeps every key and is the original target bit for bit), and
+    the policy key carries the whole config. Only crpd_raw accepts gamma < 1: main would need
+    gamma * (delta_T + mu_hat), and the shortcut rho = T0 => zero correction holds for the current target, not
+    for a scaled one in general. Launcher: `CRPD_GAMMAS=1,0.3,0.1` with `CRPD_ALPHAS` and
+    `CRPD_VARIANTS=crpd_raw`; runs are named `crpd_raw-alpha0p03-gamma0p3`, gamma = 1 keeps its old name and
+    runs first so the others reuse its collection. Selection stays on the select split; held-out prompts only
+    confirm. Wording correction: CRPD as implemented is offline distillation on data generated once by the
+    frozen reference rho and the teacher T+, not on-policy in the updated student. UltraFeedback preference
+    labels come mainly from GPT-4 ratings, so they are called available preference labels, not human labels.
+    Tests: `test_teacher_gap_scale_scales_raw_targets_only`, `test_gamma_sweep_shares_collection_and_keys_targets`,
+    `test_gamma_sweep_names_and_guards`.

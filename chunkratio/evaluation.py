@@ -116,50 +116,82 @@ def reward_selector(cfg: dict[str,Any], prompts: list[dict[str,Any]], tokenizer:
     rows = [p for p in prompts if p['split'] == 'select']
     if not rows:
         raise ValueError('select split required for reward checkpoint selection')
+    if any('messages' not in row for row in rows):
+        raise ValueError('reward selection requires original prompt messages')
     name = 'sfairXC/FsfairX-LLaMA3-RM-v0.1'
-    rm = AutoModelForSequenceClassification.from_pretrained(name,revision=selection['reward_model_revision'],torch_dtype=torch.float32)
-    # The FP32 8B RM (32 GB) waits in host memory and visits the GPU only while it scores.
-    rm = rm.eval().requires_grad_(False)
     rm_tok = AutoTokenizer.from_pretrained(name,revision=selection['reward_model_revision'])
+    loaded: dict[str,Any] = {}
     decode = selection['decoding']
+    # Rows generated together; 1 is the original one-prompt-at-a-time rule. Batches are left-padded
+    # with positions from the mask, so a row's greedy tokens differ from its unbatched ones only by
+    # FP32 rounding of near-ties. The RM still scores one unpadded response at a time.
+    batch = cfg.get('selection_generation_batch_size') or 1
+    eos = tokenizer.eos_token_id
+    pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos
     cost = {'generated_tokens':0,'rm_scored_input_tokens':0,'selection_calls':0}
+
+    def reward_model() -> Any:
+        """The FP32 8B RM (32 GB), read on the first selection call; a run that never selects (for
+        example the evaluate stage after a finished policy) never loads it."""
+        if 'rm' not in loaded:
+            rm = AutoModelForSequenceClassification.from_pretrained(name,revision=selection['reward_model_revision'],
+                                                                    torch_dtype=torch.float32)
+            loaded['rm'] = rm.eval().requires_grad_(False)
+        return loaded['rm']
 
     @torch.no_grad()
     def select(student: Any) -> float:
         """Mean independent reward of generated responses on fixed select prompts (§11.1)."""
-        scores = []
         cost['selection_calls'] += 1
-        rm.to(cfg['device'])
+        responses = generate_rows(student)
+        # The RM waits in host memory and visits the GPU only while it scores, after generation.
+        rm = reward_model().to(cfg['device'])
         try:
-            score_rows(student,scores)
+            scores = [score_response(rm,row,response) for row,response in zip(rows,responses)]
         finally:
             rm.to('cpu')
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-        # Per-prompt rewards in select-row order, for paired comparisons between checkpoints and rho.
+        # Per-prompt rewards in select-row order, for paired comparisons between checkpoints and rho;
+        # the responses themselves serve diagnostics (length, EOS, repetition).
         select.last_scores = list(scores)
+        select.last_responses = [list(r) for r in responses]
         return statistics.mean(scores)
 
-    def score_rows(student: Any, scores: list[float]) -> None:
-        """Generate and RM-score every select prompt into `scores`."""
-        for row in rows:
-            ids = torch.tensor([row['prompt_ids']],device=cfg['device'])
-            # Reset stream per prompt/checkpoint so selection noise is controlled.
+    def generate_rows(student: Any) -> list[list[int]]:
+        """Greedy response tokens of every select row, in row order, up to and including the first EOS."""
+        responses: list[list[int]] = [[] for _ in rows]
+        # Similar prompt lengths share a batch (less left padding); the grouping never reorders scores.
+        order = sorted(range(len(rows)),key=lambda i:(len(rows[i]['prompt_ids']),i))
+        for start in range(0,len(order),batch):
+            group = order[start:start+batch]
+            width = max(len(rows[i]['prompt_ids']) for i in group)
+            ids = torch.full((len(group),width),pad,dtype=torch.long,device=cfg['device'])
+            attention = torch.zeros_like(ids)
+            for r,i in enumerate(group):
+                prompt = rows[i]['prompt_ids']
+                ids[r,width-len(prompt):] = torch.tensor(prompt,device=cfg['device'])
+                attention[r,width-len(prompt):] = 1
+            # Reset stream per batch/checkpoint so selection noise is controlled.
             with torch.random.fork_rng(devices=[ids.device] if ids.is_cuda else []):
                 torch.manual_seed(cfg['seed']+911)
-                response = student.generate(ids,attention_mask=torch.ones_like(ids),
-                                            pad_token_id=tokenizer.pad_token_id,eos_token_id=tokenizer.eos_token_id,**decode)
-            cost['generated_tokens'] += response.shape[1]-ids.shape[1]
-            if 'messages' not in row:
-                raise ValueError('reward selection requires original prompt messages')
-            messages = row['messages']+[{'role':'assistant','content':tokenizer.decode(response[0,ids.shape[1]:],skip_special_tokens=True)}]
-            text = rm_tok.apply_chat_template(messages,tokenize=False)
-            inputs = rm_tok(text,return_tensors='pt',add_special_tokens=False).to(cfg['device'])
-            cost['rm_scored_input_tokens'] += int(inputs['attention_mask'].sum())
-            logits = rm(**inputs).logits
-            if logits.numel() != 1:
-                raise ValueError('reward model must return one scalar')
-            scores.append(float(logits.item()))
+                output = student.generate(ids,attention_mask=attention,pad_token_id=pad,eos_token_id=eos,**decode)
+            for r,i in enumerate(group):
+                tokens = output[r,width:].tolist()
+                responses[i] = tokens[:tokens.index(eos)+1] if eos in tokens else tokens
+                cost['generated_tokens'] += len(responses[i])
+        return responses
+
+    def score_response(rm: Any, row: dict[str,Any], response: list[int]) -> float:
+        """RM reward of one decoded response to its select prompt."""
+        messages = row['messages']+[{'role':'assistant','content':tokenizer.decode(response,skip_special_tokens=True)}]
+        text = rm_tok.apply_chat_template(messages,tokenize=False)
+        inputs = rm_tok(text,return_tensors='pt',add_special_tokens=False).to(cfg['device'])
+        cost['rm_scored_input_tokens'] += int(inputs['attention_mask'].sum())
+        logits = rm(**inputs).logits
+        if logits.numel() != 1:
+            raise ValueError('reward model must return one scalar')
+        return float(logits.item())
     return select,cost
 
 

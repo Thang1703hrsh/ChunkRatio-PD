@@ -97,11 +97,83 @@ X10_SIZES = {'deita_rows':10000,'ultrachat_rows':10000,'uf_train_rows':20480,'uf
              'steps':300,'batch_size':64,'selection_interval':150,'diagnostic_prompts':8,'diagnostic_replicates':4,
              'policy_microbatch_size':4,'selection_baseline':True,'max_prompt_tokens':2048}
 SIZES = {'smoke':SMOKE_SIZES,'stability':STABILITY_SIZES,'x10':X10_SIZES}.get(SCALE) or (HUB_SIZES if HUB else None)
+# hda x10: speed-only knobs raised toward the A100-80GB. The hub x10 run peaked at 53 GB in collect-candidates
+# with 32 rows (17.7 GB of it FP32 weights) and at 51 GB in train-policy with microbatch 4. Neither knob
+# changes results: collection groups never affect samples, and microbatches accumulate with per-pair weights.
+if HDA and SCALE == 'x10':
+    SIZES = {**SIZES,'generation_batch_size':48,'policy_microbatch_size':6}
+# hda: RM selection generates 16 select prompts per batch instead of one at a time (each selection took
+# about 15 min of the hub x10 train-policy). Same prompts, greedy rule and 1024-token cap.
+if HDA and SIZES:
+    SIZES = {**SIZES,'selection_generation_batch_size':16}
+# CRPD_CORRECTION_BATCH=96 gives collect-correction its own generation group size (it is generation-bound
+# and used 34 GB at 48 rows in hda x10); grouping never changes a job's samples.
+CORRECTION_BATCH = os.environ.get('CRPD_CORRECTION_BATCH','')
+if CORRECTION_BATCH and SIZES:
+    SIZES = {**SIZES,'correction_generation_batch_size':int(CORRECTION_BATCH)}
+# CRPD_FAST_OPTIONS=1 turns on the chunkratio.fast execution options: candidate scoring across states
+# within the token budget (FP32 rounding differences only) and a 3 GiB host cache of head features.
+FAST_OPTIONS = os.environ.get('CRPD_FAST_OPTIONS','0') == '1'
+if FAST_OPTIONS and SIZES:
+    SIZES = {**SIZES,'batch_candidate_scoring':True,'head_feature_cache_mb':3072}
+# CRPD_BIG_BATCH=1: larger grouping batches only (results change by FP32 rounding at most); the training
+# batch of 64 pairs per step is unchanged. Prefix generation 96 rows (37 GB at 48 rows in hda x10, groups
+# now length-sorted), policy microbatch 8 (55 GB at 6), selection generation 32 prompts, candidate
+# scoring across states with a 16k-token budget.
+BIG_BATCH = os.environ.get('CRPD_BIG_BATCH','0') == '1'
+if BIG_BATCH and SIZES:
+    SIZES = {**SIZES,'prefix_generation_batch_size':96,'policy_microbatch_size':8,'selection_generation_batch_size':32,
+             'batch_candidate_scoring':True,'score_tokens_per_batch':16384}
+# CRPD_STEPS=150 trains for that many steps and selects only at the end (plus the rho baseline).
+STEPS = os.environ.get('CRPD_STEPS','')
+if STEPS and SIZES:
+    SIZES = {**SIZES,'steps':int(STEPS),'selection_interval':int(STEPS)}
+# CRPD_BATCH_SIZE=128 changes the training batch (pairs per optimizer step): a training setting, not a
+# speed option. GPU memory follows policy_microbatch_size, so 128 pairs run as 16 accumulated microbatches.
+BATCH_SIZE = os.environ.get('CRPD_BATCH_SIZE','')
+if BATCH_SIZE and SIZES:
+    SIZES = {**SIZES,'batch_size':int(BATCH_SIZE)}
+# CRPD_TURBO=1: every measured speed option at once. Training targets and pairs are unchanged up to FP32
+# rounding; gpu_sampling draws the same categorical distributions with different random draws (exact
+# sampling, tested), so a turbo run is a fresh collection, never mixed with a non-turbo cache.
+#   generation groups by token budget (KV cache ~229 KB/token FP32 for both Qwen3 sizes: 160k tokens ~37 GB),
+#   train-policy microbatches by token budget 8192 (4.1 s vs 7.6 s per 128-pair step at microbatch 8,
+#   54.6 GB peak; 16k ran out of memory), cross-state candidate scoring, selection generation 32 prompts.
+TURBO = os.environ.get('CRPD_TURBO','0') == '1'
+# CRPD_ONE_PROCESS=1 (implied by CRPD_TURBO): small scales run the whole pipeline in one `evaluate` call
+# instead of one process per stage, each of which reloads and fingerprints the three models.
+ONE_PROCESS = os.environ.get('CRPD_ONE_PROCESS','0') == '1' or TURBO
+# CRPD_NO_END_TOKEN=1: end-of-turn tokens are unscored in every chunk score (teacher delta_T and the student
+# and rho margins), a user-requested deviation from 'include sampled EOS exactly once' (DECISIONS). The hda
+# T+ ends turns with <|endoftext|> and writes about twice as long, so it scores the shared <|im_end|> about
+# 20 nats below T0 and the turbo student learned never to end a response (0% EOS on held-out prompts).
+NO_END_TOKEN = os.environ.get('CRPD_NO_END_TOKEN','0') == '1'
+if NO_END_TOKEN and SIZES:
+    SIZES = {**SIZES,'score_end_token':False}
+if TURBO and SIZES:
+    SIZES = {**SIZES,'gpu_sampling':True,'generation_tokens_per_batch':163840,'generation_max_rows':384,
+             'policy_tokens_per_microbatch':8192,'batch_candidate_scoring':True,'score_tokens_per_batch':16384,
+             'selection_generation_batch_size':32,
+             # One prefix pass per state for all siblings and per pair for c and d (A100 benchmarks: T+ scoring
+             # 24 s vs 58 s per 1,600 siblings at 33 GB with 48 states per forward; policy step 2.9 s vs 4.0 s).
+             'shared_prefix_scoring':True,'score_max_states':48}
 HF_PREFIX = 'crpd-qwen3-1p7b-to-0p6b'+('-hub' if HUB else '-hda' if HDA else '')+(f'-{SCALE}' if SMALL else '')
 # GPU of the CRPD stage (collection, head, targets, policy). Another GPU writes its outputs and cache
 # under a GPU tag so a comparison run collects afresh instead of reusing the default GPU's shards.
 CRPD_GPU = os.environ.get('CRPD_GPU','A100-80GB')
 GPU_TAG = '' if CRPD_GPU == 'A100-80GB' else '-'+CRPD_GPU.lower().replace('-','')
+# CRPD_OUTPUT_TAG=v2 writes outputs and cache under a tag as well, so a rerun with new code sits beside
+# the finished results of an earlier config instead of colliding with them.
+OUTPUT_TAG = os.environ.get('CRPD_OUTPUT_TAG','')
+GPU_TAG += '-'+OUTPUT_TAG if OUTPUT_TAG else ''
+# CRPD_COMPACT=1: the user's compact configuration (DECISIONS), tagged so it never shares outputs or cache
+# with protocol runs. K=2 (one rho + one T+ sibling), correction rolled out from every nonterminal
+# endpoint only, head fitted on chunk-boundary states only; selection every 50 steps, because one pair
+# per state makes the pool about six times smaller.
+COMPACT = os.environ.get('CRPD_COMPACT','0') == '1'
+COMPACT_SETTINGS = {'candidates':2,'correction_seeds':'endpoints','endpoint_fraction':1.,'head_positions':'boundary',
+                    'states_per_prompt':2,'selection_interval':50}
+GPU_TAG += '-compact' if COMPACT else ''
 # CRPD_ALPHAS=0.03,0.1 trains each variant once per alpha instead of the protocol alpha. Collection,
 # head and target keys do not contain alpha, so the sweep reuses them while the code revision is the same.
 ALPHA_TEXT = os.environ.get('CRPD_ALPHAS','')
@@ -111,11 +183,24 @@ ALPHAS = tuple(float(a) for a in ALPHA_TEXT.split(',') if a)
 SWEEP_LITE = os.environ.get('CRPD_SWEEP_LITE','0') == '1'
 if not all(0 < a < float('inf') for a in ALPHAS):
     raise SystemExit('CRPD_ALPHAS must be finite positive numbers')
+# CRPD_GAMMAS=1,0.3,0.1 trains crpd_raw once per alpha and gamma, t = gamma * delta_T (DECISIONS). gamma
+# only enters the target and policy keys, so all gammas of one launch share one collection; gamma = 1
+# writes the same config (and name) as a run without the option.
+GAMMA_TEXT = os.environ.get('CRPD_GAMMAS','')
+GAMMAS = tuple(float(g) for g in GAMMA_TEXT.split(',') if g)
+if not all(0 < g <= 1 for g in GAMMAS):
+    raise SystemExit('CRPD_GAMMAS must be numbers in (0, 1]')
+if GAMMAS and not ALPHAS:
+    raise SystemExit('CRPD_GAMMAS needs CRPD_ALPHAS (the sweep names its runs by alpha and gamma)')
+if any(g != 1 for g in GAMMAS) and set(VARIANTS) != {'crpd_raw'}:
+    raise SystemExit('CRPD_GAMMAS below 1 is implemented for CRPD_VARIANTS=crpd_raw only')
 
 
-def run_name(variant: str, alpha: float) -> str:
-    """Config and output name of one sweep run, for example crpd_main-alpha0p03."""
-    return f"{variant}-alpha{str(alpha).replace('.','p')}"
+def run_name(variant: str, alpha: float, gamma: float = 1.) -> str:
+    """Config and output name of one sweep run, for example crpd_main-alpha0p03 or
+    crpd_raw-alpha0p03-gamma0p3 (gamma = 1 keeps the name without the option)."""
+    name = f"{variant}-alpha{str(alpha).replace('.','p')}"
+    return name if gamma == 1 else f"{name}-gamma{str(gamma).replace('.','p')}"
 
 
 app = modal.App(APP_NAME)
@@ -127,7 +212,11 @@ image = (modal.Image.debian_slim(python_version='3.12')
                'PYTORCH_CUDA_ALLOC_CONF':'expandable_segments:True',
                'CRPD_SCALE':SCALE,'CRPD_HF_PUSH':'1' if HF_PUSH else '0','CRPD_TEACHERS':TEACHERS,
                'CRPD_GPU':CRPD_GPU,'CRPD_ALPHAS':ALPHA_TEXT,'CRPD_SWEEP_LITE':'1' if SWEEP_LITE else '0',
-               'CRPD_VARIANTS':VARIANT_TEXT})
+               'CRPD_VARIANTS':VARIANT_TEXT,'CRPD_OUTPUT_TAG':OUTPUT_TAG,'CRPD_COMPACT':'1' if COMPACT else '0',
+               'CRPD_CORRECTION_BATCH':CORRECTION_BATCH,'CRPD_FAST_OPTIONS':'1' if FAST_OPTIONS else '0',
+               'CRPD_BIG_BATCH':'1' if BIG_BATCH else '0','CRPD_STEPS':STEPS,'CRPD_BATCH_SIZE':BATCH_SIZE,
+               'CRPD_TURBO':'1' if TURBO else '0','CRPD_ONE_PROCESS':'1' if ONE_PROCESS else '0',
+               'CRPD_NO_END_TOKEN':'1' if NO_END_TOKEN else '0','CRPD_GAMMAS':GAMMA_TEXT})
          .add_local_dir(REPO,REMOTE_REPO,ignore=['output','data','.git','mtbench','winrate_eval','diversity_metrics',
                                                  'promt','prompts','env','reports','**/__pycache__','.pytest_cache']))
 common = {'image':image,'volumes':{VOLUME_PATH:volume},'timeout':24*3600}
@@ -443,10 +532,23 @@ def write_pilot_configs() -> dict[str,str]:
         cfg = pilot_config(protocol,variant,checkpoints,_revisions(),split,verified,RUN_PAIR,assumption)
         if SIZES:
             cfg.update({k:SIZES[k] for k in ('steps','batch_size','selection_interval','states_per_prompt',
-                                             'policy_microbatch_size','selection_baseline','max_prompt_tokens') if k in SIZES})
+                                             'policy_microbatch_size','selection_baseline','max_prompt_tokens',
+                                             'generation_batch_size','selection_generation_batch_size',
+                                             'correction_generation_batch_size','batch_candidate_scoring',
+                                             'head_feature_cache_mb','prefix_generation_batch_size',
+                                             'score_tokens_per_batch','gpu_sampling','generation_tokens_per_batch',
+                                             'generation_max_rows','policy_tokens_per_microbatch',
+                                             'shared_prefix_scoring','score_max_states','score_end_token') if k in SIZES})
             cfg['pilot_assumptions'] = {**cfg['pilot_assumptions'],'pilot_subset':f"{SIZES['subset']} prompts ({SCALE} scale)",
                                         'states_per_prompt':str(SIZES['states_per_prompt']),
                                         'policy_steps':f"{SIZES['steps']} steps x {SIZES['batch_size']} pairs; RM selection every {SIZES['selection_interval']} steps"}
+        if COMPACT:
+            cfg.update(COMPACT_SETTINGS)
+            cfg['pilot_assumptions'] = {**cfg['pilot_assumptions'],
+                                        'compact':('K=2 (1 rho + 1 T+), correction from nonterminal endpoints only '
+                                                   '(endpoint_fraction 1), head on chunk-boundary states only, '
+                                                   '2 states per prompt, selection every 50 steps; a user-requested '
+                                                   'deviation from the K=4 protocol (DECISIONS)')}
         if GPU_TAG:
             cfg.update(output=f'{ROOT}/{variant}{GPU_TAG}/seed0',cache_root=f'{ROOT}/cache{GPU_TAG}')
         if SWEEP_LITE:
@@ -454,13 +556,19 @@ def write_pilot_configs() -> dict[str,str]:
         path.write_text(json.dumps(cfg,indent=2),encoding='utf-8')
         paths[variant] = str(path.relative_to(work))
         for alpha in ALPHAS:
-            name = run_name(variant,alpha)
-            sweep = {**cfg,'alpha':alpha,'output':f'{ROOT}/{name}{GPU_TAG}/seed0','selection_baseline':not SWEEP_LITE,
-                     'pilot_assumptions':{**cfg['pilot_assumptions'],
-                                          'alpha_sweep':f'{ALPHA_TEXT}; chosen on select-split RM only (DECISIONS 55)'}}
-            sweep_path = path.with_name(f'{name}.json')
-            sweep_path.write_text(json.dumps(sweep,indent=2),encoding='utf-8')
-            paths[name] = str(sweep_path.relative_to(work))
+            for gamma in GAMMAS or (1.,):
+                name = run_name(variant,alpha,gamma)
+                sweep = {**cfg,'alpha':alpha,'output':f'{ROOT}/{name}{GPU_TAG}/seed0','selection_baseline':not SWEEP_LITE,
+                         'pilot_assumptions':{**cfg['pilot_assumptions'],
+                                              'alpha_sweep':f'{ALPHA_TEXT}; chosen on select-split RM only (DECISIONS 55)'}}
+                if gamma != 1:
+                    sweep['teacher_gap_scale'] = gamma
+                    sweep['pilot_assumptions'] = {**sweep['pilot_assumptions'],
+                                                  'gamma_sweep':f'{GAMMA_TEXT}; t = gamma * delta_T, crpd_raw only; '
+                                                                'chosen on select-split RM only (DECISIONS)'}
+                sweep_path = path.with_name(f'{name}.json')
+                sweep_path.write_text(json.dumps(sweep,indent=2),encoding='utf-8')
+                paths[name] = str(sweep_path.relative_to(work))
     return paths
 
 
@@ -471,14 +579,19 @@ def verify_hda_teachers(revision: str) -> dict:
     verify, that T0 was T+'s DPO reference: runs record it as an assumption, never as verified."""
     volume.reload()
     out = workdir()/ROOT/'teacher_reference_evidence.json'
-    if out.exists() and json.loads(out.read_text(encoding='utf-8'))['supported']:
-        print('skip verify_hda_teachers',flush=True)
-        return json.loads(out.read_text(encoding='utf-8'))
     sys.path.insert(0,str(workdir()))
+    from chunkratio.pilot import HDA_CHECKPOINTS, TEACHER_BASE_MODEL
+    # Earlier evidence counts only for exactly these checkpoints (repos and revisions): replacing a teacher
+    # in HDA_CHECKPOINTS must check the new pair instead of reusing the old pair's result.
+    if out.exists():
+        earlier = json.loads(out.read_text(encoding='utf-8'))
+        if earlier.get('supported') and earlier.get('sources') == HDA_CHECKPOINTS:
+            print('skip verify_hda_teachers',flush=True)
+            return earlier
+        print('teacher_reference_evidence.json is for other checkpoints; checking again',flush=True)
     from huggingface_hub import snapshot_download
     from chunkratio.artifacts import write_json
     from chunkratio.hub_teachers import nearest_reference
-    from chunkratio.pilot import HDA_CHECKPOINTS, TEACHER_BASE_MODEL
     revisions = _revisions()
     folder = lambda repo,rev: Path(snapshot_download(repo,revision=rev,allow_patterns=['*.json','*.safetensors']))
     report = nearest_reference(folder(HDA_CHECKPOINTS['teacher_plus']['repo'],HDA_CHECKPOINTS['teacher_plus']['revision']),
@@ -513,7 +626,8 @@ def diagnose(revision: str) -> None:
 
 
 # 64 GB RAM: the FP32 8B selection RM passes through host memory while loading.
-@app.function(gpu=CRPD_GPU,cpu=4.0,memory=65536,retries=1,**common)
+# 96 GB RAM: the FP32 8B selection RM waits in host memory during training (hda x10 peaked at 62 GB).
+@app.function(gpu=CRPD_GPU,cpu=4.0,memory=98304,retries=1,**common)
 def train_variants(revision: str) -> None:
     """crpd_main, crpd_raw, crpd_anchor (seed 0) sharing one cache_root; each resumes from its shards.
 
@@ -522,7 +636,9 @@ def train_variants(revision: str) -> None:
     """
     volume.reload()
     configs = write_pilot_configs()
-    runs = [(variant,run_name(variant,alpha)) for variant in VARIANTS for alpha in ALPHAS] or [(v,v) for v in VARIANTS]
+    # gamma = 1 first: it collects, and the other gammas of the same alpha reuse that collection.
+    runs = ([(variant,run_name(variant,alpha,gamma)) for variant in VARIANTS for alpha in ALPHAS
+             for gamma in sorted(GAMMAS or (1.,),reverse=True)] or [(v,v) for v in VARIANTS])
     for variant,name in runs:
         config = json.loads((workdir()/configs[name]).read_text(encoding='utf-8'))
         if finished(config,'diagnostics.json',revision) or (SWEEP_LITE and finished(config,'student/config.json',revision)):
@@ -530,6 +646,12 @@ def train_variants(revision: str) -> None:
         else:
             stages = (('validate-config','collect-prefixes','collect-candidates','collect-correction','fit-head',
                        'build-targets','train-policy','evaluate') if SMALL else ('evaluate',))
+            # Variants that bypass the head (pipeline.py) would only load three models in these two stages.
+            if config['variant'] in ('crpd_raw','crpd_suffix'):
+                stages = tuple(s for s in stages if s not in ('collect-correction','fit-head'))
+            # One pipeline call loads the models once; per-phase collection seconds stay in timing_*.json.
+            if ONE_PROCESS:
+                stages = ('validate-config','evaluate')
             stages = ('train-policy',) if SWEEP_LITE else stages
             for stage in stages:
                 crpd(revision,stage,'--config',configs[name])

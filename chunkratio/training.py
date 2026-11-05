@@ -17,7 +17,7 @@ from torch import nn
 
 from .artifacts import digest
 from .math import diagnostics, pair_loss
-from .scoring import fingerprint, score_batch
+from .scoring import fingerprint, length_groups, score_batch, sibling_logprobs
 from .value_head import save_tensor
 
 
@@ -61,6 +61,22 @@ class ChunkRatioTrainer:
         self.rng = random.Random(cfg['seed']+701)
         self.history: list[dict[str,Any]] = []
 
+    def microbatches(self, batch: list[dict[str,Any]]) -> list[list[dict[str,Any]]]:
+        """Split one step's sampled pairs for gradient accumulation; never changes the step's pairs.
+
+        Default: fixed `policy_microbatch_size` slices in sampling order. With `policy_tokens_per_microbatch`
+        (opt-in), pairs are sorted by length and cut so rows x longest row stays within the budget, so short
+        pairs share a forward and long ones do not pad them. Each slice is weighted by its share of the
+        batch, so the accumulated gradient is the same batch mean up to floating-point summation order.
+        """
+        budget = self.cfg.get('policy_tokens_per_microbatch')
+        if budget:
+            lengths = [len(p['state']['prefix_ids'])+max(len(p['c']['tokens']),len(p['d']['tokens'])) for p in batch]
+            return [[batch[i] for i in group] for group in length_groups(lengths,budget)]
+        size = self.cfg.get('policy_microbatch_size',1)
+        assert size > 0
+        return [batch[offset:offset+size] for offset in range(0,len(batch),size)]
+
     def batch_loss(self, batch: list[dict[str,Any]]) -> tuple[torch.Tensor,dict[str,float]]:
         """Hierarchically sampled batch mean implements prescribed measure (§7.2)."""
         losses,metrics = self.pair_terms(batch)
@@ -70,19 +86,39 @@ class ChunkRatioTrainer:
         """Unreduced per-pair losses and diagnostics of one batch of sibling pairs (§8)."""
         prefixes = [p['state']['prefix_ids'] for p in batch]
         chunks = {side:[p[side]['tokens'] for p in batch] for side in ('c','d')}
+        # shared_prefix_scoring (opt-in): c and d run on one prefix pass per pair, for the student and for
+        # rho alike, so the margin still starts at exactly zero; scores and gradients equal score_batch's up
+        # to rounding (tests). rho is then always recomputed the same way, never read from the FP32 cache.
+        shared = self.cfg.get('shared_prefix_scoring',False)
+        # score_end_token=False (opt-in, DECISIONS): the end-of-turn token is unscored for student and rho,
+        # matching the targets, so ending a response is neutral in the margin as in delta_T.
+        end = self.cfg.get('score_end_token',True)
+        def both(model: nn.Module) -> tuple[torch.Tensor,torch.Tensor]:
+            """(c, d) sums for every pair of the batch from one prefix pass each."""
+            sums = sibling_logprobs(model,prefixes,[[c,d] for c,d in zip(chunks['c'],chunks['d'])],self.eos,end)
+            return torch.stack([s[0] for s in sums]),torch.stack([s[1] for s in sums])
         with student_precision(self.cfg):
-            c = score_batch(self.student,prefixes,chunks['c'],self.eos,frozen=False)
-            d = score_batch(self.student,prefixes,chunks['d'],self.eos,frozen=False)
+            if shared:
+                c,d = both(self.student)
+            else:
+                c = score_batch(self.student,prefixes,chunks['c'],self.eos,frozen=False,score_eos=end)
+                d = score_batch(self.student,prefixes,chunks['d'],self.eos,frozen=False,score_eos=end)
+        rho_shared: dict[str,torch.Tensor] = {}
         def column(side: str, key: str) -> torch.Tensor:
             """Move frozen cached scalar scores to the student device (§8)."""
             return c.new_tensor([p[side][key] for p in batch])
         def reference(side: str) -> torch.Tensor:
             """log rho in the student's precision, so a = log pi - log rho starts at exactly zero.
             The cached scores are FP32; bf16 student forwards would differ from them at student = rho."""
+            if shared:
+                if not rho_shared:
+                    with torch.no_grad(), student_precision(self.cfg):
+                        rho_shared['c'],rho_shared['d'] = both(self.rho)
+                return rho_shared[side]
             if self.cfg.get('policy_autocast_dtype') is None:
                 return column(side,'logp_student_ref')
             with student_precision(self.cfg):
-                return score_batch(self.rho,prefixes,chunks[side],self.eos)
+                return score_batch(self.rho,prefixes,chunks[side],self.eos,score_eos=end)
         losses,m,u = pair_loss(c,d,reference('c'),reference('d'),
                              column('c','target_score'),column('d','target_score'),self.cfg['alpha'])
         return losses,diagnostics(losses,m,u)
@@ -158,10 +194,7 @@ class ChunkRatioTrainer:
             batch = self.sample()
             loss_total = 0.
             diag = {'excess_bce':0.,'logit_error':0.,'saturation':0.}
-            microbatch_size = cfg.get('policy_microbatch_size',1)
-            assert microbatch_size > 0
-            for offset in range(0,len(batch),microbatch_size):
-                micro = batch[offset:offset+microbatch_size]
+            for micro in self.microbatches(batch):
                 loss,metrics = self.batch_loss(micro)
                 weight = len(micro)/len(batch)
                 (loss*weight).backward()
