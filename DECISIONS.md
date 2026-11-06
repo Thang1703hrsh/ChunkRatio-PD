@@ -576,3 +576,31 @@ distillation stage (`scripts/run_narval.py`); it has no SFT or teacher-DPO code 
     about 18 min, other about 10 min: about 1.6 h on an A100-80GB at about $3.46/h with RAM and CPU (about $5.5),
     plus held-out diagnostics and benchmarks about $1.5: about $7-9 in total. nuocb0739 had used $12.08 of credit
     this month before launch.
+91. **2,000-prompt pilot result (6 November 2026).** `crpd_raw-alpha0p03-gamma0p05-p2k` (x30, nuocb0739): 22,381 pairs,
+    best select checkpoint at step 150 of 450 (select RM vs rho +0.81 [0.18, 1.44], 44/20; steps 300 and 450 lower).
+    Held-out (same 64 test prompts as x10): RM +0.55 [-0.10, 1.24] (35/29, sign p = 0.48), EOS 90.6%, length 389,
+    repetition 24.3%; at equal length +0.85, both-EOS +0.77 (33/24). x10 gamma 0.05 had +0.54 (43/20), EOS 92.2%,
+    length 370. Winogrande 58.33 (rho 57.85, NARVAL riskkd 58.72); TruthfulQA-MC2 45.39 (rho 45.91, difference
+    -0.53 [-0.88, -0.21]; riskkd 45.15, while the paper reports SFT 45.92 and NARVAL 48.19). Three times the
+    prompts did not improve on x10. Measured cost: 78.7 min for the restarted invocation (collection 23 min,
+    training 4.33 s/step, 4 selections 13 min, post-training diagnostics 5 min); one preemption at 11:10 lost the
+    first attempt's uncommitted collection. Credit used this month rose from $12.08 to $23.20 with this pilot and
+    the day's evaluations. Full data (about 55k prompts, one pass) would take about 17-19 GPU-hours (about $60-70)
+    and needs periodic volume commits first.
+92. **Checkpoints from the authors' repos, and same-source pairs (user request, 6 November 2026; fixed before the
+    runs).** (a) `HDA_CHECKPOINTS` now names the vukien2301 repos listed in `riskKD_hf_checkpoints.xlsx` (student
+    init qwen3-0.6b-deita-sft-student @ df3f07e9, SFT teacher qwen3-1.7b-deita-sft-student @ 68735fe3 "also the
+    SFT teacher of the Qwen3-0.6B setting", DPO teacher qwen3-1.7b-ultrafeedback-dpo-teacher @ 3ebd9cf9). Every
+    file equals the hoangducanh1865 copies used so far except training_args.bin, so weights, tokenizer, config and
+    template, and therefore results, are unchanged. (b) Diagnosis: with t = delta_T = log T+ - log T0, a chunk
+    proposed by T+ has E[delta_T] = KL(T+||T0) >= 0 whatever its quality, so rho-T+ pairs mostly encode the
+    proposer (99.8% prefer the T+ side; 66% of the training weight) and the student copies T+'s length and
+    repetition (gamma 0.05: length 370-389 vs rho 247, repetition 21-24% vs 15%). Opt-in `pair_sources`
+    (crpd_raw only, validated, in the target key when not 'all'): 'within' trains on pairs whose candidates share
+    a proposer (rho-rho, T+-T+); 'student_ref' on rho-rho only; the hierarchical measure is renormalised over the
+    kept prompts, states and pairs ('all' reproduces the protocol pairs and weights exactly; tests
+    `test_pair_sources_filters_pairs_and_renormalises`, `test_pair_sources_validation`). This deviates from the
+    K=4 sibling measure (DECISIONS records it as a user-requested variant setting, not the protocol). Plan at x10
+    (nuocb0739, about $4.5 of the about $7 left): `CRPD_PAIR_SOURCES=within`, gamma 0.05 (only the pair rule
+    differs from the pinned run) and 0.1 (more signal once the source bias is gone), chosen on select RM; held-out
+    pd_diagnostics on both. Success means held-out RM above the pinned run with EOS and length closer to rho.

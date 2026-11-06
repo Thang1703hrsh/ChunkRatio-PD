@@ -94,10 +94,13 @@ HUB_ASSUMPTIONS = {
 # a plain ChatML template whose assistant turns end with <|im_end|>; the tokenizers declare <|endoftext|>,
 # so <|im_end|> is set as EOS when loading. On Winogrande and TruthfulQA-MC2 the 1.7B pair reproduces the
 # NARVAL Table 1 teacher rows within 0.6 points (script/modal/benchmark_eval.py).
+# The NARVAL authors' own repos (riskKD_hf_checkpoints.xlsx: the Qwen3-1.7B -> Qwen3-0.6B student init and DPO
+# teacher, and the 1.7B SFT that is "also the SFT teacher of the Qwen3-0.6B setting"). The hoangducanh1865 repos
+# used before are copies: every file is identical at these revisions except training_args.bin (DECISIONS 92).
 HDA_CHECKPOINTS = {
-    'teacher_base':{'repo':'hoangducanh1865/qwen3-1.7b-deita-sft-student','revision':'52f7c14ea4893128252ada7a365c957813820070'},
-    'teacher_plus':{'repo':'hoangducanh1865/qwen3-1.7b-ultrafeedback-dpo-teacher','revision':'97a6de251a5e3f78494c6892fb4fbdf9b53c9f04'},
-    'student_ref':{'repo':'hoangducanh1865/qwen3-0.6b-deita-sft-student','revision':'fc0f225cb63e5db6e84a7e5705c997891ec85d65'},
+    'teacher_base':{'repo':'vukien2301/qwen3-1.7b-deita-sft-student','revision':'68735fe3c227a7c62c0f34fe6664de8b3714b039'},
+    'teacher_plus':{'repo':'vukien2301/qwen3-1.7b-ultrafeedback-dpo-teacher','revision':'3ebd9cf9da9b21043cb70529b618cff8d28846ab'},
+    'student_ref':{'repo':'vukien2301/qwen3-0.6b-deita-sft-student','revision':'df3f07e928671519377a58f2cd399643c5fe65f5'},
 }
 HDA_PAIR = PAIR+'_hda'
 PAIRS[HDA_PAIR] = {'teacher':HDA_CHECKPOINTS['teacher_base']['repo'],'student':HDA_CHECKPOINTS['student_ref']['repo'],

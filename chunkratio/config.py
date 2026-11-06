@@ -83,6 +83,11 @@ def validate(cfg: dict[str,Any]) -> None:
         raise ValueError('teacher_gap_scale must be a number in (0, 1]')
     if gamma != 1 and cfg['variant'] != 'crpd_raw':
         raise ValueError('teacher_gap_scale < 1 is implemented for crpd_raw only')
+    # Which sibling pairs train (DECISIONS 92); a filtered measure is implemented for raw targets only.
+    if cfg.get('pair_sources','all') not in ('all','within','student_ref'):
+        raise ValueError('pair_sources must be all, within or student_ref')
+    if cfg.get('pair_sources','all') != 'all' and cfg['variant'] != 'crpd_raw':
+        raise ValueError('pair_sources other than all is implemented for crpd_raw only')
     # The head is fitted on head_val corrections, so only head-free variants may collect train alone.
     splits = cfg.get('collection_splits',['train','head_val'])
     if (not isinstance(splits,(list,tuple)) or 'train' not in splits or

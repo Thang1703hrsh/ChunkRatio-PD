@@ -153,6 +153,11 @@ ONE_PROCESS = os.environ.get('CRPD_ONE_PROCESS','0') == '1' or TURBO
 # T+ ends turns with <|endoftext|> and writes about twice as long, so it scores the shared <|im_end|> about
 # 20 nats below T0 and the turbo student learned never to end a response (0% EOS on held-out prompts).
 NO_END_TOKEN = os.environ.get('CRPD_NO_END_TOKEN','0') == '1'
+# CRPD_PAIR_SOURCES=within trains crpd_raw on same-source sibling pairs only (rho-rho, T+-T+), removing the
+# proposal-source bias of rho-T+ labels; student_ref keeps rho-rho pairs only (DECISIONS 92). Unset: all pairs.
+PAIR_SOURCES = os.environ.get('CRPD_PAIR_SOURCES','')
+if PAIR_SOURCES and SIZES:
+    SIZES = {**SIZES,'pair_sources':PAIR_SOURCES}
 if NO_END_TOKEN and SIZES:
     SIZES = {**SIZES,'score_end_token':False}
 if TURBO and SIZES:
@@ -227,7 +232,7 @@ image = (modal.Image.debian_slim(python_version='3.12')
                'CRPD_CORRECTION_BATCH':CORRECTION_BATCH,'CRPD_FAST_OPTIONS':'1' if FAST_OPTIONS else '0',
                'CRPD_BIG_BATCH':'1' if BIG_BATCH else '0','CRPD_STEPS':STEPS,'CRPD_BATCH_SIZE':BATCH_SIZE,
                'CRPD_TURBO':'1' if TURBO else '0','CRPD_ONE_PROCESS':'1' if ONE_PROCESS else '0',
-               'CRPD_NO_END_TOKEN':'1' if NO_END_TOKEN else '0','CRPD_GAMMAS':GAMMA_TEXT})
+               'CRPD_NO_END_TOKEN':'1' if NO_END_TOKEN else '0','CRPD_PAIR_SOURCES':PAIR_SOURCES,'CRPD_GAMMAS':GAMMA_TEXT})
          .add_local_dir(REPO,REMOTE_REPO,ignore=['output','data','.git','mtbench','winrate_eval','diversity_metrics',
                                                  'promt','prompts','env','reports','**/__pycache__','.pytest_cache']))
 common = {'image':image,'volumes':{VOLUME_PATH:volume},'timeout':24*3600}
@@ -549,7 +554,7 @@ def write_pilot_configs() -> dict[str,str]:
                                              'head_feature_cache_mb','prefix_generation_batch_size',
                                              'score_tokens_per_batch','gpu_sampling','generation_tokens_per_batch',
                                              'generation_max_rows','policy_tokens_per_microbatch',
-                                             'shared_prefix_scoring','score_max_states','score_end_token') if k in SIZES})
+                                             'shared_prefix_scoring','score_max_states','score_end_token','pair_sources') if k in SIZES})
             cfg['pilot_assumptions'] = {**cfg['pilot_assumptions'],'pilot_subset':f"{SIZES['subset']} prompts ({SCALE} scale)",
                                         'states_per_prompt':str(SIZES['states_per_prompt']),
                                         'policy_steps':f"{SIZES['steps']} steps x {SIZES['batch_size']} pairs; RM selection every {SIZES['selection_interval']} steps"}

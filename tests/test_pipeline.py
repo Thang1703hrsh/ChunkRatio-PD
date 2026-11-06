@@ -450,3 +450,53 @@ def test_shards_record_rng_digests_that_replay(tmp_path: Path) -> None:
     assert any(c['tokens'] == tokens and 'teacher_plus' in c['sources'] for c in record['candidates'])
     sizes = [len(json.dumps(r['rng'])) for r in records]
     assert max(sizes) < 2000
+
+
+def test_pair_sources_filters_pairs_and_renormalises(tmp_path: Path) -> None:
+    """pair_sources: 'all' gives the protocol pairs and weights exactly; 'within' keeps only same-source pairs
+    and 'student_ref' only rho-rho pairs, each with the hierarchical measure renormalised to sum 1 over the kept
+    prompts, states and pairs; the filtered targets get their own target key, the collection is shared
+    (DECISIONS 92)."""
+    from collections import Counter
+    from chunkratio.artifacts import read_json, read_jsonl
+    from chunkratio.pipeline import pipeline
+    cfg = {**load_config('config/crpd/smoke.json'),'variant':'crpd_raw'}
+    models,_,_,info = load_models(cfg)
+    prompts = prepare_prompts(read_jsonl(Path(cfg['prompts'])),cfg['seed'])
+    a,b = [ShardStore(tmp_path/name,{'test':name}) for name in ('prefix','candidate')]
+    records = collect_candidates(collect_prefixes(prompts,models['student_ref'],cfg,info['eos'],a),models,cfg,info['eos'],b)
+    base = build_targets(records,None,models,cfg,info['eos'],'reference_mean')
+    explicit = build_targets(records,None,models,{**cfg,'pair_sources':'all'},info['eos'],'reference_mean')
+    assert [(p['id'],p['weight']) for p in explicit['pairs']] == [(p['id'],p['weight']) for p in base['pairs']]
+    assert any(not set(p['c']['sources']) & set(p['d']['sources']) for p in base['pairs'])
+    for rule in ('within','student_ref'):
+        t = build_targets(records,None,models,{**cfg,'pair_sources':rule},info['eos'],'reference_mean')
+        assert t['pairs'] and len(t['pairs']) < len(base['pairs'])
+        assert sum(p['weight'] for p in t['pairs']) == pytest.approx(1.,abs=1e-12)
+        for p in t['pairs']:
+            c,d = set(p['c']['sources']),set(p['d']['sources'])
+            assert c & d if rule == 'within' else ('student_ref' in c and 'student_ref' in d)
+        per_prompt = Counter()
+        for p in t['pairs']:
+            per_prompt[p['state']['prompt_id']] += p['weight']
+        assert all(v == pytest.approx(1/len(per_prompt)) for v in per_prompt.values())
+        assert {p['id'] for p in t['pairs']} <= {p['id'] for p in base['pairs']}
+    # Keys: the collection is shared, the filtered targets are stored apart.
+    run = {**cfg,'output':str(tmp_path/'run')}
+    pipeline(run,'build-targets')
+    first = read_json(tmp_path/'run'/'target_index.json')['path']
+    pipeline({**run,'pair_sources':'within'},'build-targets')
+    assert read_json(tmp_path/'run'/'target_index.json')['path'] != first
+    stores = lambda stage: [p for p in (tmp_path/'run'/'cache').iterdir() if p.name.startswith(stage+'-')]
+    assert len(stores('candidates')) == 1 and len(stores('targets')) == 2
+
+
+def test_pair_sources_validation() -> None:
+    """Only crpd_raw accepts a filtered pair rule; unknown rules fail closed."""
+    from chunkratio.config import validate
+    base = load_config('config/crpd/smoke.json')
+    validate({**base,'variant':'crpd_raw','pair_sources':'within'})
+    with pytest.raises(ValueError,match='all, within or student_ref'):
+        validate({**base,'variant':'crpd_raw','pair_sources':'mixed'})
+    with pytest.raises(ValueError,match='crpd_raw only'):
+        validate({**base,'variant':'crpd_main','pair_sources':'within'})

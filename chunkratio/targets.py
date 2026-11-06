@@ -93,13 +93,32 @@ def build_targets(records: list[dict[str,Any]], head: MeanHead | None, models: d
         output.append(result)
         if state['split'] == 'train':
             grouped[state['prompt_id']].append(result)
+    # pair_sources (opt-in, crpd_raw only; DECISIONS 92). 'all' (protocol): every sibling pair. 'within': pairs
+    # whose candidates share a proposing source (rho-rho, T+-T+; a chunk drawn by both counts for either). A
+    # T+-proposed chunk has E[delta_T] = KL(T+||T0) >= 0, so rho-T+ labels mostly encode which model proposed the
+    # chunk (99.8% prefer the T+ side), and the student copies T+'s length and repetition. Within a source the
+    # delta_T difference compares chunks of the same proposal distribution. 'student_ref': rho-rho pairs only.
+    # The hierarchical measure is renormalised over what is kept: prompts with a kept pair, their states with a
+    # kept pair, and the kept pairs of each state, each uniform; 'all' gives the former weights exactly.
+    rule = cfg.get('pair_sources','all')
+    def kept(c: dict[str,Any], d: dict[str,Any]) -> bool:
+        """Whether the pair (c, d) enters training under the pair_sources rule."""
+        if rule == 'all':
+            return True
+        a,b = set(c['sources']),set(d['sources'])
+        return bool(a & b) if rule == 'within' else 'student_ref' in a and 'student_ref' in b
+    selected = {}
+    for prompt_id,prompt_states in grouped.items():
+        states = [(record,combos) for record in prompt_states
+                  if (combos := [(c,d) for c,d in itertools.combinations(record['candidates'],2) if kept(c,d)])]
+        if states:
+            selected[prompt_id] = states
     pairs = []
-    for prompt_states in grouped.values():
-        for record in prompt_states:
-            cs = record['candidates']
-            for c,d in itertools.combinations(cs,2):
+    for states in selected.values():
+        for record,combos in states:
+            for c,d in combos:
                 pairs.append({'id':digest([c['id'],d['id']]),'state':record['state'],'c':c,'d':d,
-                              'weight':1/len(grouped)/len(prompt_states)/math.comb(len(cs),2)})
+                              'weight':1/len(selected)/len(states)/len(combos)})
     if pairs:
         assert abs(sum(p['weight'] for p in pairs)-1) < 1e-10
     return {'records':output,'pairs':pairs,'audits':audits,'route':route}

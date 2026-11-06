@@ -210,6 +210,9 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
     # carries the whole config, gamma included).
     if cfg.get('teacher_gap_scale',1.0) != 1:
         target_deps['teacher_gap_scale'] = cfg['teacher_gap_scale']
+    # The pair rule enters the target key only when it filters, so 'all' keeps every existing key.
+    if cfg.get('pair_sources','all') != 'all':
+        target_deps['pair_sources'] = cfg['pair_sources']
     target_path = cache/stage_key('targets',target_deps)
     write_json(target_path/'targets.json',targets)
     write_json(output/'target_index.json',{'path':str(target_path/'targets.json'),'head_hash':head_meta['hash']})
