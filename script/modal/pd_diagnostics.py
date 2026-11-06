@@ -195,6 +195,22 @@ def diagnose(teacher_pairs: int = 256) -> dict:
                     for k,v in generations.items()},
         'repetition_4gram':{k:statistics.mean(repetition(r) for r in v['responses']) for k,v in generations.items()},
         'student_minus_rho_logratio_per_token':{f'on_{k}_responses':drift(v['responses']) for k,v in generations.items()}}
+    # Per-prompt values and a length-controlled view of the RM gain (measurement only): the reward model may
+    # favour longer answers, so the difference is also reported at equal length (OLS intercept of the reward
+    # difference on the length difference) and on prompts where both responses ended with EOS.
+    lengths = {k:[len(r) for r in v['responses']] for k,v in generations.items()}
+    ended = {k:[bool(r) and r[-1] == eos for r in v['responses']] for k,v in generations.items()}
+    dlen = np.asarray(lengths['student'],dtype=float)-np.asarray(lengths['rho'],dtype=float)
+    slope,intercept = np.polyfit(dlen,delta,1) if np.ptp(dlen) > 0 else (0.,float(delta.mean()))
+    both = [i for i in range(len(delta)) if ended['student'][i] and ended['rho'][i]]
+    report['heldout_generation']['per_prompt'] = {'rm':{k:v['scores'] for k,v in generations.items()},
+                                                  'length':lengths,'eos':ended}
+    report['heldout_generation']['length_controlled'] = {
+        'ols_rm_difference_at_equal_length':float(intercept),'ols_slope_per_token':float(slope),
+        'corr_rm_difference_with_length_difference':float(np.corrcoef(dlen,delta)[0,1]) if np.ptp(dlen) > 0 else None,
+        'both_eos_prompts':len(both),
+        'both_eos_rm_difference':float(delta[both].mean()) if both else None,
+        'both_eos_wins_losses':[int((delta[both] > 0).sum()),int((delta[both] < 0).sum())] if both else None}
     print(json.dumps({'heldout_generation':report['heldout_generation']}),flush=True)
     Path(OUTPUT).write_text(json.dumps(report,indent=1),encoding='utf-8')
     volume.commit()

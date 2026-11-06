@@ -56,6 +56,24 @@ Diễn giải:
 - Đo theo paper: bộ vukien2301 thấp hơn số trong NARVAL Table 1 khoảng 1.4 điểm ở student 0.6B, dù đổi backend,
   dtype hay phiên bản lm-eval. Vì vậy chỉ so tương đối, trên cùng một cách đo.
 
+## 3b. Heldout (chạy lại γ = 0.1 với code tối ưu, `crpd_raw-alpha0p03-gamma0p1-g01`, Modal `nuocb0739`)
+
+Chạy lại với code commit `23838ac` (DECISIONS 87–88): RM select +1.12 [0.46, 1.78] (43/21), nhất quán với
++1.18 của run gốc. `pd_diagnostics` trên 64 prompt test (không dùng để chọn):
+
+| Chỉ số | rho | γ = 0.1 | noend (bản ghim cũ) |
+|---|---:|---:|---:|
+| RM test so với rho | — | **+0.77 [+0.02, +1.51]**, 40/24 | −0.48 [−1.24, +0.23] |
+| Tỉ lệ EOS | 98.4% | 82.8% | 3.1% |
+| Độ dài trung bình | 247 | 526 | 1,011 |
+| Lặp 4-gram | 15.0% | 26.7% | 35% |
+| Log-ratio student−rho trên câu trả lời của rho | — | −0.06 nats/token | −1.1 nats/token |
+
+Lần đầu tiên một student CRPD hơn rho trên test với khoảng tin cậy không chứa 0. Nhưng chưa qua điều kiện:
+EOS 82.8% < 90%, câu trả lời dài gấp khoảng 2.1 lần rho, lặp nhiều hơn. Một phần mức tăng RM có thể đến từ độ dài
+(RM thường ưu tiên câu trả lời dài); chưa kiểm tra theo độ dài. Trong 99.8% cặp rho–T+, phía T+ được ưu tiên,
+nên student học theo T+ (viết dài, kết thúc bằng `<|endoftext|>`). File: `output/hda-x10-g01/`.
+
 ## 4. Chưa kiểm tra (bắt buộc trước khi dùng hoặc chạy full)
 
 - **Heldout `pd_diagnostics`** (RM test, tỉ lệ EOS, độ dài, độ lặp). Winogrande không phát hiện lỗi không dừng;

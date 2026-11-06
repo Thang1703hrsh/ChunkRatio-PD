@@ -540,3 +540,26 @@ distillation stage (`scripts/run_narval.py`); it has no SFT or teacher-DPO code 
     (`test_shards_record_rng_digests_that_replay`). Candidate shards: about 142 KB -> 2.3 KB in the smoke cache;
     x10 about 236 MB -> 4 MB of JSON written and read. Keys carry `rng_record: sha256`, so no store mixes the
     two formats. Nothing read the stored states.
+    Measured on nuocb0739 (gamma 0.1 rerun `crpd_raw-alpha0p03-gamma0p1-g01`, 5 November 2026): 37.4 min including
+    a first download of the 8B RM; stage seconds: collect_prefixes 171, collect_candidates 487 (601 with
+    head_val before), post_training_diagnostics 102, train_policy 1,360 of which selection 687 (generation 235,
+    RM load/transfer 375, RM scoring 77). Correction to 87(b): on the GPU the train records are not bit-identical
+    after dropping head_val, because token-budget generation groups change and batched FP32 logits round
+    differently near sampling boundaries (7,119 pairs vs 7,108; CPU tests with fixed grouping are identical).
+    The draws remain exact categorical samples of the same distributions; select RM +1.12 [0.46, 1.78] (43/21)
+    vs +1.18 [0.49, 1.86] (46/18) before.
+89. **Gamma sweep 0.1 / 0.05 / 0.03 and the pinned best run (user request, 6 November 2026).** x10, alpha 0.03,
+    150 x 128, nuocb0739, one collection (`CRPD_CACHE_TAG=shared`; the 0.05 and 0.03 runs collected nothing new,
+    about 20 min each instead of 37). Select RM vs rho (choice split): 0.1 +1.12 [0.46, 1.78]; 0.05 +1.00
+    [0.34, 1.65]; 0.03 +0.66 [0.09, 1.23]. Held-out test (64 prompts, confirmation only), student vs rho:
+    0.1 RM +0.77 [0.02, 1.51] (40/24), EOS 82.8%, length 526, repetition 26.7%; 0.05 RM +0.54 [-0.20, 1.28]
+    (43/20, sign p = 0.005), EOS 92.2%, length 370, repetition 21.3%; 0.03 RM +0.16 [-0.56, 0.88] (30/33),
+    EOS 89.1%, length 388; rho EOS 98.4%, length 247, repetition 15.0%. `pd_diagnostics` now also reports
+    per-prompt values and a length-controlled RM difference (measurement only): for 0.05 the RM difference
+    falls with length (slope -0.0056 per token, correlation -0.33), the OLS difference at equal length is
+    +1.23, and on the 59 prompts where both ended with EOS it is +0.93 (42/16, sign p = 0.001), so the gain is not
+    a length artifact. Winogrande (hf fp32): 0.1 58.01 (rerun), 0.05 57.85, 0.03 58.09, all within noise of rho
+    57.85 and of NARVAL riskkd 58.72. Rule applied: among runs whose held-out behaviour passes (EOS >= 90%), the
+    best select score wins: gamma 0.05. Gamma 0.1 keeps the larger held-out RM gain but fails the EOS gate.
+    Open: length is still 1.5x rho and repetition 21% vs 15%; the gamma 0.1 pd_diagnostics rerun with the
+    length-controlled fields did not write a new file (the old result stands).
