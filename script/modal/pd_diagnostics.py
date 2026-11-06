@@ -34,12 +34,14 @@ OUTPUT = f'output/pd_diagnostics_{RUN_NAME}.json' if RUN_NAME else f'output/pd_d
 REPO = Path(__file__).resolve().parents[2] if modal.is_local() else Path('/root/repo')
 
 app = modal.App(APP_NAME)
-volume = modal.Volume.from_name('crpd-qwen3-pilot-hda-x10')
+# CRPD_DIAG_VOLUME=crpd-qwen3-pilot-hda-x30 measures a run of the 2,000-prompt pilot (same test prompts as x10).
+VOLUME = os.environ.get('CRPD_DIAG_VOLUME','crpd-qwen3-pilot-hda-x10')
+volume = modal.Volume.from_name(VOLUME)
 image = (modal.Image.debian_slim(python_version='3.12')
          .pip_install('torch==2.6.0','transformers==4.52.4','numpy','safetensors','tokenizers','huggingface_hub')
          .env({'HF_HOME':'/vol/hf','TOKENIZERS_PARALLELISM':'false','PYTHONUNBUFFERED':'1',
                'PYTORCH_CUDA_ALLOC_CONF':'expandable_segments:True','CRPD_DIAG_TAG':TAG,
-               'CRPD_DIAG_RUN':RUN_NAME})
+               'CRPD_DIAG_RUN':RUN_NAME,'CRPD_DIAG_VOLUME':VOLUME})
          .add_local_dir(REPO/'chunkratio','/root/repo/chunkratio',ignore=['__pycache__']))
 
 

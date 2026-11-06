@@ -191,3 +191,23 @@ def test_cache_tag_is_independent_of_output_tag(monkeypatch) -> None:
     compact = load(CRPD_OUTPUT_TAG='g01',CRPD_CACHE_TAG='shared',CRPD_COMPACT='1')
     assert (compact.GPU_TAG,compact.CACHE_SUFFIX) == ('-g01-compact','-shared-compact')
     assert "'CRPD_CACHE_TAG':CACHE_TAG" in Path('script/modal/qwen3_pilot.py').read_text(encoding='utf-8')
+
+
+def test_x30_pilot_matches_x10_splits(monkeypatch) -> None:
+    """x30 (2,000-prompt pilot) keeps x10's UltraFeedback rows, states and speed settings, so its select and test
+    prompts equal x10's and its train prompts contain x10's; own app and volume (DECISIONS 90)."""
+    def load(scale):
+        """Import the launcher at one scale."""
+        for key,value in {'CRPD_SCALE':scale,'CRPD_TEACHERS':'hda','CRPD_TURBO':'1'}.items():
+            monkeypatch.setenv(key,value)
+        spec = importlib.util.spec_from_file_location('qwen3_pilot_x30',Path('script/modal/qwen3_pilot.py'))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    x10,x30 = load('x10'),load('x30')
+    assert x30.APP_NAME == 'crpd-qwen3-pilot-hda-x30'
+    assert x30.SIZES['subset'] == {'train':2000,'head_val':200,'select':64}
+    assert (x30.SIZES['steps'],x30.SIZES['selection_interval']) == (450,150)
+    for key in ('uf_train_rows','uf_test_rows','states_per_prompt','max_prompt_tokens','gpu_sampling',
+                'policy_tokens_per_microbatch','shared_prefix_scoring'):
+        assert x30.SIZES[key] == x10.SIZES[key]

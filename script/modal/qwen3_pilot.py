@@ -38,8 +38,8 @@ from pathlib import Path
 import modal
 
 SCALE = os.environ.get('CRPD_SCALE','full')
-if SCALE not in ('full','smoke','stability','x10'):
-    raise SystemExit('CRPD_SCALE must be full, smoke, stability or x10')
+if SCALE not in ('full','smoke','stability','x10','x30'):
+    raise SystemExit('CRPD_SCALE must be full, smoke, stability, x10 or x30')
 # smoke: plumbing and per-stage timing; stability: enough steps and RM checkpoints to see whether
 # policy training moves the right way. Both are small runs in their own app and volume.
 SMOKE = SCALE == 'smoke'
@@ -96,11 +96,16 @@ X10_SIZES = {'deita_rows':10000,'ultrachat_rows':10000,'uf_train_rows':20480,'uf
              'subset':{'train':640,'head_val':160,'select':64},'states_per_prompt':2,
              'steps':300,'batch_size':64,'selection_interval':150,'diagnostic_prompts':8,'diagnostic_replicates':4,
              'policy_microbatch_size':4,'selection_baseline':True,'max_prompt_tokens':2048}
-SIZES = {'smoke':SMOKE_SIZES,'stability':STABILITY_SIZES,'x10':X10_SIZES}.get(SCALE) or (HUB_SIZES if HUB else None)
+# x30: the 2,000-prompt pilot (DECISIONS 90). Same 20,480 UltraFeedback rows as x10, so the hash-ranked splits
+# agree: the 64 select prompts and the 64 test prompts are x10's, and the 2,000 train prompts contain x10's 640.
+# 2 states per prompt as x10; 450 steps keep about x10's passes over the pairs (3.1x the prompts, 3x the steps),
+# with RM selection every 150 steps.
+X30_SIZES = {**X10_SIZES,'subset':{'train':2000,'head_val':200,'select':64},'steps':450,'selection_interval':150}
+SIZES = {'smoke':SMOKE_SIZES,'stability':STABILITY_SIZES,'x10':X10_SIZES,'x30':X30_SIZES}.get(SCALE) or (HUB_SIZES if HUB else None)
 # hda x10: speed-only knobs raised toward the A100-80GB. The hub x10 run peaked at 53 GB in collect-candidates
 # with 32 rows (17.7 GB of it FP32 weights) and at 51 GB in train-policy with microbatch 4. Neither knob
 # changes results: collection groups never affect samples, and microbatches accumulate with per-pair weights.
-if HDA and SCALE == 'x10':
+if HDA and SCALE in ('x10','x30'):
     SIZES = {**SIZES,'generation_batch_size':48,'policy_microbatch_size':6}
 # hda: RM selection generates 16 select prompts per batch instead of one at a time (each selection took
 # about 15 min of the hub x10 train-policy). Same prompts, greedy rule and 1024-token cap.

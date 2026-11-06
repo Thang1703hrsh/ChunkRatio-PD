@@ -563,3 +563,16 @@ distillation stage (`scripts/run_narval.py`); it has no SFT or teacher-DPO code 
     best select score wins: gamma 0.05. Gamma 0.1 keeps the larger held-out RM gain but fails the EOS gate.
     Open: length is still 1.5x rho and repetition 21% vs 15%; the gamma 0.1 pd_diagnostics rerun with the
     length-controlled fields did not write a new file (the old result stands).
+90. **2,000-prompt pilot of gamma 0.05 (user request, 6 November 2026), fixed before collection.** Launcher scale
+    `x30` (own app and volume `crpd-qwen3-pilot-hda-x30`): crpd_raw, alpha 0.03, gamma 0.05, all turbo settings,
+    2 states per prompt, 2,000 train prompts (train-only collection), batch 128, 450 steps (about x10's 2.7 passes
+    over the pairs: about 22k pairs x 2.6), RM selection on the 64 select prompts every 150 steps plus the rho
+    baseline. Same 20,480 UltraFeedback rows as x10, so the hash-ranked splits agree: identical 64 select and 64
+    test prompts, and the train prompts contain x10's 640. Run name `crpd_raw-alpha0p03-gamma0p05-p2k`. After
+    training, a server-side chain (`script/modal/eval_vukien/pilot_benchmarks.py::after_pilot`) starts held-out
+    `pd_diagnostics` and Winogrande (5-shot) + TruthfulQA-MC2 (0-shot), hf fp32, lm-eval 0.4.9.2, for the pilot
+    student, the x10 gamma 0.05 student, rho and NARVAL riskkd, with paired tests. Cost estimate from the measured
+    x10 stage times: collection about 34 min (3.1x x10's 658 s), training about 34 min (4.5 s/step), selections
+    about 18 min, other about 10 min: about 1.6 h on an A100-80GB at about $3.46/h with RAM and CPU (about $5.5),
+    plus held-out diagnostics and benchmarks about $1.5: about $7-9 in total. nuocb0739 had used $12.08 of credit
+    this month before launch.
