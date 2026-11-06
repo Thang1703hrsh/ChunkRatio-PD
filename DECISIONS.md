@@ -621,3 +621,17 @@ distillation stage (`scripts/run_narval.py`); it has no SFT or teacher-DPO code 
     pd_diagnostics; benchmarks (`script/server/benchmarks.py`) use the hf fp32 harness of DECISIONS 91 in a
     separate environment (`requirements-eval.txt`). Time estimates in docs/SERVER.md are scaled from A100
     measurements and are not B200 measurements. Tests: `tests/test_server.py`, sharding tests in test_pipeline.py.
+94. **GPU memory plan for large GPUs (user request, 6 November 2026).** B200-class GPUs (about 180 GB) left most
+    memory idle with the A100-80GB settings. `chunkratio.riskkd.memory_plan(pair, gpu_gb)` sizes, from each pair's
+    resident FP32 weights and KV bytes per token: generation_tokens_per_batch, generation_max_rows,
+    score_tokens_per_batch, score_max_states and correction_generation_batch_size (scaled with the memory left
+    after the weights; an 80 GB GPU gets exactly the measured A100 values for the 0.6B pair), selection
+    generation of all 64 select prompts at once, and the number of training processes per GPU. The policy
+    microbatch stays at 8192 tokens (12288 measured slightly slower on an A100); spare memory instead runs two
+    gamma trainings per GPU for the 0.6B and Llama pairs (GPU utilisation about 33% while training). Opt-in
+    `release_teachers` (server configs set it): after the targets, T+ and T0 are fingerprint-checked and dropped
+    instead of parked in host RAM; nothing later reads them (`test_release_teachers_keeps_results`: identical
+    targets, student and diagnostics). run_pair.py reads GPU memory with nvidia-smi, prints the plan, halves the
+    collection budgets and resumes on a CUDA out-of-memory error, and reruns a training that ran out of memory
+    alone on a GPU. The B200 figures are computed, not measured; none of this changes results beyond FP32
+    rounding of the grouping. Tests: `test_memory_plan_scales_with_gpu_memory`, `test_release_teachers_in_server_configs`.

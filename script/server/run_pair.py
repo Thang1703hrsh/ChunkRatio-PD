@@ -38,8 +38,15 @@ def log(message: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {message}",flush=True)
 
 
+class StageFailed(Exception):
+    """A subprocess failed; `oom` when its log shows a CUDA out-of-memory error."""
+    def __init__(self, command: list[str], status: int, logfile: Path, oom: bool) -> None:
+        super().__init__(f'failed ({status}): {" ".join(command)} -- see {logfile}')
+        self.oom = oom
+
+
 def run(command: list[str], gpu: str | None, logfile: Path, dry: bool) -> None:
-    """One subprocess on one GPU (or CPU), output appended to its log file; raises on failure."""
+    """One subprocess on one GPU (or CPU), output appended to its log file; raises StageFailed on failure."""
     log(('DRY ' if dry else '')+(f'GPU {gpu}: ' if gpu is not None else 'CPU: ')+' '.join(command)+f'  > {logfile}')
     if dry:
         return
@@ -47,19 +54,42 @@ def run(command: list[str], gpu: str | None, logfile: Path, dry: bool) -> None:
     env = {**os.environ,'TOKENIZERS_PARALLELISM':'false','PYTORCH_CUDA_ALLOC_CONF':'expandable_segments:True'}
     if gpu is not None:
         env['CUDA_VISIBLE_DEVICES'] = gpu
+    start = logfile.stat().st_size if logfile.exists() else 0
     with open(logfile,'a',encoding='utf-8') as out:
         status = subprocess.run(command,cwd=ROOT,env=env,stdout=out,stderr=subprocess.STDOUT).returncode
     if status:
-        raise SystemExit(f'failed ({status}): {" ".join(command)} -- see {logfile}')
+        with open(logfile,encoding='utf-8',errors='replace') as source:
+            source.seek(start)
+            tail = source.read()[-20000:]
+        raise StageFailed(command,status,logfile,'out of memory' in tail.lower() or 'OutOfMemoryError' in tail)
 
 
-def parallel(jobs: list[tuple[list[str],Path]], gpus: list[str], dry: bool) -> None:
-    """Jobs spread over the GPUs, one job per GPU at a time."""
+def parallel(jobs: list[tuple[list[str],Path]], gpus: list[str], per_gpu: int, dry: bool) -> None:
+    """Jobs over `per_gpu` slots on each GPU. A job that runs out of GPU memory is retried alone on a GPU after
+    the others (results do not depend on how many processes share a GPU); any other failure stops the run."""
+    slots = [g for _ in range(per_gpu) for g in gpus]
+    retry = []
     def worker(index_job: tuple[int,tuple[list[str],Path]]) -> None:
         index,(command,logfile) = index_job
-        run(command,gpus[index % len(gpus)],logfile,dry)
-    with ThreadPoolExecutor(max_workers=len(gpus)) as pool:
+        try:
+            run(command,slots[index % len(slots)],logfile,dry)
+        except StageFailed as error:
+            if not (error.oom and per_gpu > 1):
+                raise
+            log(f'out of GPU memory with {per_gpu} processes per GPU; will retry alone: {logfile.name}')
+            retry.append((command,logfile))
+    with ThreadPoolExecutor(max_workers=len(slots)) as pool:
         list(pool.map(worker,enumerate(jobs)))
+    if retry:
+        parallel(retry,gpus,1,dry)
+
+
+def gpu_memory_gb(gpus: list[str]) -> float:
+    """Smallest total memory among the chosen GPUs (nvidia-smi), in GB."""
+    out = subprocess.run(['nvidia-smi','--query-gpu=index,memory.total','--format=csv,noheader,nounits'],
+                         capture_output=True,text=True,check=True).stdout
+    sizes = {line.split(',')[0].strip():float(line.split(',')[1])/1024 for line in out.strip().splitlines()}
+    return min(sizes[g] for g in gpus)
 
 
 def number(value: float) -> str:
@@ -82,8 +112,10 @@ def main() -> int:
     parser.add_argument('--selection-interval',type=int,default=None)
     parser.add_argument('--passes',type=float,default=1.0,help='full scale: passes over the training pairs')
     parser.add_argument('--selections',type=int,default=3,help='full scale: RM selections over the run')
+    parser.add_argument('--gpu-memory-gb',type=float,default=None,help='Per-GPU memory for the memory plan (default: nvidia-smi)')
+    parser.add_argument('--trainings-per-gpu',type=int,default=None,help='Override the memory plan')
     parser.add_argument('--policy-tokens',type=int,default=None,help='policy_tokens_per_microbatch (8192 measured on A100)')
-    parser.add_argument('--generation-tokens',type=int,default=None,help='generation_tokens_per_batch (163840 on A100)')
+    parser.add_argument('--generation-tokens',type=int,default=None,help='Override the planned generation_tokens_per_batch')
     parser.add_argument('--root',default='output/server')
     parser.add_argument('--stages',default=','.join(STAGES[:5]),help=f'Comma list from {STAGES}')
     parser.add_argument('--eval-python',default=None,help='Python of the lm-eval environment (benchmarks stage)')
@@ -215,8 +247,14 @@ def main() -> int:
         revisions = json.loads(revisions_path.read_text(encoding='utf-8'))
         split_hash = json.loads((data/'ultrafeedback_train.splits.json').read_text(encoding='utf-8'))['assignment_sha256']
         evidence = json.loads(evidence_path.read_text(encoding='utf-8'))
-    speed = {k:v for k,v in (('policy_tokens_per_microbatch',args.policy_tokens),
-                             ('generation_tokens_per_batch',args.generation_tokens)) if v}
+    # Memory plan (DECISIONS 94): collection budgets and training processes per GPU from the GPU size.
+    from chunkratio.riskkd import memory_plan
+    gpu_gb = args.gpu_memory_gb or (180. if args.dry_run else gpu_memory_gb(gpus))
+    plan = memory_plan(args.pair,gpu_gb)
+    per_gpu = args.trainings_per_gpu or plan['trainings_per_gpu']
+    speed = {**plan['collection'],**{k:v for k,v in (('policy_tokens_per_microbatch',args.policy_tokens),
+                                                     ('generation_tokens_per_batch',args.generation_tokens)) if v}}
+    log(f"memory plan for {gpu_gb:.0f} GB GPUs: {speed}, {per_gpu} training process(es) per GPU")
     splits = ['train'] if args.variant == 'crpd_raw' else None
     steps,interval = (args.steps,args.selection_interval) if args.steps else DEFAULT_STEPS.get(args.scale,(None,None))
     cache = str(work/'cache')
@@ -250,7 +288,22 @@ def main() -> int:
             jobs.append((commands,logs/f'collect-shard{index}.log',gpu))
         def worker(job: tuple[list[list[str]],Path,str]) -> None:
             for command in job[0]:
-                run(command,job[2],job[1],args.dry_run)
+                for attempt in range(3):
+                    try:
+                        run(command,job[2],job[1],args.dry_run)
+                        break
+                    except StageFailed as error:
+                        if not error.oom or attempt == 2:
+                            raise
+                        # Halve the collection budgets and resume from the shards already written.
+                        path = Path(command[command.index('--config')+1])
+                        cfg = json.loads(path.read_text(encoding='utf-8'))
+                        for key in ('generation_tokens_per_batch','generation_max_rows','score_tokens_per_batch',
+                                    'score_max_states','correction_generation_batch_size'):
+                            if cfg.get(key):
+                                cfg[key] = max(1,cfg[key]//2)
+                        write_json(path,cfg)
+                        log(f'out of GPU memory in {path.name}; halved the collection budgets and resuming')
         log(f'collect: {len(gpus)} worker(s)')
         with ThreadPoolExecutor(max_workers=len(gpus)) as pool:
             list(pool.map(worker,jobs))
@@ -269,15 +322,16 @@ def main() -> int:
                 write_json(path,cfg)
                 log(f'{names[g]}: {pairs} pairs -> {total} steps, selection every {cfg["selection_interval"]}')
         parallel([([py,'-m','chunkratio','evaluate','--config',str(paths[g])],logs/f'{names[g]}.log') for g in gammas],
-                 gpus,args.dry_run)
+                 gpus,per_gpu,args.dry_run)
 
     runs = [work/'runs'/names[g]/'seed0' for g in gammas]
     if 'heldout' in stages:
         parallel([([py,'script/server/heldout_eval.py','--run',str(r),'--test',str(test_file)],logs/f'heldout-{r.parent.name}.log')
-                  for r in runs],gpus,args.dry_run)
+                  for r in runs],gpus,per_gpu,args.dry_run)
     if 'benchmarks' in stages:
         run([args.eval_python,'script/server/benchmarks.py','--pair',args.pair,'--runs',*map(str,runs),
-             '--gpus',','.join(gpus),'--output',str(work/'benchmarks')],None,logs/'benchmarks.log',args.dry_run)
+             '--gpus',','.join(g for _ in range(per_gpu) for g in gpus),'--output',str(work/'benchmarks')],
+            None,logs/'benchmarks.log',args.dry_run)
     if not args.dry_run:
         for r in runs:
             if (r/'heldout.json').exists():

@@ -51,3 +51,30 @@ def test_run_pair_dry_run_plans_every_stage(pair: str) -> None:
                          capture_output=True,text=True,check=True).stdout
     assert out.count('collect-candidates') == 3 and out.count(' evaluate ') == 2 and out.count('heldout_eval.py') == 2
     assert 'GPU 2:' in out and not Path('output/dry-run-test').exists()
+
+
+def test_memory_plan_scales_with_gpu_memory() -> None:
+    """An A100-80GB gets the measured 0.6B settings; a 180 GB GPU gets larger collection budgets and two training
+    processes for the small pairs; FP32 8B teachers that do not fit fail clearly (DECISIONS 94)."""
+    from chunkratio.riskkd import memory_plan
+    a100 = memory_plan('qwen3_1p7b_to_0p6b',80)
+    assert (a100['collection']['generation_tokens_per_batch'],a100['collection']['score_tokens_per_batch'],
+            a100['collection']['score_max_states'],a100['trainings_per_gpu']) == (163840,16384,48,1)
+    b200 = memory_plan('qwen3_1p7b_to_0p6b',180)
+    assert b200['collection']['generation_tokens_per_batch'] > 2*163840 and b200['trainings_per_gpu'] == 2
+    assert memory_plan('qwen3_8b_to_1p7b',180)['trainings_per_gpu'] == 1
+    assert memory_plan('llama31_8b_to_llama32_1b',180)['trainings_per_gpu'] == 2
+    for pair in ('qwen3_8b_to_1p7b','llama31_8b_to_llama32_1b'):
+        with pytest.raises(ValueError,match='not enough'):
+            memory_plan(pair,80)
+
+
+def test_release_teachers_in_server_configs() -> None:
+    """Server configs drop the teachers after targets; the flag is validated."""
+    spec = RISKKD['qwen3_8b_to_1p7b']
+    protocol = json.loads(Path(f"config/crpd/narval/{spec['protocol']}.json").read_text(encoding='utf-8-sig'))
+    cfg = server_config('qwen3_8b_to_1p7b','crpd_raw',REVISIONS,'h','d.jsonl','o','c',alpha=.03,protocol=protocol,
+                        evidence=EVIDENCE)
+    assert cfg['release_teachers'] is True
+    with pytest.raises(ValueError,match='release_teachers'):
+        validate({**cfg,'release_teachers':'yes'})

@@ -87,15 +87,30 @@ These are **estimates**, scaled from the A100-80GB runs measured on Modal. The a
 
 An x10 run (640 prompts) takes roughly 15–45 minutes depending on the pair.
 
-**Memory.**
-- **GPU:** two FP32 8B teachers (2 × 32 GB) plus 8B KV caches within `generation_tokens_per_batch` fit on one
-  B200.
-- **Host RAM:** each training process keeps the parked teachers and the selection RM in RAM. That is about
-  100 GB for the 8B pairs and about 50 GB for the 0.6B pair. With 4 γ in parallel on an 8B pair, plan for about
-  400 GB, or run fewer γ.
+### Memory plan (automatic)
 
-`--policy-tokens` and `--generation-tokens` raise the batch budgets for the larger B200 memory. They do not
-change results beyond FP32 rounding, but they are not benchmarked yet; the defaults are the A100-80GB values.
+`run_pair.py` reads each GPU's memory with `nvidia-smi` (override with `--gpu-memory-gb`) and fills it. The plan
+is printed at start, and it changes no result beyond FP32 rounding.
+
+| Per GPU (≈180 GB B200) | 0.6B pair | Qwen 8B → 1.7B | Llama 8B → 1B | A100-80GB (measured) |
+|---|---:|---:|---:|---:|
+| Generation tokens per batch | 450,560 | 212,992 | 245,760 | 163,840 |
+| Scoring tokens per batch / states | 45,056 / 128 | 24,576 / 80 | 28,672 / 80 | 16,384 / 48 |
+| Training processes per GPU | **2** | 1 | **2** | 1 |
+
+- **Collection:** the batch budgets grow with the memory left after the three FP32 models. Two FP32 8B
+  teachers need about 98 GB per GPU, so the 8B pairs refuse to run on 80 GB GPUs.
+- **Training:** the policy microbatch stays at the measured 8,192 tokens, because 12,288 was slightly slower on
+  an A100. The spare memory runs **two γ per GPU** where they fit, since GPU utilisation while training was about
+  33%. Override with `--trainings-per-gpu`.
+- **Host RAM:** each training process drops the two teachers once the targets exist (`release_teachers`), so it
+  no longer keeps 64 GB of FP32 8B teachers in RAM. Plan for about 40 GB per training process, mostly the
+  selection RM.
+- **Out-of-memory fallback:** the plan for B200 is computed, not measured. If a collection worker runs out of
+  memory, its budgets are halved and it resumes from its shards. If a training process runs out with two per GPU,
+  it is rerun alone on a GPU.
+
+`--policy-tokens` and `--generation-tokens` override the plan.
 
 ## 5. Output layout
 

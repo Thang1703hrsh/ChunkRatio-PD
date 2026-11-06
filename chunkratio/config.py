@@ -70,6 +70,8 @@ def validate(cfg: dict[str,Any]) -> None:
         raise ValueError('gpu_sampling must be a boolean')
     if not isinstance(cfg.get('shared_prefix_scoring',False),bool):
         raise ValueError('shared_prefix_scoring must be a boolean')
+    if not isinstance(cfg.get('release_teachers',False),bool):
+        raise ValueError('release_teachers must be a boolean')
     if not isinstance(cfg.get('score_end_token',True),bool):
         raise ValueError('score_end_token must be a boolean')
     # Correction returns, the head and the exponential audit always score the end-of-turn token, so an

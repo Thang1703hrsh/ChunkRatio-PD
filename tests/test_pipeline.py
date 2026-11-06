@@ -549,3 +549,22 @@ def test_collection_shard_validation() -> None:
     for bad in ({'index':4,'count':4},{'index':0},{'index':'0','count':2},[0,2]):
         with pytest.raises(ValueError,match='collection_shard'):
             validate({**base,'collection_shard':bad})
+
+
+def test_release_teachers_keeps_results(tmp_path: Path) -> None:
+    """release_teachers drops T+ and T0 after their fingerprints are checked, once targets exist; targets, the
+    trained student and the diagnostics' student/rho scores equal the parking run (DECISIONS 94)."""
+    import torch
+    from chunkratio.artifacts import read_json
+    from chunkratio.pipeline import pipeline
+    base = {**load_config('config/crpd/smoke.json'),'variant':'crpd_raw','steps':2}
+    a = pipeline({**base,'output':str(tmp_path/'park')},'evaluate')
+    b = pipeline({**base,'release_teachers':True,'output':str(tmp_path/'release')},'evaluate')
+    assert a['teachers_released_after_targets'] == [] and b['teachers_released_after_targets'] == ['teacher_plus','teacher_base']
+    sa = torch.load(tmp_path/'park'/'student.pt',weights_only=True)['state_dict']
+    sb = torch.load(tmp_path/'release'/'student.pt',weights_only=True)['state_dict']
+    assert all(torch.equal(sa[k],sb[k]) for k in sa)
+    assert a['pair_diagnostics'] == b['pair_diagnostics'] and a['candidate_coverage'] == b['candidate_coverage']
+    ta = read_json(Path(read_json(tmp_path/'park'/'target_index.json')['path']))
+    tb = read_json(Path(read_json(tmp_path/'release'/'target_index.json')['path']))
+    assert ta['pairs'] == tb['pairs']

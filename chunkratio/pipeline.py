@@ -225,8 +225,20 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
     # Targets are built, so the frozen teachers are idle from here on: park them in host memory to
     # free GPU room (two FP32 1.7B teachers = 13.6 GB) for the selection RM and the student optimizer.
     # Their fingerprints are still checked after training.
-    for role in ('teacher_plus','teacher_base'):
-        models[role].to('cpu')
+    # Opt-in release_teachers (DECISIONS 94): check their fingerprints now and drop them instead, so a process
+    # holds no teacher at all while it trains (two FP32 8B teachers = 64 GB of host RAM per process otherwise).
+    # Nothing after this point reads a teacher.
+    released = []
+    if cfg.get('release_teachers',False):
+        for role in ('teacher_plus','teacher_base'):
+            assert fingerprint(models[role]) == identities[role],'frozen model parameters changed'
+            del models[role]
+            released.append(role)
+        import gc
+        gc.collect()
+    else:
+        for role in ('teacher_plus','teacher_base'):
+            models[role].to('cpu')
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     lap('build_targets')
@@ -240,7 +252,8 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
     lap('train_policy')
     write_json(output/'policy_index.json',{'path':str(policy_path),'code_revision':revision})
     frozen_after = {role:fingerprint(model) for role,model in models.items()}
-    assert identities == frozen_after,'frozen model parameters changed'
+    assert {role:identities[role] for role in models} == frozen_after,'frozen model parameters changed'
+    assert set(frozen_after)|set(released) == set(identities)
     if head is not None:
         assert fingerprint(head) == head_meta['hash'] and all(p.grad is None for p in head.parameters())
     lap('fingerprint')
@@ -306,6 +319,7 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
             for role,count in record.get(field,{}).items():
                 destination[role] = destination.get(role,0)+count
     result = {'synthetic':cfg.get('synthetic',False),'route':route,'variant':cfg['variant'],'policy':policy,
+              'teachers_released_after_targets':released,
               'head':head_meta,'pair_diagnostics':weighted,'correction_audit':sibling_audit,'candidate_coverage':observed_mass,
               'audit':targets['audits'],'counts':{'states':len(states),'pairs':len(targets['pairs']),
                                                 'correction_trajectories':len(corrections)},

@@ -71,6 +71,48 @@ SPEED = {'gpu_sampling':True,'generation_tokens_per_batch':163840,'generation_ma
          'max_prompt_tokens':2048,'states_per_prompt':2,'selection_baseline':True}
 
 
+# GPU memory model per pair (DECISIONS 94). weights_gb: the three FP32 roles resident during collection.
+# kv_kb: FP32 KV cache per token of the largest generating model (2 x layers x KV heads x head dim x 4 bytes:
+# Qwen3-1.7B 229 KB, Qwen3-8B 295 KB, Llama-3.1-8B 262 KB). train_gb: peak of one training process. The
+# Qwen3-0.6B figure is measured (54.6 GB on an A100-80GB at policy budget 8192, plus margin); the others scale its
+# per-token activation and logit memory by width and add the student's weights, gradients, Adam states and rho;
+# load_gb: the start of a training process, before the teachers are released.
+MEMORY = {
+    'qwen3_1p7b_to_0p6b':{'weights_gb':16.2,'kv_kb':229,'train_gb':60.,'load_gb':19.},
+    'qwen3_8b_to_1p7b':{'weights_gb':72.5,'kv_kb':295,'train_gb':100.,'load_gb':80.},
+    'llama31_8b_to_llama32_1b':{'weights_gb':69.,'kv_kb':262,'train_gb':70.,'load_gb':74.},
+}
+# The A100-80GB settings above were measured on the 0.6B pair with 51 GB free after its weights (0.92 x 80 - 6 - 16.2).
+A100_FREE_GB = 51.4
+
+
+def memory_plan(pair: str, gpu_gb: float) -> dict[str,Any]:
+    """Collection batch budgets and training processes per GPU that fill a GPU of `gpu_gb` (DECISIONS 94).
+
+    Generation and scoring budgets grow with the memory left after the resident weights (KV cache for generation
+    in proportion to KV bytes per token); grouping never changes a job's sampled distribution, only FP32 rounding.
+    The policy microbatch budget stays at the measured 8192 tokens (12288 was slightly slower on an A100), so the
+    extra memory runs several training processes per GPU when they fit (GPU utilisation was about 33% while
+    training on an A100)."""
+    spec = MEMORY[pair]
+    usable = .92*gpu_gb-6
+    free = usable-spec['weights_gb']
+    if free < 20:
+        raise ValueError(f"{pair} needs about {spec['weights_gb']+26:.0f} GB per GPU for collection (FP32 teachers); "
+                         f'{gpu_gb:.0f} GB is not enough')
+    ratio = max(1.,free/A100_FREE_GB) if pair == 'qwen3_1p7b_to_0p6b' else free/A100_FREE_GB
+    round_to = lambda value,step: max(step,int(value//step)*step)
+    collection = {'generation_tokens_per_batch':round_to(163840*ratio*229/spec['kv_kb'],8192),
+                  'generation_max_rows':min(1024,round_to(384*ratio,32)),
+                  'score_tokens_per_batch':min(65536,round_to(16384*ratio,4096)),
+                  'score_max_states':min(192,round_to(48*ratio,8)),
+                  'correction_generation_batch_size':min(512,round_to(96*ratio,16)),
+                  'selection_generation_batch_size':64}
+    per_gpu = max(1,int(usable//max(spec['train_gb'],spec['load_gb'])))
+    return {'gpu_gb':gpu_gb,'collection':collection,'trainings_per_gpu':per_gpu,
+            'estimate':{'usable_gb':round(usable,1),'free_after_weights_gb':round(free,1)}}
+
+
 def assumptions(pair: str) -> dict[str,str]:
     """Unverified settings recorded in every config of the pair."""
     spec = RISKKD[pair]
@@ -111,6 +153,8 @@ def server_config(pair: str, variant: str, revisions: dict[str,str], split_hash:
         cfg['pair_sources'] = pair_sources
     if collection_splits is not None:
         cfg['collection_splits'] = collection_splits
-    # A finished student holds the same weights as its HF export.
+    # A finished student holds the same weights as its HF export; the teachers are dropped once the targets exist,
+    # so a training process keeps neither FP32 teacher in GPU or host memory (DECISIONS 94).
     cfg['save_student_state_dict'] = False
+    cfg['release_teachers'] = True
     return cfg
