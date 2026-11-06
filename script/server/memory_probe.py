@@ -62,7 +62,8 @@ def main() -> int:
     from chunkratio.scoring import sibling_logprobs
     spec = RISKKD[args.pair]
     nvml = NvmlPeak()
-    gpu_gb = args.gpu_memory_gb or nvml.total_gb
+    # Plan with run_pair.py's convention (nvidia-smi MiB / 1024), so the probe measures the budgets the server uses.
+    gpu_gb = args.gpu_memory_gb or nvml.total_gb*1e9/2**30
     plan = memory_plan(args.pair,gpu_gb)
     report = {'pair':args.pair,'gpu':torch.cuda.get_device_name(0),'gpu_total_gb':round(nvml.total_gb,1),
               'plan':plan,'phases':{}}
@@ -143,7 +144,7 @@ def main() -> int:
     student = AutoModelForCausalLM.from_pretrained(ckpt['student_ref']['repo'],revision=ckpt['student_ref']['revision'],
                                                    torch_dtype=torch.float32).to('cuda').eval()
     optimizer = torch.optim.AdamW(student.parameters(),lr=1e-6,weight_decay=0.)
-    depth = statistics.median(lengths)+256  # a mid-response state
+    depth = int(statistics.median(lengths))+256  # a mid-response state
     state = (rows_of(1)[0]*4)[:depth]
     for budget in (8192,16384,24576):
         pairs = max(1,budget//(depth+32))
@@ -180,10 +181,24 @@ def main() -> int:
     # Recommendation: bytes per token measured above, filled to 90% of the device.
     usable = .9*nvml.total_gb
     rec = {}
-    g = report['phases'].get('generate_x1',{})
+    # A larger budget is recommended only when the larger probe was measurably faster (B200, 6 November 2026:
+    # generation x1.5 was 13% slower per token and scoring x2 only 1.6% faster, so memory was not the limit).
+    phases = report['phases']
+    def rate(name: str, unit: str) -> float | None:
+        p = phases.get(name,{})
+        return p[unit]/p['seconds'] if p.get('ok') and p.get('seconds') else None
+    g = phases.get('generate_x1',{})
     if g.get('ok'):
         per_token = max(1e-9,(g['torch_peak_reserved_gb']-resident/1e9)/(g['rows']*(long+512)))
-        rec['generation_tokens_per_batch'] = int((usable-resident/1e9)/per_token)//8192*8192
+        fill = int((usable-resident/1e9)/per_token)//8192*8192
+        small,large = rate('generate_x1','new_tokens'),rate('generate_x1.5','new_tokens')
+        rec['generation_tokens_per_batch'] = (fill if small and large and large > 1.05*small
+                                              else collection['generation_tokens_per_batch'])
+        rec['generation_speedup_x1.5'] = round(large/small,3) if small and large else None
+    small,large = rate('score_x1','chunks'),rate('score_x2','chunks')
+    if small and large:
+        rec['score_speedup_x2'] = round(large/small,3)
+        rec['score_tokens_per_batch'] = collection['score_tokens_per_batch']*(2 if large > 1.05*small else 1)
     peaks = {k:v['nvml_peak_used_gb'] for k,v in report['phases'].items() if k.startswith('train_') and v.get('ok')}
     if peaks:
         rec['training_peak_gb_at_8192'] = peaks.get('train_8192')

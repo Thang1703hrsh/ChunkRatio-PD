@@ -1,6 +1,10 @@
 """Modal: lightweight smoke test and GPU memory probe of the server launcher on one B200 per pair (DECISIONS 95).
 
-For each pair, in its own container with one B200:
+For each pair:
+  0. `prepare` (CPU container, no GPU billed): run_pair.py --stages prepare downloads UltraFeedback, tokenizes it and
+     warms the Hugging Face cache on the volume with the trio and the 8B selection RM; on success it spawns `smoke`;
+     on failure no GPU container starts.
+Then in its own container with one B200 (`smoke`), with every model already on the volume:
   1. script/server/run_pair.py --scale smoke (32 train prompts, train-only collection, 2 gammas trained at once on the
      GPU, 10 steps, held-out check on 16 test prompts), with --skip-verify (no 16-32 GB base-model download);
   2. script/server/memory_probe.py at the planned full batch sizes (the smoke batches are far smaller);
@@ -8,7 +12,7 @@ For each pair, in its own container with one B200:
 Results: volume crpd-b200-smoke, output/<pair>/summary.json (and the run logs).
 
   modal deploy script/modal/b200_smoke.py
-  python -c "import modal; [print(modal.Function.from_name('crpd-b200-smoke','smoke').spawn(p).object_id) for p in
+  python -c "import modal; [print(modal.Function.from_name('crpd-b200-smoke','prepare').spawn(p).object_id) for p in
              ('qwen3_1p7b_to_0p6b','qwen3_8b_to_1p7b','llama31_8b_to_llama32_1b')]"
 """
 from __future__ import annotations
@@ -24,6 +28,9 @@ import modal
 
 APP = 'crpd-b200-smoke'
 REPO = Path(__file__).resolve().parents[2] if modal.is_local() else Path('/root/repo')
+# The image has no git and no .git: provenance takes the commit from CRPD_CODE_REVISION (artifacts.code_revision).
+REVISION = (subprocess.check_output(['git','rev-parse','HEAD'],cwd=REPO,text=True).strip() if modal.is_local()
+            else 'remote')
 app = modal.App(APP)
 volume = modal.Volume.from_name(APP,create_if_missing=True)
 image = (modal.Image.debian_slim(python_version='3.12')
@@ -32,11 +39,52 @@ image = (modal.Image.debian_slim(python_version='3.12')
          .pip_install('transformers==4.52.4','datasets==3.5.0','numpy','safetensors','tokenizers','huggingface_hub',
                       'hf_transfer','nvidia-ml-py','pyyaml')
          .env({'HF_HOME':'/vol/hf','HF_HUB_ENABLE_HF_TRANSFER':'1','TOKENIZERS_PARALLELISM':'false',
-               'PYTHONUNBUFFERED':'1','PYTORCH_CUDA_ALLOC_CONF':'expandable_segments:True'})
+               'PYTHONUNBUFFERED':'1','PYTORCH_CUDA_ALLOC_CONF':'expandable_segments:True',
+               'CRPD_CODE_REVISION':REVISION})
          .add_local_dir(REPO/'chunkratio','/root/repo/chunkratio',ignore=['__pycache__'])
          .add_local_dir(REPO/'script'/'server','/root/repo/script/server',ignore=['__pycache__'])
          .add_local_dir(REPO/'config'/'crpd','/root/repo/config/crpd')
          .add_local_dir(REPO/'reference','/root/repo/reference'))
+
+
+def repo_root(pair: str) -> Path:
+    """Configs require relative paths (cache_root): run from the repo with output/ linked to the volume."""
+    import os
+    os.chdir('/root/repo')
+    Path('/vol/output').mkdir(parents=True,exist_ok=True)
+    if not Path('output').exists():
+        os.symlink('/vol/output','output')
+    root = Path('output')/pair
+    root.mkdir(parents=True,exist_ok=True)
+    return root
+
+
+def launcher(pair: str, root: Path) -> list[str]:
+    """Two gammas at once only where the memory plan runs two trainings per GPU (Qwen3-8B: one process, one gamma:
+    forcing two would run out of memory and rerun alone, paying the B200 twice)."""
+    if '/root/repo' not in sys.path:
+        sys.path.insert(0,'/root/repo')
+    from chunkratio.riskkd import memory_plan
+    two =memory_plan(pair,179.)['trainings_per_gpu'] >= 2
+    return [sys.executable,'script/server/run_pair.py','--pair',pair,'--scale','smoke','--gpus','0',
+            '--gammas','0.05,0.03' if two else '0.05','--skip-verify','--root',str(root/'server')]
+
+
+@app.function(image=image,cpu=4.0,memory=16384,timeout=3600,volumes={'/vol':volume})
+def prepare(pair: str) -> str:
+    """CPU only: downloads, tokenization and HF cache warm-up; spawns the B200 part only when they succeed."""
+    root = repo_root(pair)
+    start = time.time()
+    # --gpu-memory-gb: no nvidia-smi here; the configs written now are rewritten by the GPU container.
+    with open(root/'prepare.log','w',encoding='utf-8') as out:
+        status = subprocess.run(launcher(pair,root)+['--stages','prepare','--gpu-memory-gb','179'],
+                                stdout=out,stderr=subprocess.STDOUT).returncode
+    (root/'prepare_timing.json').write_text(json.dumps({'seconds':round(time.time()-start,1),'status':status,
+                                                        'container':'cpu'}))
+    volume.commit()
+    if status:
+        raise RuntimeError(f'prepare failed ({status}) for {pair}: see volume {APP} {root}/prepare.log; no GPU started')
+    return smoke.spawn(pair).object_id
 
 
 @app.function(image=image,gpu='B200',cpu=8.0,memory=196608,timeout=3*3600,volumes={'/vol':volume})
@@ -53,9 +101,9 @@ def smoke(pair: str) -> dict:
             samples.append((time.time(),stage[0],info.used/1e9,util))
             time.sleep(.5)
     threading.Thread(target=sample,daemon=True).start()
-    root = Path('/vol/output')/pair
-    root.mkdir(parents=True,exist_ok=True)
-    timings = {}
+    root = repo_root(pair)
+    timing = root/'prepare_timing.json'
+    timings = {'prepare_cpu':json.loads(timing.read_text())} if timing.exists() else {}
     def step(name: str, command: list[str]) -> int:
         stage[0] = name
         start = time.time()
@@ -65,13 +113,10 @@ def smoke(pair: str) -> dict:
         volume.commit()
         return status
     py = sys.executable
-    base = [py,'script/server/run_pair.py','--pair',pair,'--scale','smoke','--gpus','0','--gammas','0.05,0.03',
-            '--trainings-per-gpu','2','--skip-verify','--root',str(root/'server')]
-    status = step('prepare',base+['--stages','prepare'])
+    base = launcher(pair,root)
+    status = step('collect',base+['--stages','collect'])
     if status == 0:
-        status = step('collect',base+['--stages','collect'])
-    if status == 0:
-        status = step('train_2_per_gpu',base+['--stages','train'])
+        status = step('train',base+['--stages','train'])
     if status == 0:
         step('heldout',base+['--stages','heldout'])
     prepared = root/'server'/pair/'data'/'rows2048'/'ultrafeedback_train.jsonl'
@@ -112,5 +157,6 @@ def smoke(pair: str) -> dict:
 @app.local_entrypoint()
 def main():
     pairs = ('qwen3_1p7b_to_0p6b','qwen3_8b_to_1p7b','llama31_8b_to_llama32_1b')
-    for result in smoke.map(pairs,return_exceptions=True):
-        print(json.dumps(result,default=str)[:4000])
+    # CPU prepare first; each returns the id of the B200 call it spawned (none when prepare failed).
+    for pair,result in zip(pairs,prepare.map(pairs,return_exceptions=True)):
+        print(pair,result)

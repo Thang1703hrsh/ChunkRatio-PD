@@ -643,3 +643,40 @@ distillation stage (`scripts/run_narval.py`); it has no SFT or teacher-DPO code 
     NVML peaks and throughput for loading, T+ generation (planned budget and 1.5x), three-role shared-prefix
     scoring (planned and 2x), a training microbatch at 8192/16384/24576 policy tokens with the teachers released,
     and the 8B selection RM. An NVML sampler covers the whole container. The probe also runs on the server itself.
+96. **B200 memory measurement: budgets unchanged (user request, 6 November 2026).** The first Modal B200 run
+    (nuocb0739, stopped by the workspace spend limit) measured, with the three roles resident and a 90th-percentile
+    prompt: qwen3_1p7b_to_0p6b T+ generation at 491,520 tokens 151 GB NVML, 1,414 new tokens/s; at 1.5x 192 GB
+    (full), 1,232 tokens/s (13% slower); scoring at 49,152 tokens 104 GB, 44.3 chunks/s; at 2x 192 GB, 45.0 chunks/s
+    (+1.6%); qwen3_8b_to_1p7b weights 72.4 GB, generation at 237,568 tokens 142 GB. GPU utilisation was about 89%:
+    collection is compute-bound on a B200, so the memory left over buys no speed and `memory_plan` keeps its values
+    (run_pair.py plans a B200 at 179 GiB, below the probed budgets). Not measured: the Llama pair, training
+    microbatches (the probe crashed on a float slice index, fixed) and the RM. Fixes: b200_smoke.py runs from the
+    repo with output/ linked to the volume (configs require a relative cache_root) and sets CRPD_CODE_REVISION (the
+    image has no git); memory_probe.py plans in GiB as run_pair.py does and recommends a larger budget only when the
+    larger probe was more than 5% faster. Partial data: output/b200-smoke-partial/. To cut Modal cost, b200_smoke.py runs the prepare stage (downloads, tokenization, HF
+    cache warm-up) in a CPU-only container that spawns the B200 container only on success, and smoke runs two
+    gammas at once only where memory_plan allows two trainings per GPU (Qwen3-8B: one gamma; forcing two would
+    run out of memory and rerun alone).
+97. **Hub push and evaluation of pushed students (user request, 6 November 2026).** run_pair.py gains a `push` stage
+    (script/server/push_hub.py): one commit per run with the exported student, a model card and
+    crpd_provenance.json; private unless `--hub-public`; after the commit the Hub safetensors sha256 are compared
+    with the local files and `<run>/hub.json` records repo, commit and the check. Refused: runs whose checkpoint
+    selection kept the reference (the student would be rho), runs without heldout.json, and non-full scales unless
+    `--hub-allow-pilot` (pilot students are not the method). benchmarks.py `--from-hub` evaluates the recorded
+    commits (only verified pushes) and `--models name=repo[@revision]` adds any Hub model. Recommended push set:
+    one full-scale student per pair at the gamma chosen on x10 by select RM among runs with held-out EOS >= 90%,
+    plus at most one pre-declared ablation per pair; choosing among pushed checkpoints by benchmark scores would be
+    test-based selection. Guide: script/server/README.md. Tests: test_push_hub_*, test_run_pair_push_guards_and_plan.
+98. **Two-B200 utilisation (user request, 6 November 2026).** One full-data gamma trains on one GPU, so a single
+    pair at a time left the other B200 idle for hours, and the CPU stages and the rho/NARVAL benchmarks held the
+    GPUs. Changes (none alters a result; the shard union is the single-process collection for any shard count,
+    `in_shard` hashes the prompt id): run_pair.py `--collect-shards K --shard-indices` (shard configs named
+    `collect-shard<i>of<K>.json`); full-scale `build-targets` of all gammas in parallel; rho/NARVAL benchmarks on
+    GPUs no training slot uses, during training. New `script/server/run_all.py`: a greedy list scheduler over GPU
+    half-units and one CPU lane for several pairs (jobs prep, collect/i, train/g, heldout/g, bench-base, bench,
+    push; priority train > heldout > collect > bench, then pair order; OOM beside another job reruns on a whole
+    GPU; a failure stops only its pair; finished-job marks make reruns skip them). Not done: data-parallel training
+    of one gamma over both GPUs (it would change the optimizer arithmetic). A simulation on the real job graph with
+    estimated hours (A100-derived, not B200-measured) gives about 36 h for the three pairs in the order Llama,
+    Qwen3-8B, Qwen3-0.6B, against about 44 h one pair after another; the bound for two fully busy GPUs is about 33.5 h.
+    Tests: test_scheduler_*, test_run_all_dry_run_plans_pairs.

@@ -50,13 +50,33 @@ def main() -> int:
     parser.add_argument('--runs',nargs='*',default=[],help='Finished CRPD run folders (each holds student/)')
     parser.add_argument('--gpus',default='0')
     parser.add_argument('--output',required=True)
+    parser.add_argument('--from-hub',action='store_true',
+                        help='Evaluate each run as pushed (repo and commit from <run>/hub.json) instead of its local student/')
+    parser.add_argument('--models',nargs='*',default=[],
+                        help='Extra Hub models as name=repo or name=repo@revision (e.g. a pushed student elsewhere)')
     args = parser.parse_args()
     from chunkratio.riskkd import RISKKD
     spec = RISKKD[args.pair]
     rho,narval = spec['checkpoints']['student_ref'],spec['narval']
     models = {'rho_sft':f"{rho['repo']},revision={rho['revision']}",'narval':f"{narval['repo']},revision={narval['revision']}"}
     for run in args.runs:
-        models[Path(run).parent.name if Path(run).name == 'seed0' else Path(run).name] = str(Path(run)/'student')
+        name = Path(run).parent.name if Path(run).name == 'seed0' else Path(run).name
+        if args.from_hub:
+            hub = Path(run)/'hub.json'
+            if not hub.exists():
+                raise SystemExit(f'{run}: no hub.json; push it first (run_pair.py --stages push)')
+            record = json.loads(hub.read_text(encoding='utf-8'))
+            if not record.get('verified'):
+                raise SystemExit(f"{record['repo']}: the pushed weights were not verified against the local run")
+            models[name] = f"{record['repo']},revision={record['revision']}"
+        else:
+            models[name] = str(Path(run)/'student')
+    for item in args.models:
+        name,_,target = item.partition('=')
+        repo,_,revision = target.partition('@')
+        if not name or not repo or name in models:
+            raise SystemExit(f'--models needs distinct name=repo[@revision], got {item!r}')
+        models[name] = f'{repo},revision={revision}' if revision else repo
     out = Path(args.output)
     gpus = [g for g in args.gpus.split(',') if g]
     jobs = [(name,task) for task in TASKS for name in models]

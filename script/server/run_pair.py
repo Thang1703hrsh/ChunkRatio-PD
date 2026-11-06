@@ -10,6 +10,9 @@ Stages, each idempotent and resumable (rerun the same command after an interrupt
               64 select prompts
   heldout     greedy generation on the 64 test prompts: RM vs rho, EOS, length, repetition (script/server/heldout_eval.py)
   benchmarks  Winogrande + TruthfulQA-MC2 vs rho and the riskKD student, with --eval-python (script/server/benchmarks.py)
+  push        each run's student to the Hugging Face Hub, private unless --hub-public, with a model card; the Hub
+              sha256 is checked against the local weights (script/server/push_hub.py); full scale only unless
+              --hub-allow-pilot. Repo: <--hub-namespace>/crpd-<pair>-<scale>-<run name>
 
 Examples (repository root; Linux: script/server/run_pair.sh, Windows: script/server/run_pair.ps1):
   python script/server/run_pair.py --pair qwen3_1p7b_to_0p6b --scale x10 --gpus 0,1 --gammas 0.05 --dry-run
@@ -30,7 +33,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT))
-STAGES = ('prepare','verify','collect','train','heldout','benchmarks')
+STAGES = ('prepare','verify','collect','train','heldout','benchmarks','push')
 DEFAULT_STEPS = {'smoke':(10,10),'x10':(150,150),'x30':(450,150)}  # (steps, selection interval); full: --passes over the pairs
 
 
@@ -116,9 +119,19 @@ def main() -> int:
     parser.add_argument('--trainings-per-gpu',type=int,default=None,help='Override the memory plan')
     parser.add_argument('--policy-tokens',type=int,default=None,help='policy_tokens_per_microbatch (8192 measured on A100)')
     parser.add_argument('--generation-tokens',type=int,default=None,help='Override the planned generation_tokens_per_batch')
+    parser.add_argument('--collect-shards',type=int,default=None,
+                        help='Split the collection into K hash shards (default: one per GPU); any K gives the same data')
+    parser.add_argument('--shard-indices',default=None,
+                        help='Comma list of the shards this invocation collects (default: all K), spread over --gpus')
     parser.add_argument('--root',default='output/server')
     parser.add_argument('--stages',default=','.join(STAGES[:5]),help=f'Comma list from {STAGES}')
     parser.add_argument('--eval-python',default=None,help='Python of the lm-eval environment (benchmarks stage)')
+    parser.add_argument('--bench-from-hub',action='store_true',
+                        help='benchmarks: evaluate the pushed repos at their recorded commits (needs push first)')
+    parser.add_argument('--hub-namespace',default=None,help='push: Hugging Face user or organisation')
+    parser.add_argument('--hub-public',action='store_true',help='push: create public repos (default private)')
+    parser.add_argument('--hub-allow-pilot',action='store_true',help='push: also allow smoke/x10/x30 runs')
+    parser.add_argument('--hub-update-card',action='store_true',help='push: commit again to refresh the card')
     parser.add_argument('--dry-run',action='store_true')
     parser.add_argument('--skip-verify',action='store_true',
                         help='Smoke only: no weight-space check; configs record the reference evidence as not checked')
@@ -128,6 +141,15 @@ def main() -> int:
         raise SystemExit(f'unknown stage in {stages}')
     if 'benchmarks' in stages and not args.eval_python:
         raise SystemExit('benchmarks needs --eval-python (an environment with requirements-eval.txt)')
+    if 'push' in stages:
+        if not args.hub_namespace:
+            raise SystemExit('push needs --hub-namespace (your Hugging Face user or organisation)')
+        if args.scale != 'full' and not args.hub_allow_pilot:
+            raise SystemExit(f'push of a {args.scale} run: pilot students are not the method; add --hub-allow-pilot '
+                             'to push anyway')
+    if args.bench_from_hub and 'benchmarks' in stages and 'push' in stages and \
+            stages.index('push') > stages.index('benchmarks'):
+        raise SystemExit('--bench-from-hub evaluates the pushed repos: list push before benchmarks')
     gpus = [g for g in args.gpus.split(',') if g]
     gammas = [float(g) for g in args.gammas.split(',') if g]
     if not gpus or not gammas or not all(0 < g <= 1 for g in gammas):
@@ -280,15 +302,25 @@ def main() -> int:
     # collect (one worker per GPU)
     if 'collect' in stages:
         last = ['collect-candidates']+(['collect-correction'] if args.variant == 'crpd_main' else [])
+        count = args.collect_shards or len(gpus)
+        indices = ([int(i) for i in args.shard_indices.split(',') if i] if args.shard_indices else list(range(count)))
+        if count < 1 or not indices or not all(0 <= i < count for i in indices):
+            raise SystemExit(f'--shard-indices must lie in [0, {count})')
+        if args.variant == 'crpd_main' and count > 1 and len(indices) < count:
+            raise SystemExit('crpd_main collects corrections after the head: run all its shards in one invocation')
+        # One worker per GPU; each runs its shards one after the other (shard i goes to GPU i mod #GPUs).
         jobs = []
-        for index,gpu in enumerate(gpus):
-            shard = {'index':index,'count':len(gpus)} if len(gpus) > 1 else None
-            path = work/'configs'/f'collect-shard{index}.json'
-            if not args.dry_run:
-                write_json(path,config(gammas[0],str(work/'workers'/f'shard{index}'),
-                                       **({'collection_shard':shard} if shard else {})))
-            commands = [[py,'-m','chunkratio',stage,'--config',str(path)] for stage in last]
-            jobs.append((commands,logs/f'collect-shard{index}.log',gpu))
+        for slot,gpu in enumerate(gpus):
+            commands = []
+            for index in indices[slot::len(gpus)]:
+                shard = {'index':index,'count':count} if count > 1 else None
+                path = work/'configs'/(f'collect-shard{index}of{count}.json' if shard else 'collect.json')
+                if not args.dry_run:
+                    write_json(path,config(gammas[0],str(work/'workers'/(f'shard{index}of{count}' if shard else 'single')),
+                                           **({'collection_shard':shard} if shard else {})))
+                commands += [[py,'-m','chunkratio',stage,'--config',str(path)] for stage in last]
+            if commands:
+                jobs.append((commands,logs/f'collect-gpu{gpu}.log',gpu))
         def worker(job: tuple[list[list[str]],Path,str]) -> None:
             for command in job[0]:
                 for attempt in range(3):
@@ -316,26 +348,56 @@ def main() -> int:
         if steps is None and not args.dry_run:
             from chunkratio.artifacts import read_json
             from chunkratio.riskkd import steps_for
+            # Targets of every gamma at once (one per GPU slot), then the steps from each pair count.
+            parallel([([py,'-m','chunkratio','build-targets','--config',str(paths[g])],logs/f'{names[g]}.log')
+                      for g in gammas],gpus,per_gpu,False)
             for g,path in paths.items():
-                run([py,'-m','chunkratio','build-targets','--config',str(path)],gpus[0],logs/f'{names[g]}.log',False)
                 cfg = read_json(path)
                 pairs = len(read_json(Path(read_json(Path(cfg['output'])/'target_index.json')['path']))['pairs'])
                 total = steps_for(pairs,args.batch_size,args.passes)
                 cfg.update(steps=total,selection_interval=max(1,-(-total//args.selections)))
                 write_json(path,cfg)
                 log(f'{names[g]}: {pairs} pairs -> {total} steps, selection every {cfg["selection_interval"]}')
+        # GPUs no training slot uses (e.g. one gamma on two GPUs) benchmark rho and NARVAL meanwhile: those scores do
+        # not depend on the run, and the benchmarks stage later skips models it already scored.
+        slots = [g for _ in range(per_gpu) for g in gpus]
+        idle = [g for g in gpus if g not in slots[:len(gammas)]]
+        baseline = None
+        if idle and 'benchmarks' in stages:
+            import threading
+            def baselines() -> None:
+                try:
+                    run([args.eval_python,'script/server/benchmarks.py','--pair',args.pair,'--gpus',','.join(idle),
+                         '--output',str(work/'benchmarks')],None,logs/'benchmarks-baselines.log',args.dry_run)
+                except StageFailed as error:  # retried by the benchmarks stage; training must not stop for it
+                    log(f'baseline benchmarks failed during training (the benchmarks stage retries): {error}')
+            baseline = threading.Thread(target=baselines)
+            baseline.start()
         parallel([([py,'-m','chunkratio','evaluate','--config',str(paths[g])],logs/f'{names[g]}.log') for g in gammas],
                  gpus,per_gpu,args.dry_run)
+        if baseline:
+            baseline.join()
 
     runs = [work/'runs'/names[g]/'seed0' for g in gammas]
     if 'heldout' in stages:
         limit = ['--limit','16'] if args.scale == 'smoke' else []
         parallel([([py,'script/server/heldout_eval.py','--run',str(r),'--test',str(test_file),*limit],logs/f'heldout-{r.parent.name}.log')
                   for r in runs],gpus,per_gpu,args.dry_run)
-    if 'benchmarks' in stages:
-        run([args.eval_python,'script/server/benchmarks.py','--pair',args.pair,'--runs',*map(str,runs),
-             '--gpus',','.join(g for _ in range(per_gpu) for g in gpus),'--output',str(work/'benchmarks')],
-            None,logs/'benchmarks.log',args.dry_run)
+    def push_runs() -> None:
+        for r in runs:
+            repo = f"{args.hub_namespace}/crpd-{args.pair}-{args.scale}-{r.parent.name}"
+            command = [py,'script/server/push_hub.py','--run',str(r),'--repo',repo,'--benchmarks',str(work/'benchmarks')]
+            command += (['--public'] if args.hub_public else [])+(['--update-card'] if args.hub_update_card else [])
+            run(command,None,logs/'push.log',args.dry_run)
+    # In the listed order, so `--stages push,benchmarks --bench-from-hub` evaluates the pushed commits and
+    # `--stages benchmarks,push` puts the benchmark table in the card.
+    for stage in [s for s in stages if s in ('benchmarks','push')]:
+        if stage == 'push':
+            push_runs()
+        else:
+            run([args.eval_python,'script/server/benchmarks.py','--pair',args.pair,'--runs',*map(str,runs),
+                 '--gpus',','.join(g for _ in range(per_gpu) for g in gpus),'--output',str(work/'benchmarks'),
+                 *(['--from-hub'] if args.bench_from_hub else [])],None,logs/'benchmarks.log',args.dry_run)
     if not args.dry_run:
         for r in runs:
             if (r/'heldout.json').exists():

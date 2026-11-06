@@ -1,5 +1,12 @@
 # Running CRPD on a multi-GPU server (2–4 × B200)
 
+Short step-by-step guide (Vietnamese): [script/server/README.md](../script/server/README.md).
+
+To run several pairs on the same GPUs with none idle, use `script/server/run_all.py`, a dependency-aware scheduler
+over `run_pair.py`. It splits each collection into hash shards that run on any free GPU, collects the next pair
+beside the current pair's training, benchmarks rho and NARVAL right after prepare, and runs prepare/verify on the
+CPU in parallel (DECISIONS 98). Run it with `--dry-run` first to see the jobs.
+
 This guide covers `script/server/run_pair.py`, which runs CRPD outside Modal for the three NARVAL Table 1 pairs:
 
 | `--pair` | T0 (SFT teacher) | T+ (DPO teacher) | rho (SFT student) | NARVAL comparison row |
@@ -20,7 +27,8 @@ The commands below are for Linux, run from the repository root.
 # Training environment. B200 needs a CUDA 12.8 build of PyTorch.
 python -m venv .venv && . .venv/bin/activate
 pip install torch --index-url https://download.pytorch.org/whl/cu128
-pip install -r requirements-crpd.txt huggingface_hub safetensors numpy
+pip install -r requirements-crpd.txt huggingface_hub safetensors numpy nvidia-ml-py  # nvidia-ml-py: memory_probe.py
+# Provenance records the git commit: run from a git clone, or set CRPD_CODE_REVISION=<commit> if the copy has no .git.
 
 # Benchmark environment. Keep it separate: lm-eval needs transformers 4.56, training pins 4.52.4.
 python -m venv ../venv-eval && ../venv-eval/bin/pip install torch --index-url https://download.pytorch.org/whl/cu128 \
@@ -68,7 +76,8 @@ To test the same-source pair rule (DECISIONS 92), add `--pair-sources within`.
 | `collect` | all | One worker per GPU (`collection_shard`). Workers share one cache, and the union of their work is the single-process collection (tested) |
 | `train` | one per γ | Each γ trains on its own GPU from the shared collection. RM checkpoint selection runs on the same 64 select prompts. Full scale first counts the pairs and sets `steps = passes × pairs / batch` (`--passes 1`, 3 selections) |
 | `heldout` | one per run | The 64 held-out test prompts: RM vs rho, EOS, length, repetition, length-controlled RM. Writes `heldout.json` |
-| `benchmarks` | all | Winogrande 5-shot and TruthfulQA-MC2 0-shot in hf fp32, with paired tests against rho and NARVAL. Writes `benchmarks/summary.md` |
+| `benchmarks` | all | Winogrande 5-shot and TruthfulQA-MC2 0-shot in hf fp32, with paired tests against rho and NARVAL. Writes `benchmarks/summary.md`. `--bench-from-hub` evaluates the pushed commits instead |
+| `push` | none | `script/server/push_hub.py`: each run's student to `<--hub-namespace>/crpd-<pair>-<scale>-<run>`, private unless `--hub-public`, with a model card and provenance; the Hub sha256 is checked against the local weights and recorded in `hub.json`. Full scale only unless `--hub-allow-pilot`; refuses a run whose selection kept rho or that has no `heldout.json` |
 
 Every stage can be resumed. Shards, targets and the policy checkpoint are saved as the run goes, so after an
 interruption you rerun the same command.
