@@ -31,7 +31,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0,str(ROOT))
 STAGES = ('prepare','verify','collect','train','heldout','benchmarks')
-DEFAULT_STEPS = {'x10':(150,150),'x30':(450,150)}  # (steps, selection interval); full: --passes over the pairs
+DEFAULT_STEPS = {'smoke':(10,10),'x10':(150,150),'x30':(450,150)}  # (steps, selection interval); full: --passes over the pairs
 
 
 def log(message: str) -> None:
@@ -120,6 +120,8 @@ def main() -> int:
     parser.add_argument('--stages',default=','.join(STAGES[:5]),help=f'Comma list from {STAGES}')
     parser.add_argument('--eval-python',default=None,help='Python of the lm-eval environment (benchmarks stage)')
     parser.add_argument('--dry-run',action='store_true')
+    parser.add_argument('--skip-verify',action='store_true',
+                        help='Smoke only: no weight-space check; configs record the reference evidence as not checked')
     args = parser.parse_args()
     stages = [s for s in args.stages.split(',') if s]
     if set(stages)-set(STAGES):
@@ -210,7 +212,7 @@ def main() -> int:
         write_json(data/'prepared.json',{'pair':args.pair,'scale':args.scale,'rows':len(subset),'revisions':revisions})
 
     # verify (CPU)
-    if 'verify' in stages and not args.dry_run:
+    if 'verify' in stages and not args.dry_run and not args.skip_verify:
         from chunkratio.artifacts import write_json
         sources = {role:spec['checkpoints'][role] for role in ('teacher_base','teacher_plus')}
         earlier = json.loads(evidence_path.read_text(encoding='utf-8')) if evidence_path.exists() else {}
@@ -246,7 +248,8 @@ def main() -> int:
     else:
         revisions = json.loads(revisions_path.read_text(encoding='utf-8'))
         split_hash = json.loads((data/'ultrafeedback_train.splits.json').read_text(encoding='utf-8'))['assignment_sha256']
-        evidence = json.loads(evidence_path.read_text(encoding='utf-8'))
+        evidence = (json.loads(evidence_path.read_text(encoding='utf-8')) if not args.skip_verify else
+                    {'relative_l2_distance':{'not checked':None},'rule':'not checked (smoke run, --skip-verify)'})
     # Memory plan (DECISIONS 94): collection budgets and training processes per GPU from the GPU size.
     from chunkratio.riskkd import memory_plan
     gpu_gb = args.gpu_memory_gb or (180. if args.dry_run else gpu_memory_gb(gpus))
@@ -326,7 +329,8 @@ def main() -> int:
 
     runs = [work/'runs'/names[g]/'seed0' for g in gammas]
     if 'heldout' in stages:
-        parallel([([py,'script/server/heldout_eval.py','--run',str(r),'--test',str(test_file)],logs/f'heldout-{r.parent.name}.log')
+        limit = ['--limit','16'] if args.scale == 'smoke' else []
+        parallel([([py,'script/server/heldout_eval.py','--run',str(r),'--test',str(test_file),*limit],logs/f'heldout-{r.parent.name}.log')
                   for r in runs],gpus,per_gpu,args.dry_run)
     if 'benchmarks' in stages:
         run([args.eval_python,'script/server/benchmarks.py','--pair',args.pair,'--runs',*map(str,runs),

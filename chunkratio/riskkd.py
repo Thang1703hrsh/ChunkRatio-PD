@@ -58,6 +58,8 @@ for _name,_spec in RISKKD.items():
 # Prompt subsets. x10 and x30 are the Modal pilot sizes (same 20,480 UltraFeedback rows, so their select and test
 # prompts agree); full uses every eligible train prompt. Selection always uses the same 64 select prompts.
 SCALES = {
+    # Plumbing and memory check only: 32 train prompts, 10 steps (script/modal/b200_smoke.py).
+    'smoke':{'uf_train_rows':2048,'subset':{'train':32,'head_val':8,'select':16}},
     'x10':{'uf_train_rows':20480,'subset':{'train':640,'head_val':160,'select':64}},
     'x30':{'uf_train_rows':20480,'subset':{'train':2000,'head_val':200,'select':64}},
     'full':{'uf_train_rows':None,'subset':{'train':None,'head_val':None,'select':64}},

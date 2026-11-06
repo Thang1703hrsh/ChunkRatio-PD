@@ -635,3 +635,11 @@ distillation stage (`scripts/run_narval.py`); it has no SFT or teacher-DPO code 
     collection budgets and resumes on a CUDA out-of-memory error, and reruns a training that ran out of memory
     alone on a GPU. The B200 figures are computed, not measured; none of this changes results beyond FP32
     rounding of the grouping. Tests: `test_memory_plan_scales_with_gpu_memory`, `test_release_teachers_in_server_configs`.
+95. **B200 smoke test and memory probe (user request, 6 November 2026).** To size the server settings for two
+    B200s, `script/modal/b200_smoke.py` runs, per pair on one Modal B200: the server launcher at a new `smoke` scale
+    (32 train prompts, 10 steps, two gammas trained at once on the GPU, held-out check on 16 prompts; `--skip-verify`
+    records the DPO-reference evidence as not checked, smoke only), then `script/server/memory_probe.py`, which
+    builds batches of the planned full size from real prompts (a smoke run never fills them) and records torch and
+    NVML peaks and throughput for loading, T+ generation (planned budget and 1.5x), three-role shared-prefix
+    scoring (planned and 2x), a training microbatch at 8192/16384/24576 policy tokens with the teachers released,
+    and the 8B selection RM. An NVML sampler covers the whole container. The probe also runs on the server itself.

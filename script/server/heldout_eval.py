@@ -30,6 +30,7 @@ def main() -> int:
     parser.add_argument('--run',required=True,help='Finished run folder (holds resolved_config.json and student/)')
     parser.add_argument('--test',required=True,help='Prepared test prompts (JSONL with messages)')
     parser.add_argument('--device',default='cuda')
+    parser.add_argument('--limit',type=int,default=None,help='First N test prompts only (smoke)')
     args = parser.parse_args()
     import numpy as np
     import torch
@@ -51,6 +52,7 @@ def main() -> int:
     eos = tokenizer.convert_tokens_to_ids(cfg['eos_token'])
     test = [{**r,'split':'select'} for r in read_jsonl(Path(args.test))
             if len(r['prompt_ids']) <= cfg.get('max_prompt_tokens',2048)]
+    test = test[:args.limit] if args.limit else test
     selector,cost = reward_selector({**cfg,'selection_generation_batch_size':32},test,tokenizer)
     generations = {}
     for name,model in (('rho',rho),('student',student)):
