@@ -500,3 +500,52 @@ def test_pair_sources_validation() -> None:
         validate({**base,'variant':'crpd_raw','pair_sources':'mixed'})
     with pytest.raises(ValueError,match='crpd_raw only'):
         validate({**base,'variant':'crpd_main','pair_sources':'within'})
+
+
+@pytest.mark.parametrize('variant',['crpd_raw','crpd_main'])
+def test_sharded_collection_equals_single_process(tmp_path: Path, variant: str) -> None:
+    """Two collection workers (collection_shard 0/2 and 1/2) on one cache, then one unsharded run, give the
+    same records, pairs, targets and trained student as a single process; a sharded worker cannot train
+    (DECISIONS 93)."""
+    import torch
+    from chunkratio.artifacts import read_json
+    from chunkratio.pipeline import pipeline
+    base = {**load_config('config/crpd/smoke.json'),'variant':variant,'steps':2}
+    single = {**base,'output':str(tmp_path/'single/run'),'cache_root':str(tmp_path/'single/cache')}
+    pipeline(single,'evaluate')
+    shared = str(tmp_path/'sharded/cache')
+    last = 'collect-correction' if variant == 'crpd_main' else 'collect-candidates'
+    for index in (0,1):
+        pipeline({**base,'collection_shard':{'index':index,'count':2},'cache_root':shared,
+                  'output':str(tmp_path/f'sharded/worker{index}')},last)
+    with pytest.raises(ValueError,match='collection_shard worker'):
+        pipeline({**base,'collection_shard':{'index':0,'count':2},'cache_root':shared,
+                  'output':str(tmp_path/'sharded/bad')},'build-targets')
+    final = {**base,'output':str(tmp_path/'sharded/run'),'cache_root':shared}
+    pipeline(final,'evaluate')
+    targets = lambda folder: read_json(Path(read_json(Path(folder)/'target_index.json')['path']))
+    a,b = targets(single['output']),targets(final['output'])
+    assert [(p['id'],p['weight']) for p in a['pairs']] == [(p['id'],p['weight']) for p in b['pairs']]
+    assert [c['tokens'] for r in a['records'] for c in r['candidates']] == \
+           [c['tokens'] for r in b['records'] for c in r['candidates']]
+    ta = [c['target_score'] for r in a['records'] for c in r['candidates']]
+    tb = [c['target_score'] for r in b['records'] for c in r['candidates']]
+    sa = torch.load(Path(single['output'])/'student.pt',weights_only=True)['state_dict']
+    sb = torch.load(Path(final['output'])/'student.pt',weights_only=True)['state_dict']
+    if variant == 'crpd_raw':
+        assert ta == tb and all(torch.equal(sa[k],sb[k]) for k in sa)
+    else:
+        # The head's rho features come from batched forwards whose composition follows the shard, so mu_hat
+        # (and what the student learns from it) agrees up to FP32 rounding; the sampled tokens are identical.
+        assert ta == pytest.approx(tb,rel=1e-6,abs=1e-6)
+        assert all(torch.allclose(sa[k],sb[k],rtol=1e-5,atol=1e-6) for k in sa)
+
+
+def test_collection_shard_validation() -> None:
+    """Malformed shards fail closed."""
+    from chunkratio.config import validate
+    base = load_config('config/crpd/smoke.json')
+    validate({**base,'collection_shard':{'index':1,'count':4}})
+    for bad in ({'index':4,'count':4},{'index':0},{'index':'0','count':2},[0,2]):
+        with pytest.raises(ValueError,match='collection_shard'):
+            validate({**base,'collection_shard':bad})

@@ -4,3 +4,4 @@ tests/** text eol=lf
 script/smoke_test.sh text eol=lf
 script/train_crpd.sh text eol=lf
 script/run_crpd_protocol.sh text eol=lf
+*.sh text eol=lf

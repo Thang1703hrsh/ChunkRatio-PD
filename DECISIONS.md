@@ -604,3 +604,20 @@ distillation stage (`scripts/run_narval.py`); it has no SFT or teacher-DPO code 
     (nuocb0739, about $4.5 of the about $7 left): `CRPD_PAIR_SOURCES=within`, gamma 0.05 (only the pair rule
     differs from the pinned run) and 0.1 (more signal once the source bias is gone), chosen on select RM; held-out
     pd_diagnostics on both. Success means held-out RM above the pinned run with EOS and length closer to rho.
+93. **Multi-GPU server launcher for the three NARVAL pairs (user request, 6 November 2026).** `script/server/run_pair.py`
+    (Linux `run_pair.sh`, Windows `run_pair.ps1`, guide `docs/SERVER.md`) runs CRPD outside Modal on 2-4 GPUs for
+    qwen3_1p7b_to_0p6b, qwen3_8b_to_1p7b and llama31_8b_to_llama32_1b, on the riskKD authors' checkpoints pinned in
+    `chunkratio/riskkd.py` (from riskKD_hf_checkpoints.xlsx; within each pair one tokenizer, vocabulary and chat
+    template, checked on the Hub; EOS <|im_end|> for Qwen, <|eot_id|> for Llama, whose template inserts no date, so
+    the protocol's pinned date_string leaves the prompt tokens unchanged, checked). Stages prepare, verify
+    (weight-space evidence for T0 as T+'s DPO reference, recorded as an assumption), collect, train, heldout,
+    benchmarks; each resumable. Multi-GPU use changes no result: (a) opt-in `collection_shard {index, count}`
+    splits prefixes, candidates and correction jobs by a hash of the prompt id across worker processes on one
+    cache; the shard never enters a key and a sharded worker cannot go past collection (raw: identical targets
+    and student to a single process; main: identical tokens, mu_hat and student equal up to FP32 rounding of the
+    head's batched features; `test_sharded_collection_equals_single_process`); (b) each gamma trains on its own
+    GPU from the shared collection. Full scale fixes steps = passes x pairs / batch after counting the pairs
+    (default 1 pass, 3 selections). Held-out measurement (`script/server/heldout_eval.py`) is section C of
+    pd_diagnostics; benchmarks (`script/server/benchmarks.py`) use the hf fp32 harness of DECISIONS 91 in a
+    separate environment (`requirements-eval.txt`). Time estimates in docs/SERVER.md are scaled from A100
+    measurements and are not B200 measurements. Tests: `tests/test_server.py`, sharding tests in test_pipeline.py.

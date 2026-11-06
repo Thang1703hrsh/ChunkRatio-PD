@@ -164,6 +164,10 @@ def pipeline(cfg: dict[str,Any], until: str = 'evaluate') -> dict[str,Any]:
         result = {'route':route,'optimizer_steps':0,'collection_skipped':True}
         write_json(output/'diagnostics.json',result)
         return result
+    # A collection shard holds part of the prompts, so a sharded worker stops at its collection stage; the
+    # run that builds targets and trains is started without a shard once every worker has finished.
+    if cfg.get('collection_shard') and until not in ('collect-prefixes','collect-candidates','collect-correction'):
+        raise ValueError('a collection_shard worker runs collect-prefixes, collect-candidates or collect-correction only')
     prefix_store = store('prefixes',dependencies)
     lap('setup')
     states = collect_prefixes(prompts,models['student_ref'],cfg,eos,prefix_store)

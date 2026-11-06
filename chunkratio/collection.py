@@ -118,6 +118,16 @@ def batches(items: list[Any], cfg: dict[str,Any], cost: Callable[[Any],int] | No
     return [items[i:i+size] for i in range(0,len(items),size)]
 
 
+def in_shard(prompt_id: str, cfg: dict[str,Any]) -> bool:
+    """Opt-in multi-process collection (`collection_shard: {index, count}`, DECISIONS 93): a worker collects only
+    the prompts whose hash falls in its shard. Every prompt, state and job keeps its own RNG stream and shard
+    file, so the union of the workers' shards is the single-process collection; the shard never enters a key."""
+    shard = cfg.get('collection_shard')
+    if not shard:
+        return True
+    return int(digest(['collection-shard',prompt_id])[:12],16) % shard['count'] == shard['index']
+
+
 def select_states(positions: list[int], prompt_id: str, seed: int, k: int | None) -> list[int]:
     """Uniform state subsample without replacement; n=0 always kept (pre-registered, §7.2).
 
@@ -141,7 +151,7 @@ def collect_prefixes(prompts: list[dict[str,Any]], rho: nn.Module, cfg: dict[str
     # crpd_raw and crpd_suffix use no head, so `collection_splits: ['train']` skips the head_val prompts. Each
     # prompt has its own stream and shard, so the train records are the same either way (DECISIONS 87).
     splits = tuple(cfg.get('collection_splits',('train','head_val')))
-    pending = sorted((p for p in prompts if p['split'] in splits and store.get(p['id']) is None),
+    pending = sorted((p for p in prompts if p['split'] in splits and in_shard(p['id'],cfg) and store.get(p['id']) is None),
                      key=lambda p:(len(p['prompt_ids']),p['id']))
     size = cfg.get('prefix_generation_batch_size') or cfg.get('generation_batch_size',8)
     for group in batches(pending,{**cfg,'generation_batch_size':size},lambda p:len(p['prompt_ids'])+cfg['horizon']):
@@ -173,7 +183,8 @@ def collect_candidates(states: list[dict[str,Any]], models: dict[str,nn.Module],
     seed = collection_seed(cfg)
     per_source = cfg['candidates']//2
     # Length-sorted groups pad less; each draw keeps its own stream, so records do not change.
-    pending = sorted((s for s in states if store.get(s['id']) is None),key=lambda s:(len(s['prefix_ids']),s['id']))
+    pending = sorted((s for s in states if in_shard(s['prompt_id'],cfg) and store.get(s['id']) is None),
+                     key=lambda s:(len(s['prefix_ids']),s['id']))
     totals: dict[str,float] = {}
     reach = lambda s: per_source*(len(s['prefix_ids'])+(length or cfg['horizon']-s['n']))
     for group in batches(pending,cfg,reach):
@@ -276,7 +287,8 @@ def collect_correction(candidates: list[dict[str,Any]], models: dict[str,nn.Modu
             for replica in range(cfg['correction_replicates'])]
     # Similar prefix lengths share a generation batch (less left padding); every job's tokens come
     # from its own stream, so the grouping does not change them.
-    pending = sorted((job for job in jobs if store.get(job[1]) is None),key=lambda job:(len(job[0]['prefix_ids']),job[1]))
+    pending = sorted((job for job in jobs if in_shard(job[0]['prompt_id'],cfg) and store.get(job[1]) is None),
+                     key=lambda job:(len(job[0]['prefix_ids']),job[1]))
     budget = cfg.get('score_tokens_per_batch',8192)
     totals: dict[str,float] = {}
     # Correction is generation-bound with free GPU memory, so it may use its own (larger) group size.

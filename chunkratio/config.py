@@ -83,6 +83,11 @@ def validate(cfg: dict[str,Any]) -> None:
         raise ValueError('teacher_gap_scale must be a number in (0, 1]')
     if gamma != 1 and cfg['variant'] != 'crpd_raw':
         raise ValueError('teacher_gap_scale < 1 is implemented for crpd_raw only')
+    # Multi-process collection (DECISIONS 93): a worker's shard of the prompts; never part of a key.
+    shard = cfg.get('collection_shard')
+    if shard is not None and (not isinstance(shard,dict) or set(shard) != {'index','count'} or
+                              any(type(shard[k]) is not int for k in shard) or not 0 <= shard['index'] < shard['count']):
+        raise ValueError('collection_shard must be {index, count} with 0 <= index < count')
     # Which sibling pairs train (DECISIONS 92); a filtered measure is implemented for raw targets only.
     if cfg.get('pair_sources','all') not in ('all','within','student_ref'):
         raise ValueError('pair_sources must be all, within or student_ref')
