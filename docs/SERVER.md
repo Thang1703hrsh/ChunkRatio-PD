@@ -1,6 +1,6 @@
 # Running CRPD on a multi-GPU server (2–4 × B200)
 
-Short step-by-step guide (Vietnamese): [script/server/README.md](../script/server/README.md).
+Short step-by-step guide: [script/server/README.md](../script/server/README.md).
 
 To run several pairs on the same GPUs with none idle, use `script/server/run_all.py`, a dependency-aware scheduler
 over `run_pair.py`. It splits each collection into hash shards that run on any free GPU, collects the next pair

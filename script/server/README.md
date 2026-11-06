@@ -1,7 +1,7 @@
-# Chạy CRPD trên server 2 × B200
+# Running CRPD on a 2 × B200 server
 
-Hướng dẫn ngắn để chạy 3 cặp model của NARVAL Table 1 bằng `script/server/run_pair.py`.
-Chi tiết đầy đủ (từng stage làm gì, memory plan) xem [docs/SERVER.md](../../docs/SERVER.md).
+A short guide to training the three NARVAL Table 1 pairs and pushing the students to Hugging Face. For what each
+stage does and how GPU memory is planned, see [docs/SERVER.md](../../docs/SERVER.md).
 
 | `--pair` | Teacher → Student |
 |---|---|
@@ -9,160 +9,125 @@ Chi tiết đầy đủ (từng stage làm gì, memory plan) xem [docs/SERVER.md
 | `qwen3_8b_to_1p7b` | Qwen3-8B → Qwen3-1.7B |
 | `llama31_8b_to_llama32_1b` | Llama-3.1-8B → Llama-3.2-1B |
 
-Mọi lệnh chạy từ thư mục gốc của repo, trên Linux.
+Run every command from the repository root, on Linux.
 
-## 1. Cài đặt (một lần)
+## 1. Setup (once)
 
 ```bash
-git clone <repo> && cd ChunkRatio-PD          # cần bản git clone (provenance ghi commit)
+git clone https://github.com/Thang1703hrsh/ChunkRatio-PD.git
+cd ChunkRatio-PD
+git checkout crpd-hda-review      # run from a git clone: provenance records the commit
 
-# Môi trường train (B200 cần PyTorch bản CUDA 12.8)
+# Training environment (B200 needs a CUDA 12.8 build of PyTorch)
 python -m venv .venv && . .venv/bin/activate
 pip install torch --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements-crpd.txt huggingface_hub safetensors numpy nvidia-ml-py
 
-# Môi trường benchmark, tách riêng (lm-eval cần transformers 4.56)
+# Benchmark environment, kept separate (lm-eval needs transformers 4.56)
 python -m venv ../venv-eval
 ../venv-eval/bin/pip install torch --index-url https://download.pytorch.org/whl/cu128
 ../venv-eval/bin/pip install -r requirements-eval.txt
 
-# Đăng nhập Hugging Face (token có quyền write nếu muốn push)
+# Hugging Face login with a token that has write access (needed for the push)
 huggingface-cli login
 ```
 
-Cặp Llama: vào Hugging Face chấp nhận licence của `meta-llama/Llama-3.1-8B` và `meta-llama/Llama-3.1-8B-Instruct`
-trước, nếu không stage `verify` sẽ dừng.
+For the Llama pair, accept the licence of `meta-llama/Llama-3.1-8B` and `meta-llama/Llama-3.1-8B-Instruct` on the
+Hub first. The weight check downloads them.
 
-Ước lượng tài nguyên (chưa đo trên server): RAM máy khoảng 40 GB cho mỗi tiến trình train (tối đa 4 tiến trình
-cùng lúc, tức khoảng 160 GB), ổ đĩa trống khoảng 500 GB cho HF cache và dữ liệu collection.
+Estimated resources (not yet measured on the server):
 
-## 2. Kiểm tra kế hoạch (không tốn GPU)
+- At least 256 GB of host RAM. Two 8B collections can run at once, each loading two FP32 teachers (about 64 GB),
+  and the weight check needs about 32 GB.
+- About 500 GB of free disk for the Hugging Face cache and the collection data.
 
-```bash
-python script/server/run_pair.py --pair qwen3_1p7b_to_0p6b --scale x10 --gpus 0,1 --gammas 0.1,0.05 --dry-run
-```
-
-In ra memory plan và mọi lệnh sẽ chạy, không chạy gì.
-
-## 3. Smoke test (khoảng 15–30 phút mỗi cặp)
+## 2. Smoke test (about 15–30 minutes per pair)
 
 ```bash
 script/server/run_pair.sh --pair qwen3_1p7b_to_0p6b --scale smoke --gpus 0,1 --gammas 0.05 --skip-verify
 ```
 
-32 prompt, 10 step, held-out 16 prompt. Chỉ để chắc chắn pipeline chạy thông, kết quả không có ý nghĩa.
-Nên chạy cặp 0.6B trước, rồi tới hai cặp 8B.
+This uses 32 prompts, 10 steps and a 16-prompt held-out check. It only shows that the pipeline runs end to end, so
+ignore its scores. Start with the 0.6B pair, then run the two 8B pairs the same way.
 
-Đo bộ nhớ GPU ở kích thước batch thật (tuỳ chọn):
-
-```bash
-python script/server/memory_probe.py --pair qwen3_8b_to_1p7b \
-    --prompts output/server/qwen3_8b_to_1p7b/data/rows2048/ultrafeedback_train.jsonl --output probe_8b.json
-```
-
-## 4. Sweep x10 để chọn γ (khoảng 15–45 phút mỗi cặp)
-
-```bash
-script/server/run_pair.sh --pair qwen3_8b_to_1p7b --scale x10 --gpus 0,1 \
-    --pair-sources within --gammas 0.1,0.05,0.03
-```
-
-Chọn γ **trước khi** chạy full, theo đúng luật này:
-
-1. Bỏ các run có EOS held-out dưới 90%.
-2. Trong các run còn lại, lấy run có select RM cao nhất (`diagnostics.json → policy.selection_score`).
-
-Dòng cuối của log in sẵn RM held-out so với rho, EOS và độ dài của từng run. Kết quả nằm ở
-`output/server/<pair>/x10/runs/<run>/seed0/`. Không chọn γ theo Winogrande hay TruthfulQA, vì đó là tập test.
-
-## 5. Chạy full với γ đã chọn
-
-```bash
-script/server/run_pair.sh --pair qwen3_8b_to_1p7b --scale full --gpus 0,1 \
-    --pair-sources within --gammas 0.1 \
-    --stages prepare,verify,collect,train,heldout,benchmarks,push \
-    --eval-python ../venv-eval/bin/python --hub-namespace <user-hoac-org>
-```
-
-- 1 epoch qua toàn bộ pair (`--passes 1`), chọn checkpoint 3 lần trong lúc train (`--selections 3`).
-- `benchmarks`: Winogrande 5-shot và TruthfulQA-MC2 cho student, rho và NARVAL, có kiểm định cặp.
-  Kết quả ở `output/server/<pair>/full/benchmarks/summary.md`.
-- `push`: đẩy student lên `<namespace>/crpd-<pair>-full-<run>`, xem mục 6.
-
-Bị ngắt giữa chừng thì chạy lại **đúng lệnh cũ**, mọi stage đều tiếp tục từ chỗ đã lưu.
-
-Thời gian ước lượng trên 2 × B200 (quy đổi từ A100, chưa đo): Qwen 0.6B khoảng 7–8 h, Llama khoảng 16–19 h,
-Qwen 8B khoảng 21–24 h.
-
-### Chạy cả 3 cặp cùng lúc, không để GPU trống (khuyên dùng)
-
-`run_all.py` lập lịch các job của cả 3 cặp trên 2 GPU:
-- Collection được chia thành 6 shard. Các shard của một cặp chạy trên mọi GPU đang rảnh.
-- Trong lúc một cặp train trên GPU này, GPU kia collect cho cặp tiếp theo.
-- Benchmark rho/NARVAL chạy ngay sau prepare.
-- Prepare/verify (chỉ cần CPU) chạy song song với công việc trên GPU.
+## 3. Full run: all three pairs at once, pushed to Hugging Face
 
 ```bash
 python script/server/run_all.py --gpus 0,1 --scale full --pair-sources within \
-    --pair llama31_8b_to_llama32_1b:0.05 --pair qwen3_8b_to_1p7b:0.1 --pair qwen3_1p7b_to_0p6b:0.1 \
-    --eval-python ../venv-eval/bin/python --hub-namespace <user-hoac-org>
+    --pair llama31_8b_to_llama32_1b:0.05 \
+    --pair qwen3_8b_to_1p7b:0.05 \
+    --pair qwen3_1p7b_to_0p6b:0.1 \
+    --eval-python ../venv-eval/bin/python \
+    --hub-namespace <your-user-or-org>
 ```
 
-- Mỗi `--pair` có dạng `pair:γ[,γ...][:pair_sources]`. Thay γ bằng giá trị bạn chọn ở mục 4.
-- Thứ tự các `--pair` là độ ưu tiên. Thứ tự trên (Llama, Qwen 8B, Qwen 0.6B) cho thời gian ngắn nhất trong mô phỏng.
-- Thêm `--dry-run` để xem danh sách job và phụ thuộc mà không chạy gì.
-- Bị ngắt thì chạy lại đúng lệnh: job đã xong được đánh dấu trong `output/server/<pair>/full/schedule/` và sẽ bị
-  bỏ qua. Thêm `--fresh` để bỏ qua các dấu này.
-- Một job lỗi chỉ dừng các bước sau của cặp đó. Các cặp khác vẫn chạy tiếp.
+`run_all.py` schedules every pair's jobs over the two GPUs so that neither one sits idle:
 
-Mô phỏng với thời lượng ước tính (chưa đo trên B200): khoảng 36 h cho cả 3 cặp, so với khoảng 44 h nếu chạy
-từng cặp một bằng `run_pair.sh`. Giới hạn lý thuyết khi 2 GPU bận 100% là khoảng 33,5 h.
+- Each collection is split into 6 shards that run on whichever GPU is free.
+- While one pair trains on one GPU, the other GPU collects for the next pair.
+- The rho and NARVAL benchmarks start right after a pair is prepared.
+- Downloads and the weight check run on the CPU, alongside the GPU work.
 
-Cần RAM máy nhiều hơn: có lúc 2 collection 8B chạy cùng lúc (mỗi cái nạp 2 teacher FP32, khoảng 64 GB) cộng
-với verify (khoảng 32 GB). Nên có từ 256 GB RAM trở lên.
+For each pair the run does the following:
 
-## 6. Push checkpoint lên Hugging Face
+1. Prepare the data and check the teacher weights.
+2. Collect.
+3. Train for one epoch (`--passes 1`), with 3 checkpoint selections on the 64 select prompts.
+4. Run the held-out check (64 test prompts: RM against rho, EOS rate, length).
+5. Run Winogrande 5-shot and TruthfulQA-MC2 for the student, rho and NARVAL.
+6. **Push the student to Hugging Face.**
 
-**Nên push 3 checkpoint, mỗi cặp 1**: student của lần chạy full với γ đã chọn ở mục 4. rho và NARVAL đã có
-sẵn trên Hub nên không cần push. Student x10/x30 chỉ train trên vài trăm tới vài nghìn prompt nên không đại
-diện cho method; launcher từ chối push chúng trừ khi thêm `--hub-allow-pilot`.
+Leave out `--hub-namespace` if you do not want to push.
 
-Muốn có ablation thì khai báo trước và push thêm tối đa 1 run mỗi cặp (ví dụ cùng γ với `--pair-sources all`),
-và báo cáo nó cả khi kém hơn.
+The order of the `--pair` flags sets their priority. The order above was the fastest in a simulation of the
+schedule: about 36 h for all three pairs, against about 44 h one pair after another. Both figures come from
+estimated stage times scaled from A100 runs, not from B200 measurements.
 
-Stage `push` (`script/server/push_hub.py`):
+If the run stops, rerun the same command. Finished jobs are marked in `output/server/<pair>/full/schedule/` and are
+skipped, and every stage resumes from what it saved. A failed job stops only the later jobs of its own pair.
 
-- Tạo repo **private** (thêm `--hub-public` nếu muốn public).
-- Một commit gồm weights, tokenizer, model card (nguồn gốc, cách chọn checkpoint, held-out, benchmarks nếu đã
-  chạy) và `crpd_provenance.json`.
-- Kiểm tra sha256 của weights trên Hub khớp với file local, ghi `runs/<run>/seed0/hub.json` (repo, commit).
-- Từ chối push nếu bước chọn checkpoint giữ lại rho (khi đó student chính là rho) hoặc chưa có `heldout.json`.
-- Chạy lại không push lần nữa nếu weights không đổi. Thêm `--hub-update-card` để cập nhật model card.
+Results for each pair:
 
-Eval bản đã push:
+- Training and held-out: `output/server/<pair>/full/runs/<run>/seed0/` (`diagnostics.json`, `heldout.json`)
+- Benchmarks: `output/server/<pair>/full/benchmarks/summary.md`
+- Logs: `output/server/<pair>/full/logs/`
+
+### Why these γ values
+
+There was no γ sweep for the 8B teachers, so two of the three values below are predictions.
+
+| Pair | γ | Reason |
+|---|---:|---|
+| Qwen3-1.7B → 0.6B | **0.1** | Measured. With `--pair-sources within`, γ 0.1 was the best held-out result so far: RM +0.64 against rho (95% CI [0.13, 1.18], 41 wins / 21 losses), EOS rate 0.95 (rho 0.98), length 333 tokens (rho 247). |
+| Qwen3-8B → 1.7B | **0.05** | Predicted. On the 0.6B pair, larger γ moved the student further from rho (longer answers, lower EOS rate, worse benchmarks at γ 1). An 8B teacher pair is likely to give larger teacher gaps, so the more conservative value is the safer bet. |
+| Llama-3.1-8B → 3.2-1B | **0.05** | Predicted, for the same reason. The Llama pair also uses a different tokenizer and chat template from the measured pair. |
+
+γ scales the teacher gap in the targets (`teacher_gap_scale`), and α stays at 0.03. To try a second value for a pair
+anyway, list both, for example `--pair qwen3_8b_to_1p7b:0.05,0.1`. Both values then train on the same collection
+and both are pushed. Decide in advance which one is the result, and report the other as an ablation.
+
+## 4. What gets pushed to Hugging Face
+
+Each pair pushes one student to `<namespace>/crpd-<pair>-full-<run>`. That gives three checkpoints for the three
+pairs. rho and NARVAL are already on the Hub, so they are not pushed.
+
+The push (`script/server/push_hub.py`):
+
+- Creates a **private** repo. Add `--hub-public` to `run_all.py` for a public one.
+- Makes one commit with the weights, the tokenizer, a model card (sources, how the checkpoint was chosen, held-out
+  and benchmark results) and `crpd_provenance.json`.
+- Checks that the weights' sha256 on the Hub match the local files, and records the repo and commit in
+  `runs/<run>/seed0/hub.json`.
+- Refuses to push when checkpoint selection kept rho (the student would be rho itself) or when `heldout.json` is
+  missing.
+- Does nothing on a rerun if the weights have not changed.
+
+To evaluate a pushed model again later, for example from another machine:
 
 ```bash
-# Đúng commit đã push (ghim theo hub.json), sau khi push:
-script/server/run_pair.sh --pair qwen3_8b_to_1p7b --scale full --gpus 0,1 --pair-sources within --gammas 0.1 \
-    --stages push,benchmarks --bench-from-hub --eval-python ../venv-eval/bin/python --hub-namespace <user-hoac-org>
-
-# Hoặc bất kỳ model nào trên Hub, ra một thư mục riêng:
 ../venv-eval/bin/python script/server/benchmarks.py --pair qwen3_8b_to_1p7b --gpus 0,1 \
-    --models crpd=<user>/<repo>@<commit> --output output/server/hub-eval
+    --models crpd=<namespace>/<repo>@<commit> --output output/server/hub-eval
 ```
 
-`benchmarks.py` bỏ qua các model đã có kết quả trong thư mục `--output`. Muốn eval lại từ đầu thì dùng một thư
-mục `--output` mới.
-
-## 7. Lỗi thường gặp
-
-| Lỗi | Cách xử lý |
-|---|---|
-| `No such file or directory: 'git'` hoặc không có `.git` | Chạy từ bản git clone, hoặc `export CRPD_CODE_REVISION=<commit>` |
-| `no reference alternative could be downloaded` (Llama) | Chấp nhận licence Llama trên Hub, rồi `huggingface-cli login` |
-| CUDA out of memory khi collect | Tự xử lý: launcher giảm một nửa batch rồi chạy tiếp |
-| CUDA out of memory khi train 2 tiến trình/GPU | Tự xử lý: chạy lại riêng từng tiến trình; hoặc thêm `--trainings-per-gpu 1` |
-| `benchmarks needs --eval-python` | Thêm `--eval-python ../venv-eval/bin/python` |
-| `push needs --hub-namespace` | Thêm `--hub-namespace <user-hoac-org>` |
-
-Log của từng bước: `output/server/<pair>/<scale>/logs/`.
+`benchmarks.py` skips any model that already has results in its `--output` folder, so give it a new folder to
+evaluate from scratch.
